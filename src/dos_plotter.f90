@@ -1,0 +1,734 @@
+module dos_plotter
+    !! DOS visualization: interactive ASCII terminal plot + SVG + CSV export
+    !! Interactive controls: ↑↓ scroll, +/- zoom, ← → pan, R reset, Q quit
+    use castep_config, only: dp, HARTREE_TO_EV
+    use term_utils, only: C_RED, C_GREEN, C_YELLOW, C_CYAN, C_BOLD, C_DIM, C_RESET, C_AXIS, &
+        get_term_size, draw_line
+    implicit none
+    private
+
+    integer, parameter, public :: &
+        DOS_MODE_ASCII  = 1, &
+        DOS_MODE_SVG    = 2, &
+        DOS_MODE_EXPORT = 3
+
+    public :: plot_dos_ascii, write_dos_svg, write_dos_csv
+    public :: plot_pdos_ascii, write_pdos_csv
+
+contains
+
+    subroutine plot_dos_ascii(energy_grid, dos_data, nspin, e_fermi, smearing, &
+            term_w_in, term_h_in, y_center_in, y_half_in, e_center_in, half_range_in)
+        real(dp), intent(in) :: energy_grid(:)
+        real(dp), intent(in) :: dos_data(:,:)
+        integer,  intent(in) :: nspin
+        real(dp), intent(in) :: e_fermi, smearing
+        integer,  intent(in) :: term_w_in, term_h_in
+        real(dp), intent(in), optional :: y_center_in, y_half_in, e_center_in, half_range_in
+
+        integer  :: ne, nw, nh, ix, iy, ie, is, nw_data
+        integer  :: fermi_col, y_label_width, gap_width, y_label_interval
+        integer  :: i1, i2, ne_vis
+        real(dp) :: e_min, e_max, e_range, y_center, y_half, y_min, y_max
+        real(dp) :: y_scale, x_scale, x_val, dos_val, e_center, half_range
+        character(len=1), allocatable :: grid(:,:)
+        character(len=64)  :: fmt_label, tmp_str
+        integer  :: last_ix, last_iy
+
+        ne = size(energy_grid)
+        if (ne < 2 .or. size(dos_data, 1) /= ne) then
+            write(*, '(a)') '  No DOS data to plot.'
+            return
+        end if
+
+        ! default x view: full range
+        e_center = 0.0_dp
+        half_range = energy_grid(ne) - energy_grid(1)
+        if (present(e_center_in))    e_center   = e_center_in
+        if (present(half_range_in))  half_range = half_range_in
+
+        if (half_range < 0.25_dp) half_range = 0.25_dp
+        e_min = e_center - half_range
+        e_max = e_center + half_range
+        e_range = e_max - e_min
+        if (e_range < 1.0e-12_dp) e_range = 1.0_dp
+
+        call find_visible_range(energy_grid, e_min, e_max, i1, i2)
+        ne_vis = i2 - i1 + 1
+
+        call get_term_size(nw, nh)
+        if (term_w_in > 0) nw = term_w_in
+        if (term_h_in > 0) nh = term_h_in
+        nw = max(30, min(300, nw))
+        nh = max(15, min(100, nh))
+        nh = max(15, nh - 9)
+
+        ! y-axis: center + half-range; default from full data: [0, y_max0]
+        y_max = 1.0_dp
+        do is = 1, nspin
+            do ie = 1, ne
+                if (dos_data(ie, is) > y_max) y_max = dos_data(ie, is)
+            end do
+        end do
+        y_max = y_max * 1.15_dp
+        if (y_max < 1.0e-12_dp) y_max = 1.0_dp
+        y_center = y_max / 2.0_dp
+        y_half   = y_max / 2.0_dp
+        if (present(y_center_in)) y_center = y_center_in
+        if (present(y_half_in))   y_half   = y_half_in
+        if (y_half < 1.0e-12_dp) y_half = 0.5_dp
+        y_min = y_center - y_half
+        y_max = y_center + y_half
+
+        y_label_width = 0
+        write(tmp_str, '(f10.4)') y_max
+        y_label_width = max(y_label_width, len_trim(adjustl(tmp_str)))
+        write(tmp_str, '(f10.4)') y_min
+        y_label_width = max(y_label_width, len_trim(adjustl(tmp_str)))
+        y_label_width = max(y_label_width, 6)
+        gap_width = 1
+        nw_data = max(20, nw - y_label_width - gap_width)
+
+        allocate(grid(nw_data, nh))
+        grid = ' '
+
+        x_scale = real(nw_data - 3, dp) / e_range
+        y_scale = real(nh - 1, dp) / (y_max - y_min)
+
+        fermi_col = nint((0.0_dp - e_min) * x_scale) + 2
+        fermi_col = max(2, min(nw_data - 1, fermi_col))
+
+        ! plot DOS curves
+        do is = 1, nspin
+            last_ix = -1
+            do ie = i1, i2
+                x_val = energy_grid(ie)
+                if (x_val < e_min .or. x_val > e_max) cycle
+                dos_val = dos_data(ie, is)
+                ix = nint((x_val - e_min) * x_scale) + 2
+                iy = nh - nint((dos_val - y_min) * y_scale)
+                ix = max(2, min(nw_data - 1, ix))
+                iy = max(1, min(nh, iy))
+                if (is == 1) then
+                    grid(ix, iy) = 'U'
+                else
+                    grid(ix, iy) = 'D'
+                end if
+                if (last_ix > 0) call draw_line(nw_data, nh, grid, last_ix, last_iy, ix, iy)
+                last_ix = ix; last_iy = iy
+            end do
+        end do
+
+        ! Fermi level vertical line
+        do iy = 1, nh
+            if (fermi_col >= 2 .and. fermi_col <= nw_data - 1) then
+                if (grid(fermi_col, iy) == ' ') grid(fermi_col, iy) = '|'
+            end if
+        end do
+
+        ! y=0 horizontal reference line
+        iy = nh - nint((0.0_dp - y_min) * y_scale)
+        iy = max(1, min(nh, iy))
+        do ix = 2, nw_data - 1
+            if (grid(ix, iy) == ' ') grid(ix, iy) = '-'
+        end do
+        if (grid(1, iy) == '|') grid(1, iy) = 'Y'
+        if (grid(nw_data, iy) == '|') grid(nw_data, iy) = 'Z'
+
+        ! borders
+        do iy = 1, nh
+            if (grid(1, iy) == ' ') grid(1, iy) = '|'
+            if (grid(nw_data, iy) == ' ') grid(nw_data, iy) = '|'
+        end do
+        do ix = 2, nw_data - 1
+            if (grid(ix, nh) == ' ' .or. grid(ix, nh) == '-') grid(ix, nh) = '-'
+        end do
+        grid(1, nh) = 'B'
+        grid(nw_data, nh) = 'R'
+        if (grid(fermi_col, nh) == '-') grid(fermi_col, nh) = 'T'
+
+        ! header
+        write(*, '(a)') ''
+        write(*, '(a,i0,a,i0,a,f5.2,a)') C_BOLD // '  Density of States  ' // &
+            C_RESET // C_CYAN, ne_vis, C_RESET // ' pts, ' // C_CYAN, &
+            nspin, C_RESET // ' spin(s),  smearing=' // C_CYAN, smearing, &
+            ' eV' // C_RESET
+        write(tmp_str, '(f8.4)') e_min
+        write(*, '(a)', advance='no') '  ' // C_DIM // 'Energy: [' // C_RESET // &
+            trim(adjustl(tmp_str)) // C_DIM // ' to ' // C_RESET
+        write(tmp_str, '(f8.4)') e_max
+        write(*, '(a,i0,1x,i0,a)') trim(adjustl(tmp_str)) // C_DIM // '] eV' // &
+            C_RESET // '  grid:' // C_RESET, nw_data, nh, &
+            '  ' // C_DIM // 'E_F=0 (dashed)' // C_RESET
+        write(tmp_str, '(f8.4)') y_max
+        write(*, '(a)') '  ' // C_DIM // 'DOS max: ' // C_RESET // trim(adjustl(tmp_str))
+        write(*, '(a)') ''
+
+        ! top border
+        write(*, '(a)') repeat(' ', y_label_width + gap_width) // C_AXIS &
+            // '┌' // repeat('─', nw_data - 2) // '┐' // C_RESET
+
+        y_label_interval = max(1, nh / 6)
+        do iy = 1, nh
+            fmt_label = ''
+            if (mod(iy - 1, y_label_interval) == 0 .or. iy == 1 .or. iy == nh) then
+                dos_val = y_max - real(iy - 1, dp) / real(nh - 1, dp) * (y_max - y_min)
+                write(fmt_label, '(f10.4)') dos_val
+                fmt_label = adjustl(fmt_label)
+            end if
+            call print_dos_row(grid, nw_data, iy, nh, fmt_label, y_label_width, gap_width)
+        end do
+
+        ! x-axis
+        write(tmp_str, '(f8.2)') e_max
+        tmp_str = adjustl(tmp_str)
+        write(fmt_label, '(f8.2)') e_min
+        fmt_label = adjustl(fmt_label)
+        write(*, '(a,a,a)') repeat(' ', y_label_width + gap_width) // C_DIM, &
+            trim(fmt_label) // repeat(' ', max(0, nw_data - 3 - len_trim(tmp_str))) &
+            // trim(tmp_str), C_RESET
+
+        ! E_F marker
+        write(*, '(a,a)') repeat(' ', y_label_width + gap_width) // C_DIM, &
+            repeat(' ', fermi_col - 2) // C_RED // 'E_F' // C_RESET
+
+        deallocate(grid)
+    end subroutine plot_dos_ascii
+
+    ! find indices of energy_grid within [e_min, e_max]
+    subroutine find_visible_range(grid, v_min, v_max, i1, i2)
+        real(dp), intent(in)  :: grid(:), v_min, v_max
+        integer,  intent(out) :: i1, i2
+        integer :: n, lo, hi, mid
+        n = size(grid)
+        ! binary search for first index >= v_min
+        lo = 1; hi = n
+        do while (lo < hi)
+            mid = (lo + hi) / 2
+            if (grid(mid) < v_min) then; lo = mid + 1
+            else;                        hi = mid
+            end if
+        end do
+        i1 = max(1, lo - 1)
+        ! binary search for last index <= v_max
+        lo = 1; hi = n
+        do while (lo < hi)
+            mid = (lo + hi + 1) / 2
+            if (grid(mid) > v_max) then; hi = mid - 1
+            else;                        lo = mid
+            end if
+        end do
+        i2 = min(n, lo + 1)
+        i1 = max(1, min(n, i1))
+        i2 = max(1, min(n, i2))
+    end subroutine find_visible_range
+
+    subroutine print_dos_row(grid, nw, iy, nh, label, lbl_w, gap_w)
+        integer, intent(in) :: nw, iy, nh, lbl_w, gap_w
+        character(len=1), intent(in) :: grid(nw, nh)
+        character(len=*), intent(in) :: label
+        character(len=4096) :: buf
+        character(len=1)   :: ch
+        character(len=3)   :: dc
+        integer :: ix, bp, labellen, n, slen, run_start, run_len, rt
+        character(len=16) :: cur_color, clr
+        logical :: is_fermi_line
+
+        bp = 1
+        labellen = len_trim(label)
+        if (labellen > 0) then
+            n = max(0, lbl_w - labellen)
+            if (n > 0) then; buf(bp:bp+n-1) = repeat(' ', n); bp = bp + n; end if
+            slen = len_trim(C_DIM); buf(bp:bp+slen-1) = trim(C_DIM); bp = bp + slen
+            buf(bp:bp+labellen-1) = label(1:labellen); bp = bp + labellen
+            slen = len_trim(C_RESET); buf(bp:bp+slen-1) = C_RESET; bp = bp + slen
+            buf(bp:bp+gap_w-1) = repeat(' ', gap_w); bp = bp + gap_w
+        else
+            n = lbl_w + gap_w
+            buf(bp:bp+n-1) = repeat(' ', n); bp = bp + n
+        end if
+
+        if (nw >= 1) then
+            run_start = 1
+            do while (run_start <= nw)
+                ch = grid(run_start, iy)
+                is_fermi_line = (ch == '|' .and. run_start > 1 .and. run_start < nw)
+                rt = dos_char_type(ch, iy == nh)
+                run_len = 1
+                do ix = run_start + 1, nw
+                    if (dos_char_type(grid(ix, iy), iy == nh) == rt) then
+                        run_len = run_len + 1
+                    else
+                        exit
+                    end if
+                end do
+                cur_color = dos_type_color(rt, is_fermi_line)
+                if (len_trim(cur_color) > 0) then
+                    clr = trim(cur_color)
+                    slen = len_trim(clr)
+                    buf(bp:bp+slen-1) = clr; bp = bp + slen
+                end if
+                do ix = 1, run_len
+                    dc = dos_type_char(grid(run_start + ix - 1, iy), rt)
+                    slen = len_trim(dc)
+                    if (slen == 0) slen = 1
+                    buf(bp:bp+slen-1) = dc(1:slen); bp = bp + slen
+                end do
+                if (len_trim(cur_color) > 0) then
+                    slen = len_trim(C_RESET)
+                    buf(bp:bp+slen-1) = C_RESET; bp = bp + slen
+                end if
+                run_start = run_start + run_len
+            end do
+        end if
+
+        write(*, '(a)') buf(1:bp-1)
+    end subroutine print_dos_row
+
+    pure function dos_char_type(ch, is_bottom) result(ct)
+        character(len=1), intent(in) :: ch
+        logical, intent(in) :: is_bottom
+        integer :: ct
+        ct = 0
+        if (ch == '|') then; ct = 1
+        else if (ch == 'B' .or. ch == 'R' .or. ch == 'T' .or. ch == 'Y' .or. ch == 'Z') then; ct = 1
+        else if (ch == '-') then; ct = 2
+        else if (ch == 'U') then; ct = 3
+        else if (ch == 'D') then; ct = 4
+        else if (ch == '.') then; ct = 5
+        else if (ch == 'S') then; ct = 6    ! s-orbital PDOS
+        else if (ch == 'P') then; ct = 7    ! p-orbital PDOS
+        else if (ch == 'L') then; ct = 8    ! d-orbital PDOS ('D' already used)
+        else if (ch == 'F') then; ct = 9    ! f-orbital PDOS
+        end if
+    end function dos_char_type
+
+    pure function dos_type_color(ct, is_fermi) result(clr)
+        integer, intent(in) :: ct
+        logical, intent(in) :: is_fermi
+        character(len=16) :: clr
+        select case (ct)
+        case (1);  clr = C_AXIS
+        case (2);  clr = C_AXIS
+        case (3);  clr = C_CYAN
+        case (4);  clr = C_YELLOW
+        case (5);  clr = C_DIM
+        case (6);  clr = C_CYAN      ! s
+        case (7);  clr = C_YELLOW    ! p
+        case (8);  clr = C_GREEN     ! d
+        case (9);  clr = C_RED       ! f
+        case default
+            if (is_fermi) then; clr = C_RED
+            else;               clr = ''
+            end if
+        end select
+    end function dos_type_color
+
+    pure function dos_type_char(ch, ct) result(dc)
+        character(len=1), intent(in) :: ch
+        integer, intent(in) :: ct
+        character(len=3) :: dc
+        select case (ct)
+        case (1)
+            select case (ch)
+            case ('B'); dc = '└'
+            case ('R'); dc = '┘'
+            case ('T'); dc = '┴'
+            case ('Y'); dc = '├'    ! y=0 left junction
+            case ('Z'); dc = '┤'    ! y=0 right junction
+            case default; dc = '│'
+            end select
+        case (2);  dc = '─'
+        case (3);  dc = '●'
+        case (4);  dc = '○'
+        case (5);  dc = '·'
+        case (6);  dc = '●'     ! s-orbital
+        case (7);  dc = '○'     ! p-orbital
+        case (8);  dc = '△'     ! d-orbital
+        case (9);  dc = '▽'     ! f-orbital
+        case default; dc = ' '
+        end select
+    end function dos_type_char
+
+
+
+    ! ----------------------------------------------------------------
+    !  CSV export for Origin / other plotting software
+    ! ----------------------------------------------------------------
+    subroutine write_dos_csv(energy_grid, dos_data, nspin, csv_file, iostat, iomsg)
+        real(dp), intent(in) :: energy_grid(:)
+        real(dp), intent(in) :: dos_data(:,:)
+        integer,  intent(in) :: nspin
+        character(len=*), intent(in) :: csv_file
+        integer,  intent(out) :: iostat
+        character(len=*), optional, intent(out) :: iomsg
+
+        integer :: unit, ios, ie, ne
+        character(len=128) :: line
+
+        iostat = 0
+        if (present(iomsg)) iomsg = ''
+        ne = size(energy_grid)
+        if (ne < 1) then
+            iostat = 1; if (present(iomsg)) iomsg = 'No data to export'; return
+        end if
+
+        open(newunit=unit, file=trim(csv_file), status='replace', &
+             action='write', iostat=ios)
+        if (ios /= 0) then
+            iostat = ios
+            if (present(iomsg)) iomsg = 'Cannot write: ' // trim(csv_file)
+            return
+        end if
+
+        ! header
+        if (nspin == 1) then
+            write(unit, '(a)') '# Energy(eV),DOS'
+        else
+            write(unit, '(a)') '# Energy(eV),DOS_up,DOS_down'
+        end if
+
+        do ie = 1, ne
+            if (nspin == 1) then
+                write(line, '(f12.6,a,es14.6)') energy_grid(ie), ',', dos_data(ie, 1)
+            else
+                write(line, '(f12.6,a,es14.6,a,es14.6)') &
+                    energy_grid(ie), ',', dos_data(ie, 1), ',', dos_data(ie, 2)
+            end if
+            ! strip internal spaces from Fortran formatted output
+            line = adjustl(line)
+            write(unit, '(a)') trim(line)
+        end do
+
+        close(unit)
+    end subroutine write_dos_csv
+
+    ! ----------------------------------------------------------------
+    !  SVG output
+    ! ----------------------------------------------------------------
+    subroutine write_dos_svg(energy_grid, dos_data, nspin, e_fermi, smearing, &
+            svg_file, w_px, h_px, iostat, iomsg)
+        real(dp), intent(in) :: energy_grid(:)
+        real(dp), intent(in) :: dos_data(:,:)
+        integer,  intent(in) :: nspin
+        real(dp), intent(in) :: e_fermi, smearing
+        character(len=*), intent(in) :: svg_file
+        integer,  intent(in) :: w_px, h_px
+        integer,  intent(out) :: iostat
+        character(len=*), optional, intent(out) :: iomsg
+
+        integer, parameter :: ML = 80, MR = 20, MT = 40, MB = 60
+        real(dp) :: e_min, e_max, e_range, y_max, x_scale, y_scale
+        integer  :: unit, ios, ie, ne, plot_w, plot_h, x, y, is
+        integer  :: fermi_x
+        character(len=32) :: rgb
+
+        iostat = 0
+        if (present(iomsg)) iomsg = ''
+        ne = size(energy_grid)
+        if (ne < 2) then
+            iostat = 1; return
+        end if
+
+        open(newunit=unit, file=trim(svg_file), status='replace', &
+             action='write', iostat=ios)
+        if (ios /= 0) then
+            iostat = ios
+            if (present(iomsg)) iomsg = 'Cannot write: ' // trim(svg_file)
+            return
+        end if
+
+        plot_w = w_px - ML - MR
+        plot_h = h_px - MT - MB
+
+        e_min = energy_grid(1)
+        e_max = energy_grid(ne)
+        e_range = e_max - e_min
+        if (e_range < 1.0e-12_dp) e_range = 1.0_dp
+
+        y_max = 0.0_dp
+        do is = 1, nspin
+            do ie = 1, ne
+                if (dos_data(ie, is) > y_max) y_max = dos_data(ie, is)
+            end do
+        end do
+        y_max = y_max * 1.15_dp
+        if (y_max < 1.0e-12_dp) y_max = 1.0_dp
+
+        x_scale = real(plot_w, dp) / e_range
+        y_scale = real(plot_h, dp) / y_max
+        fermi_x = ML + nint((0.0_dp - e_min) * x_scale)
+
+        write(unit, '(a)') '<?xml version="1.0" encoding="UTF-8"?>'
+        write(unit, '(a,i0,a,i0,a,i0,a,i0,a)') &
+            '<svg xmlns="http://www.w3.org/2000/svg" width="', w_px, &
+            '" height="', h_px, '" viewBox="0 0 ', w_px, ' ', h_px, '">'
+        write(unit, '(a)') '  <rect width="100%" height="100%" fill="white"/>'
+        write(unit, '(a,i0,a,i0,a,i0,a,i0,a)') &
+            '  <rect x="', ML, '" y="', MT, &
+            '" width="', plot_w, '" height="', plot_h, &
+            '" fill="none" stroke="black" stroke-width="1"/>'
+
+        write(unit, '(a,i0,a,i0,a,i0,a,i0,a)') &
+            '  <line x1="', fermi_x, '" y1="', MT, &
+            '" x2="', fermi_x, '" y2="', MT + plot_h, &
+            '" stroke="red" stroke-width="1.5" stroke-dasharray="6,4"/>'
+        write(unit, '(a,i0,a,i0,a)') &
+            '  <text x="', fermi_x + 5, '" y="', MT + 15, &
+            '" fill="red" font-size="12">E_F</text>'
+
+        do is = 1, nspin
+            if (is == 1) then
+                rgb = 'rgb(114,135,253)'
+            else
+                rgb = 'rgb(221,120,120)'
+            end if
+            write(unit, '(a,a,a)') &
+                '  <polyline fill="none" stroke="', trim(rgb), '" stroke-width="1.5" points="'
+            do ie = 1, ne
+                x = ML + nint((energy_grid(ie) - e_min) * x_scale)
+                y = MT + plot_h - nint(dos_data(ie, is) * y_scale)
+                x = max(ML, min(ML + plot_w, x))
+                y = max(MT, min(MT + plot_h, y))
+                if (ie > 1) write(unit, '(1x)', advance='no')
+                write(unit, '(i0,a,i0)', advance='no') x, ',', y
+            end do
+            write(unit, '(a)') '"/>'
+        end do
+
+        write(unit, '(a,i0,a,i0,a)') &
+            '  <text x="15" y="', h_px/2, &
+            '" transform="rotate(-90,15,', h_px/2, &
+            ')" text-anchor="middle" font-size="14">DOS (electrons/eV)</text>'
+        write(unit, '(a,i0,a,i0,a)') &
+            '  <text x="', w_px/2, '" y="', h_px - 15, &
+            '" text-anchor="middle" font-size="14">Energy (eV) rel. to E_F</text>'
+        write(unit, '(a,i0,a,i0,a,a,a)') &
+            '  <text x="', w_px/2, '" y="', MT - 10, &
+            '" text-anchor="middle" font-size="16" font-weight="bold">', &
+            'Density of States</text>'
+        write(unit, '(a,i0,a,i0,a,f5.2,a)') &
+            '  <text x="', w_px/2, '" y="', h_px - 35, &
+            '" text-anchor="middle" font-size="11" fill="gray">smearing = ', &
+            smearing, ' eV</text>'
+
+        write(unit, '(a)') '</svg>'
+        close(unit)
+    end subroutine write_dos_svg
+
+    ! ----------------------------------------------------------------
+    !  PDOS multi-channel ASCII plot (s, p, d, f)
+    ! ----------------------------------------------------------------
+    subroutine plot_pdos_ascii(energy_grid, pdos_data, e_fermi, smearing, &
+            term_w_in, term_h_in, y_center_in, y_half_in, e_center_in, half_range_in)
+        real(dp), intent(in) :: energy_grid(:)
+        real(dp), intent(in) :: pdos_data(:,:)
+        real(dp), intent(in) :: e_fermi, smearing
+        integer,  intent(in) :: term_w_in, term_h_in
+        real(dp), intent(in), optional :: y_center_in, y_half_in, e_center_in, half_range_in
+
+        integer, parameter :: MAX_CH = 5
+        character(len=1), parameter :: ch_mark(5) = ['U', 'S', 'P', 'L', 'F']  ! tot,s,p,d,f (tot uses 'U'=type 3=●)
+        integer  :: ne, nw, nh, ix, iy, ie, ich, nw_data
+        integer  :: fermi_col, y_label_width, gap_width, y_label_interval
+        integer  :: i1, i2
+        real(dp) :: e_min, e_max, e_range, y_center, y_half, y_min, y_max
+        real(dp) :: y_scale, x_scale, x_val, dos_val
+        real(dp) :: e_center, half_range
+        character(len=1), allocatable :: grid(:,:)
+        character(len=64)  :: fmt_label, tmp_str
+        integer  :: last_ix, last_iy
+
+        ne = size(energy_grid)
+        if (ne < 2 .or. size(pdos_data, 1) /= ne) then
+            write(*, '(a)') '  No PDOS data to plot.'; return
+        end if
+
+        e_center = 0.0_dp
+        half_range = energy_grid(ne) - energy_grid(1)
+        if (present(e_center_in))   e_center   = e_center_in
+        if (present(half_range_in)) half_range = half_range_in
+
+        if (half_range < 0.25_dp) half_range = 0.25_dp
+        e_min = e_center - half_range
+        e_max = e_center + half_range
+        e_range = e_max - e_min
+        if (e_range < 1.0e-12_dp) e_range = 1.0_dp
+
+        call find_visible_range(energy_grid, e_min, e_max, i1, i2)
+
+        call get_term_size(nw, nh)
+        if (term_w_in > 0) nw = term_w_in
+        if (term_h_in > 0) nh = term_h_in
+        nw = max(30, min(300, nw))
+        nh = max(15, min(100, nh))
+        nh = max(15, nh - 10)
+
+        y_max = 1.0_dp
+        do ich = 2, MAX_CH
+            do ie = 1, ne
+                if (pdos_data(ie, ich) > y_max) y_max = pdos_data(ie, ich)
+            end do
+        end do
+        y_max = y_max * 1.15_dp
+        if (y_max < 1.0e-12_dp) y_max = 1.0_dp
+        y_center = y_max / 2.0_dp
+        y_half   = y_max / 2.0_dp
+        if (present(y_center_in)) y_center = y_center_in
+        if (present(y_half_in))   y_half   = y_half_in
+        if (y_half < 1.0e-12_dp) y_half = 0.5_dp
+        y_min = y_center - y_half
+        y_max = y_center + y_half
+
+        y_label_width = 0
+        write(tmp_str, '(f10.4)') y_max
+        y_label_width = max(y_label_width, len_trim(adjustl(tmp_str)))
+        write(tmp_str, '(f10.4)') y_min
+        y_label_width = max(y_label_width, len_trim(adjustl(tmp_str)))
+        y_label_width = max(y_label_width, 6)
+        gap_width = 1
+        nw_data = max(20, nw - y_label_width - gap_width)
+
+        allocate(grid(nw_data, nh))
+        grid = ' '
+
+        x_scale = real(nw_data - 3, dp) / e_range
+        y_scale = real(nh - 1, dp) / (y_max - y_min)
+
+        fermi_col = nint((0.0_dp - e_min) * x_scale) + 2
+        fermi_col = max(2, min(nw_data - 1, fermi_col))
+
+        ! Plot s, p, d, f channels (skip total = index 1)
+        do ich = 2, MAX_CH
+            last_ix = -1
+            do ie = i1, i2
+                x_val = energy_grid(ie)
+                if (x_val < e_min .or. x_val > e_max) cycle
+                dos_val = pdos_data(ie, ich)
+                ix = nint((x_val - e_min) * x_scale) + 2
+                iy = nh - nint((dos_val - y_min) * y_scale)
+                ix = max(2, min(nw_data - 1, ix))
+                iy = max(1, min(nh, iy))
+                grid(ix, iy) = ch_mark(ich)   ! U=total, S=s, P=p, L=d, F=f
+                if (last_ix > 0) call draw_line(nw_data, nh, grid, last_ix, last_iy, ix, iy)
+                last_ix = ix; last_iy = iy
+            end do
+        end do
+
+        ! Fermi level
+        do iy = 1, nh
+            if (fermi_col >= 2 .and. fermi_col <= nw_data - 1) then
+                if (grid(fermi_col, iy) == ' ') grid(fermi_col, iy) = '|'
+            end if
+        end do
+
+        ! y=0 horizontal reference line
+        iy = nh - nint((0.0_dp - y_min) * y_scale)
+        iy = max(1, min(nh, iy))
+        do ix = 2, nw_data - 1
+            if (grid(ix, iy) == ' ') grid(ix, iy) = '-'
+        end do
+        if (grid(1, iy) == '|') grid(1, iy) = 'Y'
+        if (grid(nw_data, iy) == '|') grid(nw_data, iy) = 'Z'
+
+        ! borders
+        do iy = 1, nh
+            if (grid(1, iy) == ' ') grid(1, iy) = '|'
+            if (grid(nw_data, iy) == ' ') grid(nw_data, iy) = '|'
+        end do
+        do ix = 2, nw_data - 1
+            if (grid(ix, nh) == ' ' .or. grid(ix, nh) == '-') grid(ix, nh) = '-'
+        end do
+        grid(1, nh) = 'B'; grid(nw_data, nh) = 'R'
+        if (grid(fermi_col, nh) == '-') grid(fermi_col, nh) = 'T'
+
+        ! header
+        write(*, '(a)') ''
+        write(*, '(a,i0,a,f5.2,a)') C_BOLD // '  Projected DOS  ' // &
+            C_RESET // C_CYAN, i2 - i1 + 1, C_RESET // ' pts,  smearing=' // &
+            C_CYAN, smearing, ' eV' // C_RESET
+        write(tmp_str, '(f8.4)') e_min
+        write(*, '(a)', advance='no') '  ' // C_DIM // 'Energy: [' // C_RESET // &
+            trim(adjustl(tmp_str)) // C_DIM // ' to ' // C_RESET
+        write(tmp_str, '(f8.4)') e_max
+        write(*, '(a,i0,1x,i0,a)') trim(adjustl(tmp_str)) // C_DIM // '] eV' // &
+            C_RESET // '  grid:' // C_RESET, nw_data, nh
+        write(tmp_str, '(f8.4)') y_max
+        write(*, '(a)') '  ' // C_DIM // 'DOS max: ' // C_RESET // trim(adjustl(tmp_str))
+        write(*, '(a)') ''
+
+        ! top border
+        write(*, '(a)') repeat(' ', y_label_width + gap_width) // C_AXIS &
+            // '┌' // repeat('─', nw_data - 2) // '┐' // C_RESET
+
+        y_label_interval = max(1, nh / 6)
+        do iy = 1, nh
+            fmt_label = ''
+            if (mod(iy - 1, y_label_interval) == 0 .or. iy == 1 .or. iy == nh) then
+                dos_val = (real(nh - iy, dp) / real(nh - 1, dp)) * y_max
+                write(fmt_label, '(f10.4)') dos_val
+                fmt_label = adjustl(fmt_label)
+            end if
+            call print_dos_row(grid, nw_data, iy, nh, fmt_label, y_label_width, gap_width)
+        end do
+
+        ! x-axis
+        write(tmp_str, '(f8.2)') e_max
+        tmp_str = adjustl(tmp_str)
+        write(fmt_label, '(f8.2)') e_min
+        fmt_label = adjustl(fmt_label)
+        write(*, '(a,a,a)') repeat(' ', y_label_width + gap_width) // C_DIM, &
+            trim(fmt_label) // repeat(' ', max(0, nw_data - 3 - len_trim(tmp_str))) &
+            // trim(tmp_str), C_RESET
+
+        write(*, '(a,a)') repeat(' ', y_label_width + gap_width) // C_DIM, &
+            repeat(' ', fermi_col - 2) // C_RED // 'E_F' // C_RESET
+
+        ! legend
+        write(*, '(a)') ''
+        write(*, '(a)') '  ' // C_CYAN   // '● s'   // C_RESET // '  ' &
+                          // C_YELLOW // '○ p'   // C_RESET // '  ' &
+                          // C_GREEN  // '△ d'   // C_RESET // '  ' &
+                          // C_RED    // '▽ f'   // C_RESET
+
+        deallocate(grid)
+    end subroutine plot_pdos_ascii
+
+    ! ----------------------------------------------------------------
+    !  PDOS CSV export (multi-channel)
+    ! ----------------------------------------------------------------
+    subroutine write_pdos_csv(energy_grid, pdos_data, csv_file, iostat, iomsg)
+        real(dp), intent(in) :: energy_grid(:)
+        real(dp), intent(in) :: pdos_data(:,:)
+        character(len=*), intent(in) :: csv_file
+        integer,  intent(out) :: iostat
+        character(len=*), optional, intent(out) :: iomsg
+
+        integer :: unit, ios, ie, ne
+
+        iostat = 0
+        if (present(iomsg)) iomsg = ''
+        ne = size(energy_grid)
+        if (ne < 1) then
+            iostat = 1; if (present(iomsg)) iomsg = 'No data'; return
+        end if
+
+        open(newunit=unit, file=trim(csv_file), status='replace', &
+             action='write', iostat=ios)
+        if (ios /= 0) then
+            iostat = ios
+            if (present(iomsg)) iomsg = 'Cannot write: ' // trim(csv_file)
+            return
+        end if
+
+        write(unit, '(a)') '# Energy(eV),Total,s,p,d,f'
+        do ie = 1, ne
+            write(unit, '(f12.6,5(a,es14.6))') &
+                energy_grid(ie), ',', pdos_data(ie, 1), ',', pdos_data(ie, 2), &
+                ',', pdos_data(ie, 3), ',', pdos_data(ie, 4), ',', pdos_data(ie, 5)
+        end do
+
+        close(unit)
+    end subroutine write_pdos_csv
+
+end module dos_plotter
