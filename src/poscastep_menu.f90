@@ -180,9 +180,11 @@ contains
             else if (ch == '+' .or. ch == '=') then
                 half_range = max(0.25_dp, half_range * 0.5_dp)
                 scroll_step = max(0.25_dp, half_range * 0.5_dp)
+                k_width_pct = max(0.05_dp, k_width_pct * 0.5_dp)
             else if (ch == '-') then
                 half_range = min(20.0_dp, half_range * 2.0_dp)
                 scroll_step = max(0.25_dp, half_range * 0.5_dp)
+                k_width_pct = min(1.0_dp, k_width_pct * 2.0_dp)
             else if (ch == 'r' .or. ch == 'R') then
                 e_center = fermi_ev
                 k_pct = 0.5_dp

@@ -1,6 +1,6 @@
 # CASTEP Suite
 
-A Fortran 2008 CLI toolkit for [CASTEP] DFT calculations — generate input files from crystal structures, and post-process band structures, DOS, and projected DOS.
+A Fortran 2008 CLI toolkit for [CASTEP] DFT calculations — generate input files from crystal structures, and post-process data.
 
 ## What it does
 
@@ -24,7 +24,7 @@ make
 
 ```
   ==================================
-             CASTEP Suite
+            CASTEP Suite
   ==================================
   1. PreCASTEP  (generate CASTEP input files)
   2. PosCASTEP  (post-process CASTEP output)
@@ -42,38 +42,92 @@ Converts crystal structure files into CASTEP input. Supports three input formats
 | PDB | `.pdb` | Protein Data Bank |
 | CASTEP cell | `.cell` | Existing CASTEP files |
 
+Output files are auto-named from the input stem and task type (e.g. `Cu_Phonon.cell`, `Cu_Phonon.param`).
+
 ### Menu
 
 ```
-  ==================================
-              PreCASTEP
-  ==================================
-  -2. Advanced option
-  -1. Spin_polarized : false
-   0. Generate .cell and .param files
-   1. Task : SINGLEPOINT
-   2. XC_functional : PBE
-   3. Cutoff energy : 400.0 eV
-   4. vdW correction : NONE
-   5. Pseudopotential : C19MK2
-   6. K-point scheme : GAMMA
-   7. SCF tolerance : 1e-5
-   8. Symmetry : NONE
-   Q. Back
+  ================================
+             PreCASTEP
+  ================================
+  CIF: Cu.cif
+ -3. Nonlinear optics       (NONE)       ← EFIELD / Phonon+Efield only
+ -2. Advanced option
+ -1. Spin_polarized : false
+  0. Generate InputFile
+  1. Task                   (Energy)
+  2. XC functional          (PBE)
+  3. Cutoff energy (eV)     (400)
+  4. vdW correction         (NONE)
+  5. Pseudopotential        (C19MK2)
+  6. K-point                (GAMMA)
+  7. SCF tolerance          (1e-5)
+  8. Symmetry               (NONE)
+  9. Phonon q-point scheme   (1 1 1)     ← phonon tasks only
+ 10. Phonon method           (DFPT)
+ 11. Phonon fine method      (INTERPOLATE)
+ 12. Phonon energy tol       (  1.0E-05)
+ 14. Phonon fine q-point     (1 1 1)
+  Q. Back
 ```
 
-Key options:
+### Task types (7 developed, 9 stubs)
 
-- **Task types**: 17 options including SINGLEPOINT, GEOMETRYOPTIMISATION, CELLOPTIMISATION, MOLECULAR_DYNAMICS, PHONON, ElectronicSpectroscopy, and more
+| # | Task | Status |
+|---|------|--------|
+| 1 | Energy | Done |
+| 2 | GeometryOptimisation | Done |
+| 3 | ElectronicSpectroscopy | Done |
+| 4 | Phonon | Done |
+| 5 | Phonon+Efield | Done |
+| 6 | Efield | Done |
+| 7 | Thermodynamics | Done |
+| 8-16 | MolecularDynamics … EpCoupling | Stub |
+
+### Key options
+
 - **XC functionals**: PBE, PBEsol, HSE06, PBE0, r2scan
-- **vdW corrections**: D3, D3-BJ, D4
+- **vdW corrections**: NONE, D3, D3-BJ, D4
 - **Pseudopotentials**: NCP19, C19MK2, SOC19 (auto-enables spin polarization)
 - **K-point schemes**: Gamma, Monkhorst-Pack
-- **Optimizer** (geometry tasks): BFGS, LBFGS, CG
+- **Geometry optimizers**: BFGS, LBFGS, CG
+- **Geo tolerance**: COARSE, MEDIUM, FINE, EXTREME
+- **Symmetry**: NONE, AUTO
+
+### Phonon support
+
+Full phonon calculation support with Finite Displacement (FD) and DFPT methods:
+
+- **Q-point sampling**: MP_GRID or custom k-point PATH
+- **Phonon DOS**: Gaussian smearing with configurable spacing and limit
+- **Sum rule**: NONE or RECIPROCAL
+- **Force constants**: write to disk, cutoff with SPHERICAL or CUMULANT method
+- **Born charges** and **Raman** intensities
+- **LO/TO splitting** (auto-enabled for Phonon+Efield)
+- **Fine method**: INTERPOLATE or SUPERCELL with independent q-point sampling
+
+### EFIELD support
+
+- DFPT polarizability with configurable max cycles, energy tolerance, convergence window
+- Frequency-dependent response: spacing, oscillator Q, ion permittivity
+- **Nonlinear optics**: CHI2 calculation
+- Molecular mode exclusion: CRYSTAL(3), MOLECULE(6), LINEAR_MOLECULE(5)
+- Phonon+Efield combined task with full phonon + EFIELD parameter sets
+
+### Advanced options
+
+Additional parameters accessible via `-2. Advanced option`:
+
+| Group | Items |
+|-------|-------|
+| SCF | Smearing, Max SCF cycles, Convergence window |
+| Electronic | Calculate ELF, Calculate EDD |
+| Phonon | DOS, sum rule, finite displacement, max cycles, DFPT method, force constants, dynamical matrix, LO/TO, cutoff, max CG steps, k-point symmetry, Born charges, Raman |
+| EFIELD | DFPT method, max cycles, energy tol, conv window, freq spacing, oscillator Q, ion permittivity, ignore molec modes |
 
 ### Output
 
-Generates a `.cell` file in `%BLOCK` format and a `.param` file in `key : value` format. Always writes `LATTICE_ABC` regardless of input format.
+Generates a `.cell` file in `%BLOCK` format and a `.param` file in `key : value` format. Always writes `LATTICE_ABC` regardless of input format. CASTEP 25.12 compatible.
 
 ## PosCASTEP — post-processing
 
@@ -95,7 +149,7 @@ Generates a `.cell` file in `%BLOCK` format and a `.param` file in `key : value`
 - **Terminal-adaptive**: re-detects size on every redraw
 - Unicode box frame, multi-symbol bands (● ○ □ △ ▽)
 - k-point path labels auto-detected from direction changes
-- Controls: `↑↓` scroll energy, `← →` scroll k-path, `+/-` zoom, `R` reset, `Q` quit
+- Controls: `↑↓` scroll energy, `← →` scroll k-path, `+/-` zoom both axes, `R` reset, `Q` quit
 - SVG vector output available
 
 ### 2. Plot DOS (total density of states)
@@ -126,6 +180,7 @@ CASTEP_Suite/
 ├── CLAUDE.md
 └── src/
     ├── config.f90           # Types, constants, physical parameters
+    ├── term_utils.f90       # ANSI colors, terminal size, Bresenham line draw
     ├── parser.f90           # CIF / PDB / .cell file parsers
     ├── cell_writer.f90      # CASTEP .cell file generator (%BLOCK format)
     ├── param_writer.f90     # CASTEP .param file generator (key-value)
@@ -157,3 +212,7 @@ CASTEP_Suite/
 | `-Wall -Wextra` | Comprehensive warnings |
 | `-O2` | Optimization |
 | `-g` | Debug symbols |
+
+## License
+
+MIT
