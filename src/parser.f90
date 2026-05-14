@@ -252,6 +252,8 @@ contains
             if (compare_tags(trimmed, '%BLOCK POSITIONS_ABS') .or. &
                 compare_tags(trimmed, '%BLOCK POSITIONS_FRAC')) then
                 in_positions = .true.
+                if (compare_tags(trimmed, '%BLOCK POSITIONS_FRAC')) &
+                    data%positions_fractional = .true.
                 cycle
             end if
             if (compare_tags(trimmed, '%ENDBLOCK POSITIONS_ABS') .or. &
@@ -355,6 +357,7 @@ contains
         data%alpha = 90.0_dp; data%beta = 90.0_dp; data%gamma = 90.0_dp
         data%space_group = 'P1'
         data%n_atoms = 0
+        data%positions_fractional = .true.   ! CIF coordinates are always fractional
         idx_col(1:5) = 0
         if (allocated(data%atoms)) deallocate(data%atoms)
 

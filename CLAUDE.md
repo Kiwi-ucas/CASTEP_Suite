@@ -41,7 +41,7 @@ Requirements: gfortran >= 7.0, Make.
 
 ### PreCASTEP (option 1)
 
-Interactive menu prompts for CIF/PDB/.cell file path, output base name, then loops with numbered options for CASTEP parameters:
+Interactive menu prompts for CIF/PDB/.cell file path via `ask_input_file`, auto-generates output base name from input stem + task type, then loops with numbered options for CASTEP parameters:
 - `-2. Advanced option` — Smearing (off/on), Max SCF cycles, Convergence window (min 2), Calculate ELF, Calculate EDD
 - `-1. Spin_polarized : true/false` — Toggle spin polarization; auto-set to true when pseudopotential is SOC19
 - `0` — Generate `.cell` and `.param` files and **exit the program** (does not return to suite menu)
@@ -104,11 +104,11 @@ Thirteen source files in `src/`:
 
 2. **term_utils.f90** — `term_utils` module. Leaf module (zero dependencies). Provides shared ANSI color constants (`C_RED`, `C_GREEN`, `C_YELLOW`, `C_CYAN`, `C_BOLD`, `C_DIM`, `C_RESET`, `C_AXIS`), terminal size detection (`get_term_size` + private `stty_size`), and Bresenham line-drawing (`draw_line`). Used by `bands_plotter`, `dos_plotter`, and `poscastep_menu`.
 
-3. **parser.f90** — `parser` module. File format parsers: `parse_cif_inline`, `parse_pdb_inline`, `parse_cell_inline`. Private helpers: `tokenize_inline`, `clean_str_inline`, `copy_str_no_quotes`. Exports `clean_element_symbol` for oxidation state stripping (e.g., "Cu0+" -> "Cu"). Handles CIF tag-value pairs and `loop_` blocks, PDB CRYST1/UNITCELL/ATOM records, CASTEP .cell `%BLOCK LATTICE_ABC` and `%BLOCK LATTICE_CART`. `parse_cell_inline` includes `compute_abc_from_cartesian` for Cartesian-to-lattice conversion.
+3. **parser.f90** — `parser` module. File format parsers: `parse_cif_inline`, `parse_pdb_inline`, `parse_cell_inline`. Private helpers: `tokenize_inline`, `clean_str_inline`, `copy_str_no_quotes`. Exports `clean_element_symbol` for oxidation state stripping (e.g., "Cu0+" -> "Cu"). Handles CIF tag-value pairs and `loop_` blocks, PDB CRYST1/UNITCELL/ATOM records, CASTEP .cell `%BLOCK LATTICE_ABC`, `%BLOCK LATTICE_CART`, `%BLOCK POSITIONS_ABS`, and `%BLOCK POSITIONS_FRAC`. `parse_cell_inline` includes `compute_abc_from_cartesian` for Cartesian-to-lattice conversion. `cif_data_t` has a `positions_fractional` field set by the parser — CIF and `POSITIONS_FRAC` set it `.true.`, PDB and `POSITIONS_ABS` leave it `.false.`.
 
 4. **cell_writer.f90** — `cell_writer` module. Generates CASTEP `.cell` file in `%BLOCK` format. Each `%BLOCK` type written by independent subroutine: `write_block_lattice_abc`, `write_block_species_pot`, `write_block_positions_abs`, `write_block_cell_constraints`, `write_block_kpoint_grid`. Phonon-specific blocks: `write_block_phonon_kpoint_mp`, `write_block_phonon_kpoint_path`, `write_block_phonon_fine_kpoint_path`, `write_block_phonon_supercell_matrix`. `write_block_positions_abs` handles both fractional (CIF) and Cartesian (PDB/.cell) input. `write_block_cell_constraints` only written when task is GEOMETRYOPTIMISATION and cell_opt_mode is ALL. `SYMMETRY_GENERATE` written when sym_source is AUTO. `KPOINTS_MP_GRID` written for GAMMA and MONKHORST_PACK schemes. `PHONON_KPOINT_MP_GRID` and `PHONON_FINE_KPOINT_MP_GRID` written for phonon tasks. Private helper `is_phonon_task` gates phonon blocks.
 
-5. **param_writer.f90** — `param_writer` module. Generates CASTEP `.param` file in `key : value` format. Task line first, then common keywords, then task-diff keywords (16 task-specific blocks including full PHONON/PHONON+EFIELD/THERMODYNAMICS support). Phonon keywords written by shared `write_phonon_params` helper (method, energy_tol, max_cycles, dfpt_method, DOS, sum_rule, output control, Raman, etc.). vdW-DED keywords when vdW is not NONE. Each keyword written by `write_kv(unit, key, value)`. CASTEP 25.12 compatibility: no `_unit` suffix keywords, no explicit toggle keywords (`thermo`, `electric_field`) — units are implicit and tasks self-enable.
+5. **param_writer.f90** — `param_writer` module. Generates CASTEP `.param` file in `key : value` format. Task line first, then common keywords, then task-diff keywords (16 task-specific blocks including full PHONON/PHONON+EFIELD/THERMODYNAMICS support). Phonon keywords written by shared `write_phonon_params` helper (method, energy_tol, max_cycles, dfpt_method, DOS, sum_rule, output control, Raman, etc.). `calculate_raman` also writes `raman_range_low : 0.00e+00 cm-1` and `raman_range_high : 1.00e+04 cm-1`. `calculate_born_charges` also writes `born_charge_sum_rule : true`. `write_efield_params` writes `efield_ignore_molec_modes` (CRYSTAL/MOLECULE/LINEAR_MOLECULE). vdW-DED keywords when vdW is not NONE. Force constant cutoff branches on method: SPHERICAL→`phonon_force_constant_cutoff`, CUMULANT→`phonon_force_constant_cutoff_scale`. Each keyword written by `write_kv(unit, key, value)`. CASTEP 25.12 compatibility: no `_unit` suffix keywords, no explicit toggle keywords (`thermo`, `electric_field`) — units are implicit and tasks self-enable.
 
 6. **bands_parser.f90** — `bands_parser` module. Parses CASTEP `.bands` output files into `bands_data_t`. Public: `parse_bands_file(filename, bands, iostat, iomsg)`, `free_bands_data(bands)`. Reads header metadata (num_kpoints, num_spin, num_electrons, num_eigenvalues, fermi_energy), k-point coordinates with cumulative path distances, and eigenvalue data. Eigenvalues stored in Hartree as `eigenvalues(ie, ik, is)`.
 
@@ -120,11 +120,11 @@ Thirteen source files in `src/`:
 
 10. **dos_plotter.f90** — `dos_plotter` module. DOS/PDOS visualization: interactive ASCII terminal plots + SVG + CSV export. Public constants: `DOS_MODE_ASCII=1`, `DOS_MODE_SVG=2`, `DOS_MODE_EXPORT=3`. Public: `plot_dos_ascii(energy_grid, dos_data, nspin, e_fermi, smearing, term_w_in, term_h_in, y_center_in, y_half_in, e_center_in, half_range_in)` — interactive total DOS ASCII plot with y_center/y_half axis model, `plot_pdos_ascii` — s/p/d/f multi-channel PDOS plot with legend (● s, ○ p, △ d, ▽ f), `write_dos_svg`, `write_dos_csv`, `write_pdos_csv`. Uses `term_utils` for ANSI colors, terminal detection, and line drawing. y=0 horizontal reference line with ├┤ junctions. PDOS character types extended: 'S'/'P'/'L'/'F' for s/p/d/f orbitals, 'Y'/'Z' for y=0 junctions.
 
-11. **cli_menu.f90** — `cli_menu` module. PreCASTEP main configuration menu loop with cached `castep_config_t` state. Q returns `IO_USER_QUIT`. Task switch auto-configures DFPT→NCP19 and THERMO→FD+SUPERCELL. Uses `strip_quotes` from config. Helper functions: `task_label`, `cutoff_label`, `kpoint_label`, `scf_label`, `geom_tol_label`, `sym_label`, `sp_label`, `smearing_label`. Conditionally shown items: optimizer/cell_opt_mode/geo_tolerance for GEOMETRY_OPT; phonon q-point scheme, method, fine method, energy_tol, supercell matrix for phonon tasks (items 9-13). Extended `ask_advanced_options` accepts optional phonon parameters for the Advanced sub-menu (items 6-23 for phonon). Phonon-specific subroutines: `ask_phonon_qpoint_scheme`, `ask_phonon_kpoint_grid`, `ask_phonon_path`, `ask_phonon_method`, `ask_phonon_fine_method`, `ask_phonon_energy_tol`, `ask_phonon_supercell_matrix`, `ask_phonon_fine_qpoint_scheme`, `ask_phonon_fine_path`, `ask_phonon_sum_rule`, `ask_phonon_dfpt_method`. K-point MONKHORST_PACK accepts comma-separated grid.
+11. **cli_menu.f90** — `cli_menu` module. PreCASTEP main configuration menu loop with cached `castep_config_t` state. Q returns `IO_USER_QUIT`. Task switch auto-configures DFPT→NCP19, THERMO→FD+SUPERCELL, and PHONON+EFIELD→LO/TO ON. Uses `strip_quotes` from config. Helper functions: `task_label`, `cutoff_label`, `kpoint_label`, `qpoint_label` (shows MP_GRID as "i j k" values), `scf_label`, `geom_tol_label`, `sym_label`, `sp_label`, `smearing_label`. Public: `ask_input_file` (generic path reader with `inquire` existence check). Conditionally shown items: optimizer/cell_opt_mode/geo_tolerance for GEOMETRY_OPT; phonon q-point scheme, method, fine method, energy_tol, supercell matrix for phonon tasks (items 9-14); EFIELD ignore molec modes (item 30). Extended `ask_advanced_options` accepts optional phonon/EFIELD parameters for the Advanced sub-menu (items 6-30, with DOS spacing+limit grouped under item 6, FD-only keywords gated by `.not. is_dfpt`, LO/TO toggle locked for EFIELD tasks). Phonon-specific subroutines: `ask_phonon_qpoint_scheme`, `ask_phonon_kpoint_grid`, `ask_phonon_path`, `ask_phonon_method`, `ask_phonon_fine_method`, `ask_phonon_energy_tol`, `ask_phonon_supercell_matrix`, `ask_phonon_fine_qpoint_scheme`, `ask_phonon_fine_path`, `ask_phonon_sum_rule`, `ask_phonon_dfpt_method`. K-point MONKHORST_PACK accepts comma-separated grid. EFIELD: `efield_ignore_molec_modes` (CRYSTAL/MOLECULE/LINEAR_MOLECULE).
 
-12. **poscastep_menu.f90** — `poscastep_menu` module. PosCASTEP post-processing menu loop. Public: `run_poscastep_menu(iostat)`. Menu options: 1. Plot Band Structure, 2. Plot DOS, 3. Plot pDOS, Q. Back. Private: `handle_bands_menu` → `run_ascii_navigator` (↑↓ energy scroll, ← → k-path, +/- zoom, R reset, Q quit), `handle_dos_menu` — total DOS (prompts .bands path with SAVE memory; output: ASCII/SVG/CSV; 4001-point Fermi ±20 eV grid), `handle_pdos_menu` — projected DOS (prompts file prefix, auto-derives .bands + .pdos_bin paths with SAVE memory; output: ASCII/CSV), `run_dos_navigator` (↑↓ y-pan, ←→ x-pan, +/- both-axes zoom, R reset, Q quit), `run_pdos_navigator` (same controls), `build_energy_grid`, `ensure_ext` (auto-append file extension). Gets `get_term_size` from `term_utils`. Uses `stty -icanon -echo min 1` for character input.
+12. **poscastep_menu.f90** — `poscastep_menu` module. PosCASTEP post-processing menu loop. Public: `run_poscastep_menu(iostat)`. Menu options: 1. Plot Band Structure, 2. Plot DOS, 3. Plot pDOS, Q. Back. Private: `handle_bands_menu` → `run_ascii_navigator` (↑↓ energy scroll, ← → k-path, +/- zoom both axes, R reset, Q quit), `handle_dos_menu` — total DOS (prompts .bands path with SAVE memory; output: ASCII/SVG/CSV; 4001-point Fermi ±20 eV grid), `handle_pdos_menu` — projected DOS (prompts file prefix, auto-derives .bands + .pdos_bin paths with SAVE memory; output: ASCII/CSV), `run_dos_navigator` (↑↓ y-pan, ←→ x-pan, +/- both-axes zoom, R reset, Q quit), `run_pdos_navigator` (same controls), `build_energy_grid`, `ensure_ext` (auto-append file extension). Gets `get_term_size` from `term_utils`. Uses `stty -icanon -echo min 1` for character input.
 
-13. **main.f90** — `CASTEP_Suite` program. Suite top-level `do` loop with three options (1. PreCASTEP, 2. PosCASTEP, Q. Quit). PreCASTEP logic extracted into internal subroutine `run_precastep_workflow(should_exit)`: init defaults → file recognition → `run_main_menu` → parse input → compute lattice → write .cell/.param → set `should_exit=.true.` to exit program. All `stop` replaced with `return`. Helper functions: `real2str_dp`, `compute_cartesian_lattice`, `get_file_extension`, `to_lower_inline`.
+13. **main.f90** — `CASTEP_Suite` program. Suite top-level `do` loop with three options (1. PreCASTEP, 2. PosCASTEP, Q. Quit). PreCASTEP logic extracted into internal subroutine `run_precastep_workflow(should_exit)`: init defaults → file recognition → `run_main_menu` → parse input → compute lattice → write .cell/.param → set `should_exit=.true.` to exit program. All `stop` replaced with `return`. Coordinate system determined by `castep_config_t%cartesian_coords = .not. cif%positions_fractional` (data-driven from parser, not file extension). Helper functions: `real2str_dp`, `compute_cartesian_lattice`, `get_file_extension`, `to_lower_inline`.
 
 ### Module dependency chain
 
@@ -173,7 +173,7 @@ term_utils    (leaf)
 - **Multi-format parsing in parser.f90** — CIF, PDB, and .cell parsing extracted to `parser` module. File type determined by extension.
 - **PDB parsing** — CRYST1 record (columns), UNITCELL record, and ATOM/HETATM records. All PDB coordinates are Cartesian.
 - **LATTICE_CART support** — `parse_cell_inline` handles both `%BLOCK LATTICE_ABC` and `%BLOCK LATTICE_CART`; `compute_abc_from_cartesian` converts back. CASTEP .cell files are column-major.
-- **Output always LATTICE_ABC** — regardless of input format.
+- **Output always LATTICE_ABC and POSITIONS_ABS** — regardless of input format. Fractional→Cartesian conversion uses `cell_basis` matrix; LATTICE_CART→ABC uses `compute_abc_from_cartesian`.
 - **Shared types in castep_config** — `cif_data_t`, `atom_t`, `bands_data_t` all defined in config module.
 - **Allocatable working arrays** — avoids stack overflow for large atom counts.
 - **Character truncation safety** — `copy_str_no_quotes` strips quotes by character copy.
@@ -224,6 +224,20 @@ call write_block_newtype(unit, cfg)
 call write_kv(unit, 'new_key', 'new_value')
 ```
 Place it in the appropriate section of `write_param_file` (common or task-diff).
+
+## Testing
+
+```bash
+bash test/run_tests.sh <test_name>
+```
+
+Quick tests (200 eV, -np 1): `singlepoint`, `geomopt`, `phonon_fd`, `phonon_dfpt`, `efield`, `phonon_efield`, `all`.
+
+Phonon suite (800 eV, NCP19, smearing ON, -np 44, GeomOpt→4 phonon variants): `phonon_suite`.
+
+Test structure: `test/Cu.cif` (4-atom FCC Cu). Output in `test/output/<test_name>/`. Each test builds PreCASTEP, generates input via printf, runs CASTEP, checks `.castep` for errors, reports PASS/FAIL.
+
+The `precastep-tester` agent wraps the script — invoke it after modifying any source file.
 
 ## Default Parameter Summary
 

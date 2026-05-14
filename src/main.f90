@@ -161,7 +161,7 @@ contains
         end do
         write(*, '(a, i0)') '  Found ', cif%n_atoms, ' atom(s)'
 
-        cfg%cartesian_coords = (file_ext == 'pdb' .or. file_ext == 'cell')
+        cfg%cartesian_coords = .not. cif%positions_fractional
 
         write(*, '(a)') '  Computing lattice vectors...'
         cfg%cell_basis = compute_cartesian_lattice(cfg%cell_length(1), cfg%cell_length(2), &

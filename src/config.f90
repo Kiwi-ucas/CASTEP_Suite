@@ -171,6 +171,7 @@ module castep_config
         character(len=32) :: space_group
         integer :: n_atoms
         type(atom_t), allocatable :: atoms(:)
+        logical :: positions_fractional = .false.
     end type cif_data_t
 
     !! CASTEP configuration type
