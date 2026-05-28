@@ -3,7 +3,7 @@ module poscastep_menu
     !! Structure: top-level menu -> property-specific sub-menus
     !! Currently implements: Plot Band Structure
     use castep_config, only: dp, HARTREE_TO_EV, bands_data_t, pdos_data_t, &
-        MAX_LINE_LEN, IO_INVALID_INPUT, IO_SUCCESS, strip_quotes
+        MAX_LINE_LEN, IO_INVALID_INPUT, IO_SUCCESS, IO_USER_QUIT, strip_quotes
     use phonon_dos, only: phonon_dos_data_t, parse_phonon_file, compute_phonon_dos, &
         compute_ir_spectrum, compute_raman_spectrum, free_phonon_dos_data
     use bands_parser, only: parse_bands_file, free_bands_data
@@ -75,22 +75,22 @@ contains
             select case (choice)
             case (POS_BANDS)
                 call handle_bands_menu(iostat)
-                if (iostat /= 0) return
+                if (iostat == IO_USER_QUIT) return
             case (POS_DOS)
                 call handle_dos_menu(iostat)
-                if (iostat /= 0) return
+                if (iostat == IO_USER_QUIT) return
             case (POS_PDOS)
                 call handle_pdos_menu(iostat)
-                if (iostat /= 0) return
+                if (iostat == IO_USER_QUIT) return
             case (POS_PHONON_DOS)
                 call handle_phonon_dos_menu(iostat)
-                if (iostat /= 0) return
+                if (iostat == IO_USER_QUIT) return
             case (POS_IR_SPEC)
                 call handle_ir_menu(iostat)
-                if (iostat /= 0) return
+                if (iostat == IO_USER_QUIT) return
             case (POS_RAMAN_SPEC)
                 call handle_raman_menu(iostat)
-                if (iostat /= 0) return
+                if (iostat == IO_USER_QUIT) return
             case default
                 write(*, '(a)') '  Invalid option. Enter 1-6, or Q.'
             end select
@@ -109,9 +109,15 @@ contains
         iostat = 0
 
         call ask_bands_path('Enter .bands file path: ', bands_path, iostat)
+        if (iostat == IO_USER_QUIT) then
+            iostat = 0; return
+        end if
         if (iostat /= 0) return
 
         call ask_bands_plot_options(plot_mode, output_base, iostat)
+        if (iostat == IO_USER_QUIT) then
+            iostat = 0; return
+        end if
         if (iostat /= 0) return
 
         write(*, '(a)') '  Parsing .bands file...'
@@ -240,6 +246,10 @@ contains
                 write(*, '(a)') '  Path cannot be empty. Try again.'
                 cycle
             end if
+            if (result_path == 'q' .or. result_path == 'Q') then
+                iostat = IO_USER_QUIT
+                return
+            end if
             inquire(file=trim(result_path), exist=exists)
             if (.not. exists) then
                 write(*, '(a)') '  File not found: ' // trim(result_path)
@@ -269,6 +279,9 @@ contains
         write(*, '(a)', advance='no') '    Enter choice [1]: '
         read(*, '(a)', iostat=ios) input
         if (ios == 0 .and. len_trim(input) > 0) then
+            if (adjustl(trim(input)) == 'q' .or. adjustl(trim(input)) == 'Q') then
+                iostat = IO_USER_QUIT; return
+            end if
             read(input, '(I6)', iostat=ios) choice
             if (ios == 0 .and. choice == 2) plot_mode = BANDS_MODE_SVG
         end if
@@ -316,15 +329,17 @@ contains
                 write(*, '(a,a)') '  Using: ', trim(bands_path)
             else
                 write(*, '(a)') '  No path provided. Aborted.'
-                iostat = 1; return
+                iostat = 0; return
             end if
+        else if (bands_path == 'q' .or. bands_path == 'Q') then
+            iostat = 0; return
         else
             block
                 logical :: exists
                 inquire(file=trim(bands_path), exist=exists)
                 if (.not. exists) then
                     write(*, '(a)') '  File not found: ' // trim(bands_path)
-                    iostat = 1; return
+                    iostat = 0; return
                 end if
             end block
             last_bands_path = bands_path
@@ -454,8 +469,10 @@ contains
                 write(*, '(a,a)') '  Using prefix: ', trim(prefix)
             else
                 write(*, '(a)') '  No prefix provided. Aborted.'
-                iostat = 1; return
+                iostat = 0; return
             end if
+        else if (prefix == 'q' .or. prefix == 'Q') then
+            iostat = 0; return
         else
             last_prefix = prefix
         end if
@@ -476,13 +493,13 @@ contains
                 end if
                 if (.not. ex_b) then
                     write(*, '(a)') '  File not found: ' // trim(bands_path)
-                    iostat = 1; return
+                    iostat = 0; return
                 end if
             end if
             if (.not. ex_p) then
                 write(*, '(a)') '  File not found: ' // trim(pdos_path)
                 write(*, '(a)') '  (need either .pdos_bin or .pdos_weights)'
-                iostat = 1; return
+                iostat = 0; return
             end if
         end block
 
@@ -593,6 +610,9 @@ contains
         read(*, '(a)', iostat=ios) fname
         if (ios /= 0) return
         fname = adjustl(fname); call strip_quotes(fname)
+        if (fname == 'q' .or. fname == 'Q') then
+            iostat = 0; return
+        end if
         if (len_trim(fname) == 0 .and. len_trim(last_phonon_path) > 0) then
             fname = last_phonon_path
         end if
@@ -677,6 +697,9 @@ contains
         read(*, '(a)', iostat=ios) fname
         if (ios /= 0) return
         fname = adjustl(fname); call strip_quotes(fname)
+        if (fname == 'q' .or. fname == 'Q') then
+            iostat = 0; return
+        end if
         if (len_trim(fname) == 0 .and. len_trim(last_phonon_path) > 0) then
             fname = last_phonon_path
         end if
@@ -848,6 +871,9 @@ contains
         read(*, '(a)', iostat=ios) fname
         if (ios /= 0) return
         fname = adjustl(fname); call strip_quotes(fname)
+        if (fname == 'q' .or. fname == 'Q') then
+            iostat = 0; return
+        end if
         if (len_trim(fname) == 0 .and. len_trim(last_phonon_path) > 0) then
             fname = last_phonon_path
         end if
