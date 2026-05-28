@@ -9,7 +9,7 @@ module poscastep_menu
     use bands_parser, only: parse_bands_file, free_bands_data
     use bands_plotter, only: BANDS_MODE_ASCII, BANDS_MODE_SVG, &
         plot_bands_ascii, write_bands_svg
-    use term_utils, only: get_term_size
+    use term_utils, only: get_term_size, C_ALT_ON, C_ALT_OFF
     use pdos_parser, only: parse_pdos_file, free_pdos_data
     use dos_compute, only: compute_total_dos, compute_pdos, N_CHANNELS
     use dos_plotter, only: DOS_MODE_ASCII, DOS_MODE_SVG, DOS_MODE_EXPORT, &
@@ -164,6 +164,7 @@ contains
         k_width_pct = 1.0_dp
 
         call execute_command_line('stty -icanon -echo min 1', wait=.true.)
+        write(*, '(a)', advance='no') C_ALT_ON
         do
             ! re-detect terminal size (handles resize events)
             call get_term_size(term_w, term_h)
@@ -211,9 +212,8 @@ contains
             end if
         end do
 
-        write(*, '(a)', advance='no') achar(27) // '[2J' // achar(27) // '[H'
+        write(*, '(a)', advance='no') C_ALT_OFF
         call execute_command_line('stty sane', wait=.true.)
-        write(*, '(a)') ''
     end subroutine run_ascii_navigator
 
 
@@ -759,6 +759,7 @@ contains
         y_half0 = y_half
 
         call execute_command_line('stty -icanon -echo min 1', wait=.true.)
+        write(*, '(a)', advance='no') C_ALT_ON
         do
             call get_term_size(tw, th)
             write(*, '(a)', advance='no') achar(27) // '[2J' // achar(27) // '[H'
@@ -802,6 +803,7 @@ contains
                 exit
             end select
         end do
+        write(*, '(a)', advance='no') C_ALT_OFF
         call execute_command_line('stty sane', wait=.true.)
     end subroutine run_ir_navigator
 
@@ -926,6 +928,7 @@ contains
         y_half0 = y_half
 
         call execute_command_line('stty -icanon -echo min 1', wait=.true.)
+        write(*, '(a)', advance='no') C_ALT_ON
         do
             call get_term_size(tw, th)
             write(*, '(a)', advance='no') achar(27) // '[2J' // achar(27) // '[H'
@@ -969,6 +972,7 @@ contains
                 exit
             end select
         end do
+        write(*, '(a)', advance='no') C_ALT_OFF
         call execute_command_line('stty sane', wait=.true.)
     end subroutine run_raman_navigator
 
@@ -1018,6 +1022,7 @@ contains
         y_half0 = y_half
 
         call execute_command_line('stty -icanon -echo min 1', wait=.true.)
+        write(*, '(a)', advance='no') C_ALT_ON
         do
             call get_term_size(tw, th)
             write(*, '(a)', advance='no') achar(27) // '[2J' // achar(27) // '[H'
@@ -1065,6 +1070,7 @@ contains
                 exit
             end select
         end do
+        write(*, '(a)', advance='no') C_ALT_OFF
         call execute_command_line('stty sane', wait=.true.)
     end subroutine run_phonon_dos_navigator
 
@@ -1115,6 +1121,7 @@ contains
         y_center  = y_half  ! range: [0, 2*y_half]
 
         call execute_command_line('stty -icanon -echo min 1', wait=.true.)
+        write(*, '(a)', advance='no') C_ALT_ON
         do
             x_step = e_half * 0.25_dp
             y_step = y_half * 0.4_dp
@@ -1157,9 +1164,8 @@ contains
             end if
         end do
 
-        write(*, '(a)', advance='no') achar(27) // '[2J' // achar(27) // '[H'
+        write(*, '(a)', advance='no') C_ALT_OFF
         call execute_command_line('stty sane', wait=.true.)
-        write(*, '(a)') ''
     end subroutine run_dos_navigator
 
     subroutine run_pdos_navigator(energy_grid, pdos_data, e_fermi, smearing)
@@ -1182,6 +1188,7 @@ contains
         y_center  = y_half  ! range: [0, 2*y_half]
 
         call execute_command_line('stty -icanon -echo min 1', wait=.true.)
+        write(*, '(a)', advance='no') C_ALT_ON
         do
             x_step = e_half * 0.25_dp
             y_step = y_half * 0.4_dp
@@ -1224,9 +1231,8 @@ contains
             end if
         end do
 
-        write(*, '(a)', advance='no') achar(27) // '[2J' // achar(27) // '[H'
+        write(*, '(a)', advance='no') C_ALT_OFF
         call execute_command_line('stty sane', wait=.true.)
-        write(*, '(a)') ''
     end subroutine run_pdos_navigator
 
     subroutine build_energy_grid(grid, e_min, e_max, npts)

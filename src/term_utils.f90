@@ -15,6 +15,10 @@ module term_utils
     character(len=*), parameter, public :: C_RESET = achar(27) // '[0m'
     character(len=*), parameter, public :: C_AXIS  = achar(27) // '[1;37m'
 
+    ! Alternate screen buffer (prevents scrollback pollution)
+    character(len=*), parameter, public :: C_ALT_ON  = achar(27) // '[?1049h'
+    character(len=*), parameter, public :: C_ALT_OFF = achar(27) // '[?1049l'
+
     public :: get_term_size, draw_line
 
 contains
