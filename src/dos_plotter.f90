@@ -18,13 +18,15 @@ module dos_plotter
 contains
 
     subroutine plot_dos_ascii(energy_grid, dos_data, nspin, e_fermi, smearing, &
-            term_w_in, term_h_in, y_center_in, y_half_in, e_center_in, half_range_in)
+            term_w_in, term_h_in, y_center_in, y_half_in, e_center_in, half_range_in, &
+            xlabel, xunit)
         real(dp), intent(in) :: energy_grid(:)
         real(dp), intent(in) :: dos_data(:,:)
         integer,  intent(in) :: nspin
         real(dp), intent(in) :: e_fermi, smearing
         integer,  intent(in) :: term_w_in, term_h_in
         real(dp), intent(in), optional :: y_center_in, y_half_in, e_center_in, half_range_in
+        character(len=*), intent(in), optional :: xlabel, xunit
 
         integer  :: ne, nw, nh, ix, iy, ie, is, nw_data
         integer  :: fermi_col, y_label_width, gap_width, y_label_interval
@@ -33,7 +35,11 @@ contains
         real(dp) :: y_scale, x_scale, x_val, dos_val, e_center, half_range
         character(len=1), allocatable :: grid(:,:)
         character(len=64)  :: fmt_label, tmp_str
+        character(len=16)  :: xl, xu
         integer  :: last_ix, last_iy
+
+        xl = 'Energy'; if (present(xlabel)) xl = trim(xlabel)
+        xu = 'eV';     if (present(xunit))  xu = trim(xunit)
 
         ne = size(energy_grid)
         if (ne < 2 .or. size(dos_data, 1) /= ne) then
@@ -152,12 +158,12 @@ contains
         write(*, '(a,i0,a,i0,a,f5.2,a)') C_BOLD // '  Density of States  ' // &
             C_RESET // C_CYAN, ne_vis, C_RESET // ' pts, ' // C_CYAN, &
             nspin, C_RESET // ' spin(s),  smearing=' // C_CYAN, smearing, &
-            ' eV' // C_RESET
+            ' ' // trim(xu) // C_RESET
         write(tmp_str, '(f8.4)') e_min
-        write(*, '(a)', advance='no') '  ' // C_DIM // 'Energy: [' // C_RESET // &
+        write(*, '(a)', advance='no') '  ' // C_DIM // trim(xl) // ': [' // C_RESET // &
             trim(adjustl(tmp_str)) // C_DIM // ' to ' // C_RESET
         write(tmp_str, '(f8.4)') e_max
-        write(*, '(a,i0,1x,i0,a)') trim(adjustl(tmp_str)) // C_DIM // '] eV' // &
+        write(*, '(a,i0,1x,i0,a)') trim(adjustl(tmp_str)) // C_DIM // '] ' // trim(xu) // &
             C_RESET // '  grid:' // C_RESET, nw_data, nh, &
             '  ' // C_DIM // 'E_F=0 (dashed)' // C_RESET
         write(tmp_str, '(f8.4)') y_max
@@ -180,13 +186,17 @@ contains
         end do
 
         ! x-axis
-        write(tmp_str, '(f8.2)') e_max
-        tmp_str = adjustl(tmp_str)
-        write(fmt_label, '(f8.2)') e_min
-        fmt_label = adjustl(fmt_label)
-        write(*, '(a,a,a)') repeat(' ', y_label_width + gap_width) // C_DIM, &
-            trim(fmt_label) // repeat(' ', max(0, nw_data - 3 - len_trim(tmp_str))) &
-            // trim(tmp_str), C_RESET
+        if (present(xlabel)) then
+            call write_x_axis(y_label_width, gap_width, nw_data, e_min, e_max)
+        else
+            write(tmp_str, '(f8.2)') e_max
+            tmp_str = adjustl(tmp_str)
+            write(fmt_label, '(f8.2)') e_min
+            fmt_label = adjustl(fmt_label)
+            write(*, '(a,a,a)') repeat(' ', y_label_width + gap_width) // C_DIM, &
+                trim(fmt_label) // repeat(' ', max(0, nw_data - 3 - len_trim(tmp_str))) &
+                // trim(tmp_str), C_RESET
+        end if
 
         ! E_F marker
         write(*, '(a,a)') repeat(' ', y_label_width + gap_width) // C_DIM, &
@@ -194,6 +204,35 @@ contains
 
         deallocate(grid)
     end subroutine plot_dos_ascii
+
+    subroutine write_x_axis(label_w, gap, nw, v_min, v_max)
+        integer, intent(in) :: label_w, gap, nw
+        real(dp), intent(in) :: v_min, v_max
+        integer :: n_ticks, i, pos, j, lbl_len
+        real(dp) :: tick_val
+        character(len=8) :: lbl
+        character(len=512) :: line
+
+        ! Multi-tick mode: one tick per ~16 chars of plot width
+        n_ticks = max(3, nw / 16)
+        line = repeat(' ', nw)
+
+        do i = 0, n_ticks - 1
+            tick_val = v_min + i * (v_max - v_min) / real(n_ticks - 1, dp)
+            write(lbl, '(f8.1)') tick_val
+            lbl = adjustl(lbl)
+            lbl_len = len_trim(lbl)
+            pos = 1 + i * (nw - 1) / max(1, n_ticks - 1)
+            pos = pos - lbl_len / 2
+            pos = max(1, min(nw - lbl_len + 1, pos))
+            do j = 1, lbl_len
+                if (pos + j - 1 <= nw) line(pos + j - 1:pos + j - 1) = lbl(j:j)
+            end do
+        end do
+
+        write(*, '(a,a,a)') repeat(' ', label_w + gap) // C_DIM, &
+            trim(line), C_RESET
+    end subroutine write_x_axis
 
     ! find indices of energy_grid within [e_min, e_max]
     subroutine find_visible_range(grid, v_min, v_max, i1, i2)

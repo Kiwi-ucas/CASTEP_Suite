@@ -4,6 +4,8 @@ module poscastep_menu
     !! Currently implements: Plot Band Structure
     use castep_config, only: dp, HARTREE_TO_EV, bands_data_t, pdos_data_t, &
         MAX_LINE_LEN, IO_INVALID_INPUT, IO_SUCCESS, strip_quotes
+    use phonon_dos, only: phonon_dos_data_t, parse_phonon_file, compute_phonon_dos, &
+        compute_ir_spectrum, compute_raman_spectrum, free_phonon_dos_data
     use bands_parser, only: parse_bands_file, free_bands_data
     use bands_plotter, only: BANDS_MODE_ASCII, BANDS_MODE_SVG, &
         plot_bands_ascii, write_bands_svg
@@ -17,9 +19,12 @@ module poscastep_menu
 
     public :: run_poscastep_menu
 
-    integer, parameter :: POS_BANDS = 1
-    integer, parameter :: POS_DOS   = 2
-    integer, parameter :: POS_PDOS  = 3
+    integer, parameter :: POS_BANDS      = 1
+    integer, parameter :: POS_DOS        = 2
+    integer, parameter :: POS_PDOS       = 3
+    integer, parameter :: POS_PHONON_DOS = 4
+    integer, parameter :: POS_IR_SPEC    = 5
+    integer, parameter :: POS_RAMAN_SPEC = 6
 
 contains
 
@@ -41,6 +46,9 @@ contains
             write(*, '(a)') '  1. Plot Band Structure'
             write(*, '(a)') '  2. Plot DOS'
             write(*, '(a)') '  3. Plot pDOS'
+            write(*, '(a)') '  4. Plot Phonon DOS'
+            write(*, '(a)') '  5. Plot IR Spectrum'
+            write(*, '(a)') '  6. Plot Raman Spectrum'
             write(*, '(a)') '  Q. Back'
             write(*, '(a)', advance='no') '  Select option: '
 
@@ -74,8 +82,17 @@ contains
             case (POS_PDOS)
                 call handle_pdos_menu(iostat)
                 if (iostat /= 0) return
+            case (POS_PHONON_DOS)
+                call handle_phonon_dos_menu(iostat)
+                if (iostat /= 0) return
+            case (POS_IR_SPEC)
+                call handle_ir_menu(iostat)
+                if (iostat /= 0) return
+            case (POS_RAMAN_SPEC)
+                call handle_raman_menu(iostat)
+                if (iostat /= 0) return
             case default
-                write(*, '(a)') '  Invalid option. Enter 1, 2, 3, or Q.'
+                write(*, '(a)') '  Invalid option. Enter 1-6, or Q.'
             end select
         end do
     end subroutine run_poscastep_menu
@@ -556,6 +573,525 @@ contains
         call free_bands_data(bands)
         write(*, '(a)') '  ------------------------------'
     end subroutine handle_pdos_menu
+
+    subroutine handle_phonon_dos_menu(iostat)
+        integer, intent(out) :: iostat
+        type(phonon_dos_data_t) :: phdos
+        character(len=MAX_LINE_LEN) :: fname, input, tmp_str
+        integer :: ios, plot_mode
+        real(dp) :: freq_min_range, freq_max_range, smearing_width
+        character(len=MAX_LINE_LEN), save :: last_phonon_path = ''
+
+        iostat = 0
+
+        ! ── File input ──
+        write(*, '(a)', advance='no') '  Enter .phonon file path'
+        if (len_trim(last_phonon_path) > 0) &
+            write(*, '(a)', advance='no') ' [' // trim(last_phonon_path) // ']'
+        write(*, '(a)') ': '
+
+        read(*, '(a)', iostat=ios) fname
+        if (ios /= 0) return
+        fname = adjustl(fname); call strip_quotes(fname)
+        if (len_trim(fname) == 0 .and. len_trim(last_phonon_path) > 0) then
+            fname = last_phonon_path
+        end if
+        if (len_trim(fname) == 0) then
+            write(*, '(a)') '  No file specified.'
+            return
+        end if
+        last_phonon_path = trim(fname)
+
+        call parse_phonon_file(trim(fname), phdos, ios)
+        if (ios /= 0) then
+            write(*, '(a)') '  Error parsing .phonon file.'
+            return
+        end if
+
+        write(*, '(a,i0,a,i0,a,i0,a)') '  Loaded ', phdos%n_ions, ' ions, ', &
+            phdos%n_branches, ' branches, ', phdos%n_qpoints, ' q-points.'
+
+        ! ── Output mode menu (before smearing, matching DOS flow) ──
+        write(*, '(a)') '  Output mode:'
+        write(*, '(a)') '    1. Terminal ASCII plot (default)'
+        write(*, '(a)') '    2. SVG vector graphics file'
+        write(*, '(a)') '    3. Export data (CSV)'
+        write(*, '(a)', advance='no') '    Enter choice [1]: '
+
+        read(*, '(a)', iostat=ios) input
+        plot_mode = DOS_MODE_ASCII
+        if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
+            read(input, *, iostat=ios) plot_mode
+            if (ios /= 0) plot_mode = DOS_MODE_ASCII
+        end if
+
+        ! ── Smearing ──
+        smearing_width = 5.0_dp
+        write(tmp_str, '(f5.1)') smearing_width
+        write(*, '(a)', advance='no') '  Smearing width [' // trim(adjustl(tmp_str)) // ' cm-1]: '
+        read(*, '(a)', iostat=ios) input
+        if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
+            read(input, *, iostat=ios) smearing_width
+            if (ios /= 0) smearing_width = 5.0_dp
+        end if
+        smearing_width = max(0.5_dp, min(50.0_dp, smearing_width))
+
+        ! ── Compute PHDOS ──
+        freq_min_range = max(-200.0_dp, phdos%freq_min - 50.0_dp)
+        freq_max_range = phdos%freq_max + 50.0_dp
+
+        call compute_phonon_dos(phdos, freq_min_range, freq_max_range, 4001, smearing_width, ios)
+        if (ios /= 0 .or. .not. allocated(phdos%phdos)) then
+            write(*, '(a)') '  Error computing phonon DOS.'
+            call free_phonon_dos_data(phdos); return
+        end if
+
+        ! ── Output dispatch ──
+        select case (plot_mode)
+        case (DOS_MODE_ASCII)
+            call run_phonon_dos_navigator(phdos, freq_min_range, freq_max_range)
+        case (DOS_MODE_SVG)
+            write(*, '(a)') '  SVG export is not yet implemented for phonon DOS.'
+        case (DOS_MODE_EXPORT)
+            call write_phonon_dos_csv(phdos)
+        end select
+
+        call free_phonon_dos_data(phdos)
+    end subroutine handle_phonon_dos_menu
+
+    subroutine handle_ir_menu(iostat)
+        integer, intent(out) :: iostat
+        type(phonon_dos_data_t) :: phdos
+        character(len=MAX_LINE_LEN) :: fname, input, tmp_str
+        integer :: ios, plot_mode
+        real(dp) :: freq_min_range, freq_max_range, smearing_width
+        character(len=MAX_LINE_LEN), save :: last_phonon_path = ''
+
+        iostat = 0
+
+        write(*, '(a)', advance='no') '  Enter .phonon file path'
+        if (len_trim(last_phonon_path) > 0) &
+            write(*, '(a)', advance='no') ' [' // trim(last_phonon_path) // ']'
+        write(*, '(a)') ': '
+
+        read(*, '(a)', iostat=ios) fname
+        if (ios /= 0) return
+        fname = adjustl(fname); call strip_quotes(fname)
+        if (len_trim(fname) == 0 .and. len_trim(last_phonon_path) > 0) then
+            fname = last_phonon_path
+        end if
+        if (len_trim(fname) == 0) then
+            write(*, '(a)') '  No file specified.'; return
+        end if
+        last_phonon_path = trim(fname)
+
+        call parse_phonon_file(trim(fname), phdos, ios)
+        if (ios /= 0) then
+            write(*, '(a)') '  Error parsing .phonon file.'; return
+        end if
+
+        write(*, '(a,i0,a,i0,a)') '  Loaded ', phdos%n_branches, ' modes at Gamma, ', &
+            count(phdos%ir_intensity > 0.0_dp), ' IR-active.'
+
+        ! ── Output mode menu ──
+        write(*, '(a)') '  Output mode:'
+        write(*, '(a)') '    1. Terminal ASCII plot (default)'
+        write(*, '(a)') '    2. SVG vector graphics file'
+        write(*, '(a)') '    3. Export data (CSV)'
+        write(*, '(a)', advance='no') '    Enter choice [1]: '
+        read(*, '(a)', iostat=ios) input
+        plot_mode = DOS_MODE_ASCII
+        if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
+            read(input, *, iostat=ios) plot_mode
+            if (ios /= 0) plot_mode = DOS_MODE_ASCII
+        end if
+
+        ! ── Smearing ──
+        smearing_width = 5.0_dp
+        write(tmp_str, '(f5.1)') smearing_width
+        write(*, '(a)', advance='no') '  Smearing width [' // trim(adjustl(tmp_str)) // ' cm-1]: '
+        read(*, '(a)', iostat=ios) input
+        if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
+            read(input, *, iostat=ios) smearing_width
+            if (ios /= 0) smearing_width = 5.0_dp
+        end if
+        smearing_width = max(0.5_dp, min(50.0_dp, smearing_width))
+
+        ! ── Compute IR spectrum ──
+        freq_min_range = max(0.0_dp, phdos%freq_min - 50.0_dp)
+        freq_max_range = phdos%freq_max + 50.0_dp
+        call compute_ir_spectrum(phdos, freq_min_range, freq_max_range, 4001, smearing_width, ios)
+        if (ios /= 0 .or. .not. allocated(phdos%ir_spectrum)) then
+            write(*, '(a)') '  Error computing IR spectrum.'
+            call free_phonon_dos_data(phdos); return
+        end if
+
+        select case (plot_mode)
+        case (DOS_MODE_ASCII)
+            call run_ir_navigator(phdos, freq_min_range, freq_max_range)
+        case (DOS_MODE_SVG)
+            write(*, '(a)') '  SVG export is not yet implemented for IR spectrum.'
+        case (DOS_MODE_EXPORT)
+            call write_ir_csv(phdos)
+        end select
+
+        call free_phonon_dos_data(phdos)
+    end subroutine handle_ir_menu
+
+    subroutine run_ir_navigator(phdos, freq_min_range, freq_max_range)
+        type(phonon_dos_data_t), intent(in) :: phdos
+        real(dp), intent(in) :: freq_min_range, freq_max_range
+        real(dp) :: e_center, half_range, y_center, y_half, y_half0, y_max_val
+        integer :: i, tw, th, ios
+        character(len=1) :: ch
+        real(dp) :: dos_data(size(phdos%ir_spectrum), 1)
+        character(len=3) :: arrow
+
+        do i = 1, size(phdos%ir_spectrum)
+            dos_data(i, 1) = phdos%ir_spectrum(i)
+        end do
+
+        half_range = (freq_max_range - freq_min_range) * 0.5_dp
+        e_center = (freq_min_range + freq_max_range) * 0.5_dp
+        y_max_val = maxval(phdos%ir_spectrum) * 1.15_dp
+        y_half = y_max_val * 0.5_dp
+        y_center = y_half
+        y_half0 = y_half
+
+        call execute_command_line('stty -icanon -echo min 1', wait=.true.)
+        do
+            call get_term_size(tw, th)
+            write(*, '(a)', advance='no') achar(27) // '[2J' // achar(27) // '[H'
+            call plot_dos_ascii(phdos%freq_grid, dos_data, 1, 0.0_dp, &
+                phdos%smearing, tw, th, &
+                y_center_in=y_center, y_half_in=y_half, &
+                e_center_in=e_center, half_range_in=half_range, &
+                xlabel='Frequency', xunit='cm-1')
+            write(*, '(a)') '  [arrows: pan  +/-: zoom  R: reset  Q: quit]'
+
+            read(*, '(a)', advance='no', iostat=ios) ch
+            if (ios /= 0) exit
+            if (iachar(ch) == 27) then
+                read(*, '(a)', advance='no', iostat=ios) arrow(1:1)
+                if (ios /= 0) exit
+                read(*, '(a)', advance='no', iostat=ios) arrow(2:2)
+                if (ios /= 0) exit
+                if (arrow(1:2) == '[A') then
+                    y_center = y_center + y_half * 0.3_dp
+                else if (arrow(1:2) == '[B') then
+                    y_center = max(0.0_dp, y_center - y_half * 0.3_dp)
+                else if (arrow(1:2) == '[C') then
+                    e_center = e_center + half_range * 0.3_dp
+                else if (arrow(1:2) == '[D') then
+                    e_center = e_center - half_range * 0.3_dp
+                end if
+                cycle
+            end if
+            select case (ch)
+            case ('+', '=')
+                half_range = max(1.0_dp, half_range * 0.5_dp)
+                y_half = max(0.001_dp, y_half * 0.5_dp)
+            case ('-')
+                half_range = min(5000.0_dp, half_range * 2.0_dp)
+                y_half = y_half * 2.0_dp
+            case ('r', 'R')
+                e_center = (freq_min_range + freq_max_range) * 0.5_dp
+                half_range = (freq_max_range - freq_min_range) * 0.5_dp
+                y_center = y_half0; y_half = y_half0
+            case ('q', 'Q')
+                exit
+            end select
+        end do
+        call execute_command_line('stty sane', wait=.true.)
+    end subroutine run_ir_navigator
+
+    subroutine write_ir_csv(phdos)
+        type(phonon_dos_data_t), intent(in) :: phdos
+        character(len=MAX_LINE_LEN) :: csv_file
+        integer :: unit, ios, i
+
+        write(*, '(a)', advance='no') '  Enter output CSV file name (without .csv): '
+        read(*, '(a)', iostat=ios) csv_file
+        if (ios /= 0) return
+        csv_file = adjustl(csv_file); call strip_quotes(csv_file)
+        if (len_trim(csv_file) == 0) return
+        csv_file = trim(csv_file) // '.csv'
+
+        open(newunit=unit, file=trim(csv_file), status='unknown', action='write', iostat=ios)
+        if (ios /= 0) then
+            write(*, '(a)') '  Cannot write CSV file.'; return
+        end if
+        write(unit, '(a)') '# Frequency(cm-1),IR_Intensity'
+        do i = 1, size(phdos%ir_spectrum)
+            write(unit, '(f12.4,a,es14.6)') phdos%freq_grid(i), ',', phdos%ir_spectrum(i)
+        end do
+        close(unit)
+        write(*, '(a)') '  Written ' // trim(csv_file)
+    end subroutine write_ir_csv
+
+    subroutine handle_raman_menu(iostat)
+        integer, intent(out) :: iostat
+        type(phonon_dos_data_t) :: phdos
+        character(len=MAX_LINE_LEN) :: fname, input, tmp_str
+        integer :: ios, plot_mode
+        real(dp) :: freq_min_range, freq_max_range, smearing_width
+        character(len=MAX_LINE_LEN), save :: last_phonon_path = ''
+
+        iostat = 0
+
+        write(*, '(a)', advance='no') '  Enter .phonon file path'
+        if (len_trim(last_phonon_path) > 0) &
+            write(*, '(a)', advance='no') ' [' // trim(last_phonon_path) // ']'
+        write(*, '(a)') ': '
+        read(*, '(a)', iostat=ios) fname
+        if (ios /= 0) return
+        fname = adjustl(fname); call strip_quotes(fname)
+        if (len_trim(fname) == 0 .and. len_trim(last_phonon_path) > 0) then
+            fname = last_phonon_path
+        end if
+        if (len_trim(fname) == 0) then
+            write(*, '(a)') '  No file specified.'; return
+        end if
+        last_phonon_path = trim(fname)
+
+        call parse_phonon_file(trim(fname), phdos, ios)
+        if (ios /= 0) then
+            write(*, '(a)') '  Error parsing .phonon file.'; return
+        end if
+        write(*, '(a,i0,a,i0,a)') '  Loaded ', phdos%n_branches, ' modes at Gamma, ', &
+            count(phdos%raman_activity > 0.0_dp), ' Raman-active.'
+
+        ! ── Output mode menu ──
+        write(*, '(a)') '  Output mode:'
+        write(*, '(a)') '    1. Terminal ASCII plot (default)'
+        write(*, '(a)') '    2. SVG vector graphics file'
+        write(*, '(a)') '    3. Export data (CSV)'
+        write(*, '(a)', advance='no') '    Enter choice [1]: '
+        read(*, '(a)', iostat=ios) input
+        plot_mode = DOS_MODE_ASCII
+        if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
+            read(input, *, iostat=ios) plot_mode
+            if (ios /= 0) plot_mode = DOS_MODE_ASCII
+        end if
+
+        ! ── Smearing ──
+        smearing_width = 5.0_dp
+        write(tmp_str, '(f5.1)') smearing_width
+        write(*, '(a)', advance='no') '  Smearing width [' // trim(adjustl(tmp_str)) // ' cm-1]: '
+        read(*, '(a)', iostat=ios) input
+        if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
+            read(input, *, iostat=ios) smearing_width
+            if (ios /= 0) smearing_width = 5.0_dp
+        end if
+        smearing_width = max(0.5_dp, min(50.0_dp, smearing_width))
+
+        ! ── Compute Raman spectrum ──
+        freq_min_range = max(0.0_dp, phdos%freq_min - 50.0_dp)
+        freq_max_range = phdos%freq_max + 50.0_dp
+        call compute_raman_spectrum(phdos, freq_min_range, freq_max_range, 4001, smearing_width, ios)
+        if (ios /= 0 .or. .not. allocated(phdos%raman_spectrum)) then
+            write(*, '(a)') '  Error computing Raman spectrum.'
+            call free_phonon_dos_data(phdos); return
+        end if
+
+        select case (plot_mode)
+        case (DOS_MODE_ASCII)
+            call run_raman_navigator(phdos, freq_min_range, freq_max_range)
+        case (DOS_MODE_SVG)
+            write(*, '(a)') '  SVG export is not yet implemented for Raman spectrum.'
+        case (DOS_MODE_EXPORT)
+            call write_raman_csv(phdos)
+        end select
+        call free_phonon_dos_data(phdos)
+    end subroutine handle_raman_menu
+
+    subroutine run_raman_navigator(phdos, freq_min_range, freq_max_range)
+        type(phonon_dos_data_t), intent(in) :: phdos
+        real(dp), intent(in) :: freq_min_range, freq_max_range
+        real(dp) :: e_center, half_range, y_center, y_half, y_half0, y_max_val
+        integer :: i, tw, th, ios
+        character(len=1) :: ch
+        real(dp) :: dos_data(size(phdos%raman_spectrum), 1)
+        character(len=3) :: arrow
+
+        do i = 1, size(phdos%raman_spectrum)
+            dos_data(i, 1) = phdos%raman_spectrum(i)
+        end do
+
+        half_range = (freq_max_range - freq_min_range) * 0.5_dp
+        e_center = (freq_min_range + freq_max_range) * 0.5_dp
+        y_max_val = maxval(phdos%raman_spectrum) * 1.15_dp
+        y_half = y_max_val * 0.5_dp
+        y_center = y_half
+        y_half0 = y_half
+
+        call execute_command_line('stty -icanon -echo min 1', wait=.true.)
+        do
+            call get_term_size(tw, th)
+            write(*, '(a)', advance='no') achar(27) // '[2J' // achar(27) // '[H'
+            call plot_dos_ascii(phdos%freq_grid, dos_data, 1, 0.0_dp, &
+                phdos%smearing, tw, th, &
+                y_center_in=y_center, y_half_in=y_half, &
+                e_center_in=e_center, half_range_in=half_range, &
+                xlabel='Frequency', xunit='cm-1')
+            write(*, '(a)') '  [arrows: pan  +/-: zoom  R: reset  Q: quit]'
+
+            read(*, '(a)', advance='no', iostat=ios) ch
+            if (ios /= 0) exit
+            if (iachar(ch) == 27) then
+                read(*, '(a)', advance='no', iostat=ios) arrow(1:1)
+                if (ios /= 0) exit
+                read(*, '(a)', advance='no', iostat=ios) arrow(2:2)
+                if (ios /= 0) exit
+                if (arrow(1:2) == '[A') then
+                    y_center = y_center + y_half * 0.3_dp
+                else if (arrow(1:2) == '[B') then
+                    y_center = max(0.0_dp, y_center - y_half * 0.3_dp)
+                else if (arrow(1:2) == '[C') then
+                    e_center = e_center + half_range * 0.3_dp
+                else if (arrow(1:2) == '[D') then
+                    e_center = e_center - half_range * 0.3_dp
+                end if
+                cycle
+            end if
+            select case (ch)
+            case ('+', '=')
+                half_range = max(1.0_dp, half_range * 0.5_dp)
+                y_half = max(0.001_dp, y_half * 0.5_dp)
+            case ('-')
+                half_range = min(5000.0_dp, half_range * 2.0_dp)
+                y_half = y_half * 2.0_dp
+            case ('r', 'R')
+                e_center = (freq_min_range + freq_max_range) * 0.5_dp
+                half_range = (freq_max_range - freq_min_range) * 0.5_dp
+                y_center = y_half0; y_half = y_half0
+            case ('q', 'Q')
+                exit
+            end select
+        end do
+        call execute_command_line('stty sane', wait=.true.)
+    end subroutine run_raman_navigator
+
+    subroutine write_raman_csv(phdos)
+        type(phonon_dos_data_t), intent(in) :: phdos
+        character(len=MAX_LINE_LEN) :: csv_file
+        integer :: unit, ios, i
+
+        write(*, '(a)', advance='no') '  Enter output CSV file name (without .csv): '
+        read(*, '(a)', iostat=ios) csv_file
+        if (ios /= 0) return
+        csv_file = adjustl(csv_file); call strip_quotes(csv_file)
+        if (len_trim(csv_file) == 0) return
+        csv_file = trim(csv_file) // '.csv'
+
+        open(newunit=unit, file=trim(csv_file), status='unknown', action='write', iostat=ios)
+        if (ios /= 0) then
+            write(*, '(a)') '  Cannot write CSV file.'; return
+        end if
+        write(unit, '(a)') '# Frequency(cm-1),Raman_Activity'
+        do i = 1, size(phdos%raman_spectrum)
+            write(unit, '(f12.4,a,es14.6)') phdos%freq_grid(i), ',', phdos%raman_spectrum(i)
+        end do
+        close(unit)
+        write(*, '(a)') '  Written ' // trim(csv_file)
+    end subroutine write_raman_csv
+
+    subroutine run_phonon_dos_navigator(phdos, freq_min_range, freq_max_range)
+        type(phonon_dos_data_t), intent(in) :: phdos
+        real(dp), intent(in) :: freq_min_range, freq_max_range
+        real(dp) :: e_center, half_range, y_center, y_half, y_half0
+        real(dp) :: y_max_dos
+        integer :: i, tw, th, ios
+        character(len=1) :: ch
+        real(dp) :: dos_data(size(phdos%phdos), 1)
+        character(len=3) :: arrow
+
+        do i = 1, size(phdos%phdos)
+            dos_data(i, 1) = phdos%phdos(i)
+        end do
+
+        half_range = (freq_max_range - freq_min_range) * 0.5_dp
+        e_center = (freq_min_range + freq_max_range) * 0.5_dp
+        y_max_dos = maxval(phdos%phdos) * 1.15_dp
+        y_half = y_max_dos * 0.5_dp
+        y_center = y_half
+        y_half0 = y_half
+
+        call execute_command_line('stty -icanon -echo min 1', wait=.true.)
+        do
+            call get_term_size(tw, th)
+            write(*, '(a)', advance='no') achar(27) // '[2J' // achar(27) // '[H'
+            call plot_dos_ascii(phdos%freq_grid, dos_data, 1, 0.0_dp, &
+                phdos%smearing, tw, th, &
+                y_center_in=y_center, y_half_in=y_half, &
+                e_center_in=e_center, half_range_in=half_range, &
+                xlabel='Frequency', xunit='cm-1')
+            write(*, '(a)') '  [arrows: pan  +/-: zoom  R: reset  Q: quit]'
+
+            read(*, '(a)', advance='no', iostat=ios) ch
+            if (ios /= 0) exit
+
+            ! Decode escape sequences for arrow keys
+            if (iachar(ch) == 27) then
+                read(*, '(a)', advance='no', iostat=ios) arrow(1:1)
+                if (ios /= 0) exit
+                read(*, '(a)', advance='no', iostat=ios) arrow(2:2)
+                if (ios /= 0) exit
+                if (arrow(1:2) == '[A') then       ! ↑
+                    y_center = y_center + y_half * 0.3_dp
+                else if (arrow(1:2) == '[B') then  ! ↓
+                    y_center = max(0.0_dp, y_center - y_half * 0.3_dp)
+                else if (arrow(1:2) == '[C') then  ! →
+                    e_center = e_center + half_range * 0.3_dp
+                else if (arrow(1:2) == '[D') then  ! ←
+                    e_center = e_center - half_range * 0.3_dp
+                end if
+                cycle
+            end if
+
+            select case (ch)
+            case ('+', '=')
+                half_range = max(1.0_dp, half_range * 0.5_dp)
+                y_half = max(0.001_dp, y_half * 0.5_dp)
+            case ('-')
+                half_range = min(5000.0_dp, half_range * 2.0_dp)
+                y_half = y_half * 2.0_dp
+            case ('r', 'R')
+                e_center = (freq_min_range + freq_max_range) * 0.5_dp
+                half_range = (freq_max_range - freq_min_range) * 0.5_dp
+                y_center = y_half0
+                y_half = y_half0
+            case ('q', 'Q')
+                exit
+            end select
+        end do
+        call execute_command_line('stty sane', wait=.true.)
+    end subroutine run_phonon_dos_navigator
+
+    subroutine write_phonon_dos_csv(phdos)
+        type(phonon_dos_data_t), intent(in) :: phdos
+        character(len=MAX_LINE_LEN) :: csv_file
+        integer :: unit, ios, i
+
+        write(*, '(a)', advance='no') '  Enter output CSV file name (without .csv): '
+        read(*, '(a)', iostat=ios) csv_file
+        if (ios /= 0) return
+        csv_file = adjustl(csv_file); call strip_quotes(csv_file)
+        if (len_trim(csv_file) == 0) return
+        csv_file = trim(csv_file) // '.csv'
+
+        open(newunit=unit, file=trim(csv_file), status='unknown', action='write', iostat=ios)
+        if (ios /= 0) then
+            write(*, '(a)') '  Cannot write CSV file.'
+            return
+        end if
+        write(unit, '(a)') '# Frequency(cm-1),PHDOS'
+        do i = 1, size(phdos%phdos)
+            write(unit, '(f12.4,a,es14.6)') phdos%freq_grid(i), ',', phdos%phdos(i)
+        end do
+        close(unit)
+        write(*, '(a)') '  Written ' // trim(csv_file)
+    end subroutine write_phonon_dos_csv
 
     subroutine run_dos_navigator(energy_grid, dos_data, nspin, e_fermi, smearing)
         real(dp), intent(in) :: energy_grid(:), dos_data(:,:), e_fermi, smearing
