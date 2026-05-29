@@ -19,7 +19,7 @@ module term_utils
     character(len=*), parameter, public :: C_ALT_ON  = achar(27) // '[?1049h'
     character(len=*), parameter, public :: C_ALT_OFF = achar(27) // '[?1049l'
 
-    public :: get_term_size, draw_line
+    public :: get_term_size, draw_line, enter_raw_mode, leave_raw_mode
 
 contains
 
@@ -91,5 +91,15 @@ contains
             end if
         end do
     end subroutine draw_line
+
+    subroutine enter_raw_mode()
+        call execute_command_line('stty -icanon -echo min 1', wait=.true.)
+        write(*, '(a)', advance='no') C_ALT_ON
+    end subroutine enter_raw_mode
+
+    subroutine leave_raw_mode()
+        write(*, '(a)', advance='no') C_ALT_OFF
+        call execute_command_line('stty sane', wait=.true.)
+    end subroutine leave_raw_mode
 
 end module term_utils
