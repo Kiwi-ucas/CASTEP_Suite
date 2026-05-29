@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 CASTEP Suite is a Fortran 2008 CLI suite with two modes:
 
 1. **PreCASTEP** — converts crystallographic structure files (CIF, PDB, .cell) into CASTEP DFT input files (`.cell` and `.param`)
-2. **PosCASTEP** — post-processes CASTEP output: band structure with gap analysis, total DOS, and projected DOS (s/p/d/f)
+2. **PosCASTEP** — post-processes CASTEP output: band structure with gap analysis, total DOS, projected DOS (s/p/d/f), phonon DOS, IR spectrum, and Raman spectrum
 
 Launching `./CASTEP_Suite` shows a top-level suite menu. The PreCASTEP mode exits after successful file generation. PosCASTEP returns to its sub-menu (Q. Back) and then to the suite menu (Q. Quit). No `stop` statements remain — all error/recovery paths use `return`.
 
@@ -63,7 +63,12 @@ Post-processing menu for CASTEP output analysis:
 - `1. Plot Band Structure` — prompts for `.bands` file path, then ASCII terminal plot or SVG output
 - `2. Plot DOS` — total density of states from `.bands` only; ASCII (interactive), SVG, or CSV export
 - `3. Plot pDOS` — projected DOS: enter file prefix (e.g. `Cu`), auto-loads `<prefix>.bands` + `<prefix>.pdos_bin` (or `.pdos_weights`); ASCII (interactive) or CSV export with s/p/d/f columns
+- `4. Plot Phonon DOS` — phonon density of states from `.phonon` file; ASCII (interactive) or CSV export
+- `5. Plot IR Spectrum` — infrared absorption spectrum from `.phonon` file; ASCII (interactive) or CSV export
+- `6. Plot Raman Spectrum` — Raman scattering spectrum from `.phonon` file; ASCII (interactive) or CSV export
 - `Q. Back` — Return to suite menu
+
+At any file path prompt, type `q` to cancel and return to the PosCASTEP menu. All interactive ASCII plots use the alternate screen buffer (`ESC[?1049h/l`) to avoid polluting terminal scrollback history.
 
 **Band structure analysis** (bands_plotter.f90):
 - Auto-detects terminal size via `stty size` (queries terminal driver directly, works even in `-icanon` mode), falls back to `COLUMNS`/`LINES` env vars, default 160×40
@@ -98,11 +103,11 @@ Post-processing menu for CASTEP output analysis:
 
 ## Architecture
 
-Thirteen source files in `src/`:
+Fourteen source files in `src/`:
 
 1. **config.f90** — `castep_config` module. Defines kinds (`dp`), physical constants (`HARTREE_TO_EV`), constants (16 task types, 5 XC functionals: PBE/PBEsol/HSE06/PBE0/r2scan, 4 vdW corrections, 3 pseudopotentials, 3 K-point schemes, 3 optimizers, 4 geo tolerance levels, 3 cell opt modes, 2 symmetry modes, phonon constant groups (method, fine, DFPT, sum_rule, cutoff, q-point), I/O error codes), max sizes (MAX_ATOMS=10000, MAX_TAGS=5000, MAX_LOOP_ROWS=50000, MAX_SYM_OPS=400), CIF/CASTEP tag names, and types (`atom_t`, `cif_data_t`, `castep_config_t`, `bands_data_t`). Allocatable fields: `cif_data_t%atoms`, `bands_data_t%kpoint_indices`, `bands_data_t%kpoint_coords`, `bands_data_t%kpath_dist`, `bands_data_t%eigenvalues`. Advanced option fields in `castep_config_t`: `smearing`, `max_scf_cycles`, `elec_convergence_win`, `calculate_elf`, `calculate_edd`. `castep_config_t` has a `final :: finalize_castep_config` procedure that auto-deallocates `atom_type`, `atom_x`, `atom_y`, `atom_z` on scope exit. Types include `atom_t`, `cif_data_t`, `castep_config_t`, `bands_data_t`, `pdos_data_t` (for `.pdos_bin`/`.pdos_weights` binary data). Error codes: `IO_FILE_NOT_FOUND=100`, `IO_PARSE_ERROR=101`, `IO_MISSING_CELL=102`, `IO_MISSING_ATOMS=103`, `IO_BAD_NUMERIC=104`, `IO_WRITE_ERROR=105`, `IO_INVALID_INPUT=106`, `IO_WRITE_FAIL=107`, `IO_BANDS_NOT_FOUND=108`, `IO_BANDS_PARSE_ERROR=109`, `IO_PDOS_NOT_FOUND=110`, `IO_PDOS_PARSE_ERROR=111`, `IO_USER_QUIT=-1`. Provides `default_config`, `new_castep_config`, tag normalization/case-insensitive comparison (`normalize_tag`, `compare_tags`), `string_to_real`, `int2str`, `get_castep_task_name` (maps user-facing names to CASTEP internal names), and `strip_quotes` (removes leading/trailing quote characters — shared by cli_menu and poscastep_menu).
 
-2. **term_utils.f90** — `term_utils` module. Leaf module (zero dependencies). Provides shared ANSI color constants (`C_RED`, `C_GREEN`, `C_YELLOW`, `C_CYAN`, `C_BOLD`, `C_DIM`, `C_RESET`, `C_AXIS`), terminal size detection (`get_term_size` + private `stty_size`), and Bresenham line-drawing (`draw_line`). Used by `bands_plotter`, `dos_plotter`, and `poscastep_menu`.
+2. **term_utils.f90** — `term_utils` module. Leaf module (zero dependencies). Provides shared ANSI color constants (`C_RED`, `C_GREEN`, `C_YELLOW`, `C_CYAN`, `C_BOLD`, `C_DIM`, `C_RESET`, `C_AXIS`), alternate screen buffer constants (`C_ALT_ON`/`C_ALT_OFF`), terminal size detection (`get_term_size` + private `stty_size`), Bresenham line-drawing (`draw_line`), and raw terminal mode management (`enter_raw_mode`/`leave_raw_mode` — encapsulate `stty -icanon -echo min 1` + alternate screen buffer on/off). Used by `bands_plotter`, `dos_plotter`, and `poscastep_menu`.
 
 3. **parser.f90** — `parser` module. File format parsers: `parse_cif_inline`, `parse_pdb_inline`, `parse_cell_inline`. Private helpers: `tokenize_inline`, `clean_str_inline`, `copy_str_no_quotes`. Exports `clean_element_symbol` for oxidation state stripping (e.g., "Cu0+" -> "Cu"). Handles CIF tag-value pairs and `loop_` blocks, PDB CRYST1/UNITCELL/ATOM records, CASTEP .cell `%BLOCK LATTICE_ABC`, `%BLOCK LATTICE_CART`, `%BLOCK POSITIONS_ABS`, and `%BLOCK POSITIONS_FRAC`. `parse_cell_inline` includes `compute_abc_from_cartesian` for Cartesian-to-lattice conversion. `cif_data_t` has a `positions_fractional` field set by the parser — CIF and `POSITIONS_FRAC` set it `.true.`, PDB and `POSITIONS_ABS` leave it `.false.`.
 
@@ -122,9 +127,11 @@ Thirteen source files in `src/`:
 
 11. **cli_menu.f90** — `cli_menu` module. PreCASTEP main configuration menu loop with cached `castep_config_t` state. Q returns `IO_USER_QUIT`. Task switch auto-configures DFPT→NCP19, THERMO→FD+SUPERCELL, and PHONON+EFIELD→LO/TO ON. Uses `strip_quotes` from config. Helper functions: `task_label`, `cutoff_label`, `kpoint_label`, `qpoint_label` (shows MP_GRID as "i j k" values), `scf_label`, `geom_tol_label`, `sym_label`, `sp_label`, `smearing_label`. Public: `ask_input_file` (generic path reader with `inquire` existence check). Conditionally shown items: optimizer/cell_opt_mode/geo_tolerance for GEOMETRY_OPT; phonon q-point scheme, method, fine method, energy_tol, supercell matrix for phonon tasks (items 9-14); EFIELD ignore molec modes (item 30). Extended `ask_advanced_options` accepts optional phonon/EFIELD parameters for the Advanced sub-menu (items 6-30, with DOS spacing+limit grouped under item 6, FD-only keywords gated by `.not. is_dfpt`, LO/TO toggle locked for EFIELD tasks). Phonon-specific subroutines: `ask_phonon_qpoint_scheme`, `ask_phonon_kpoint_grid`, `ask_phonon_path`, `ask_phonon_method`, `ask_phonon_fine_method`, `ask_phonon_energy_tol`, `ask_phonon_supercell_matrix`, `ask_phonon_fine_qpoint_scheme`, `ask_phonon_fine_path`, `ask_phonon_sum_rule`, `ask_phonon_dfpt_method`. K-point MONKHORST_PACK accepts comma-separated grid. EFIELD: `efield_ignore_molec_modes` (CRYSTAL/MOLECULE/LINEAR_MOLECULE).
 
-12. **poscastep_menu.f90** — `poscastep_menu` module. PosCASTEP post-processing menu loop. Public: `run_poscastep_menu(iostat)`. Menu options: 1. Plot Band Structure, 2. Plot DOS, 3. Plot pDOS, Q. Back. Private: `handle_bands_menu` → `run_ascii_navigator` (↑↓ energy scroll, ← → k-path, +/- zoom both axes, R reset, Q quit), `handle_dos_menu` — total DOS (prompts .bands path with SAVE memory; output: ASCII/SVG/CSV; 4001-point Fermi ±20 eV grid), `handle_pdos_menu` — projected DOS (prompts file prefix, auto-derives .bands + .pdos_bin paths with SAVE memory; output: ASCII/CSV), `run_dos_navigator` (↑↓ y-pan, ←→ x-pan, +/- both-axes zoom, R reset, Q quit), `run_pdos_navigator` (same controls), `build_energy_grid`, `ensure_ext` (auto-append file extension). Gets `get_term_size` from `term_utils`. Uses `stty -icanon -echo min 1` for character input.
+12. **poscastep_menu.f90** — `poscastep_menu` module. PosCASTEP post-processing menu loop. Public: `run_poscastep_menu(iostat)`. Menu options: 1. Plot Band Structure, 2. Plot DOS, 3. Plot pDOS, 4. Plot Phonon DOS, 5. Plot IR Spectrum, 6. Plot Raman Spectrum, Q. Back. Uses `IO_USER_QUIT` for consistent 'q' handling at file input prompts — returns to PosCASTEP menu. Private: `handle_bands_menu` → `run_ascii_navigator` (↑↓ energy scroll, ← → k-path, +/- zoom both axes, R reset, Q quit), `handle_dos_menu` — total DOS (prompts .bands path with SAVE memory; output: ASCII/SVG/CSV; 4001-point Fermi ±20 eV grid), `handle_pdos_menu` — projected DOS (prompts file prefix, auto-derives .bands + .pdos_bin paths with SAVE memory; output: ASCII/CSV), `handle_phonon_dos_menu` — phonon DOS from `.phonon` file (ASCII/CSV), `handle_ir_menu` — IR spectrum (ASCII/CSV), `handle_raman_menu` — Raman spectrum (ASCII/CSV), `run_dos_navigator` (↑↓ y-pan, ←→ x-pan, +/- both-axes zoom, R reset, Q quit), `run_pdos_navigator` (same controls), `run_phonon_dos_navigator`, `run_ir_navigator`, `run_raman_navigator`, `build_energy_grid`, `ensure_ext` (auto-append file extension). Uses `enter_raw_mode`/`leave_raw_mode` from `term_utils` for terminal mode + alternate screen buffer.
 
-13. **main.f90** — `CASTEP_Suite` program. Suite top-level `do` loop with three options (1. PreCASTEP, 2. PosCASTEP, Q. Quit). PreCASTEP logic extracted into internal subroutine `run_precastep_workflow(should_exit)`: init defaults → file recognition → `run_main_menu` → parse input → compute lattice → write .cell/.param → set `should_exit=.true.` to exit program. All `stop` replaced with `return`. Coordinate system determined by `castep_config_t%cartesian_coords = .not. cif%positions_fractional` (data-driven from parser, not file extension). Helper functions: `real2str_dp`, `compute_cartesian_lattice`, `get_file_extension`, `to_lower_inline`.
+13. **phonon_dos.f90** — `phonon_dos` module. Parses CASTEP `.phonon` files (frequencies, IR intensities, Raman activities). Computes phonon DOS via Gaussian smearing. Computes IR absorption and Raman scattering spectra. Public: `parse_phonon_file`, `compute_phonon_dos`, `compute_ir_spectrum`, `compute_raman_spectrum`, `free_phonon_dos_data`. Output types: `phonon_dos_data_t` with frequency grid, phonon DOS, IR spectrum, and Raman spectrum arrays.
+
+14. **main.f90** — `CASTEP_Suite` program. Suite top-level `do` loop with three options (1. PreCASTEP, 2. PosCASTEP, Q. Quit). PreCASTEP logic extracted into internal subroutine `run_precastep_workflow(should_exit)`: init defaults → file recognition → `run_main_menu` → parse input → compute lattice → write .cell/.param → set `should_exit=.true.` to exit program. All `stop` replaced with `return`. Coordinate system determined by `castep_config_t%cartesian_coords = .not. cif%positions_fractional` (data-driven from parser, not file extension). Helper functions: `real2str_dp`, `compute_cartesian_lattice`, `get_file_extension`, `to_lower_inline`.
 
 ### Module dependency chain
 
@@ -136,6 +143,7 @@ term_utils    (leaf)
   ├── param_writer    (config)
   ├── bands_parser    (config)
   ├── pdos_parser     (config)
+  ├── phonon_dos      (config)
   ├── dos_compute     (config)
   ├── bands_plotter   (config + term_utils)
   ├── dos_plotter     (config + term_utils)
@@ -145,6 +153,7 @@ term_utils    (leaf)
                         bands_parser +    │
                         bands_plotter +   │
                         pdos_parser +     │
+                        phonon_dos +      │
                         dos_compute +    ─┘
                         dos_plotter)
   └── main            (config + parser + cell_writer + param_writer
@@ -168,8 +177,10 @@ term_utils    (leaf)
 - **K-path windowing** — optional `k_pct_in`/`k_width_pct_in` parameters (percentages 0–1) define a k-path display window. Defaults to full path (center=0.5, width=1.0). Left/right arrow keys auto-zoom to 50% window on first press, then pan in 10% increments. `plot_bands_ascii` signature: `(bands, term_w_in, term_h_in, e_center, half_range, k_pct_in, k_width_pct_in)` where the last two are optional.
 - **Gap info above plot** — band gap information displayed in 2 compact lines above the plot box. Line 1: E_F + Band Gap + type. Line 2: VBM + CBM + Dir gap (if indirect). Grid height dynamically reduced by 9 rows to keep all content visible without scrolling.
 - **Resize-adaptive** — terminal size re-detected via `stty size` on every redraw. Resize the terminal and press any key to adapt.
-- **Terminal mode** — uses `stty -icanon -echo min 1` (not `stty raw`). This disables line buffering and echo while preserving `opost` output processing, which is required for `\n`→`\r\n` translation. Without this, the plot displays with a staircase alignment bug.
+- **Terminal mode** — `enter_raw_mode`/`leave_raw_mode` in `term_utils` encapsulate `stty -icanon -echo min 1` + alternate screen buffer (`ESC[?1049h`/`ESC[?1049l`). The alternate screen buffer prevents interactive plot redraws from polluting terminal scrollback history. `stty -icanon` (not `stty raw`) preserves `opost` for correct newline translation, avoiding staircase alignment bug.
 - **Compact layout** — label-plot gap = 1 column, no "k-path" text on x-axis, maximizing grid space.
+- **Consistent 'q' handling** — typing `q` at any file path prompt in PosCASTEP returns to the PosCASTEP menu (not the suite menu). Uses `IO_USER_QUIT` internally, intercepted by each handler.
+- **Phonon DOS/IR/Raman** — `phonon_dos` module parses `.phonon` files, computes phonon DOS (Gaussian smearing), IR absorption spectrum, and Raman scattering spectrum. All three use the same `plot_dos_ascii` renderer with configurable `xlabel`/`xunit`.
 - **Multi-format parsing in parser.f90** — CIF, PDB, and .cell parsing extracted to `parser` module. File type determined by extension.
 - **PDB parsing** — CRYST1 record (columns), UNITCELL record, and ATOM/HETATM records. All PDB coordinates are Cartesian.
 - **LATTICE_CART support** — `parse_cell_inline` handles both `%BLOCK LATTICE_ABC` and `%BLOCK LATTICE_CART`; `compute_abc_from_cartesian` converts back. CASTEP .cell files are column-major.

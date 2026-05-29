@@ -7,7 +7,7 @@ A Fortran 2008 CLI toolkit for [CASTEP] DFT calculations — generate input file
 | Mode | What it does |
 |------|-------------|
 | **PreCASTEP** | Converts `.cif` / `.pdb` / `.cell` structure files into CASTEP `.cell` + `.param` input files via an interactive menu |
-| **PosCASTEP** | Post-processes CASTEP output: band structure plots with gap analysis, total DOS, and projected DOS (s/p/d/f) — all as interactive ASCII terminal plots, SVG, or CSV |
+| **PosCASTEP** | Post-processes CASTEP output: band structure plots with gap analysis, total DOS, projected DOS (s/p/d/f), phonon DOS, IR spectrum, and Raman spectrum — all as interactive ASCII terminal plots, SVG, or CSV |
 
 ## Requirements
 
@@ -131,6 +131,8 @@ Generates a `.cell` file in `%BLOCK` format and a `.param` file in `key : value`
 
 ## PosCASTEP — post-processing
 
+All interactive plots use the alternate screen buffer — no scrollback pollution. Type `q` at any file path prompt to cancel and return to the PosCASTEP menu.
+
 ```
   ================================
             PosCASTEP
@@ -138,6 +140,9 @@ Generates a `.cell` file in `%BLOCK` format and a `.param` file in `key : value`
   1. Plot Band Structure
   2. Plot DOS
   3. Plot pDOS
+  4. Plot Phonon DOS
+  5. Plot IR Spectrum
+  6. Plot Raman Spectrum
   Q. Back
 ```
 
@@ -171,6 +176,28 @@ Generates a `.cell` file in `%BLOCK` format and a `.param` file in `key : value`
 - Controls: same as total DOS (`↑↓ ← → +/- R Q`)
 - Output modes: **ASCII**, **CSV** (6 columns: Energy, Total, s, p, d, f)
 
+### 4. Plot Phonon DOS (phonon density of states)
+
+- Parses CASTEP `.phonon` files for vibrational frequencies
+- Gaussian smearing with configurable width (default 5 cm⁻¹)
+- Interactive ASCII plot with frequency axis (cm⁻¹)
+- Controls: same as total DOS (`↑↓ ← → +/- R Q`)
+- Output modes: **ASCII**, **CSV**
+
+### 5. Plot IR Spectrum (infrared absorption)
+
+- IR absorption intensities from `.phonon` file (Gamma point)
+- Gaussian broadening with configurable width
+- Interactive ASCII plot, CSV export
+- Controls: same as total DOS
+
+### 6. Plot Raman Spectrum (Raman scattering)
+
+- Raman scattering activities from `.phonon` file (Gamma point)
+- Gaussian broadening with configurable width
+- Interactive ASCII plot, CSV export
+- Controls: same as total DOS
+
 ## Project structure
 
 ```
@@ -180,13 +207,14 @@ CASTEP_Suite/
 ├── CLAUDE.md
 └── src/
     ├── config.f90           # Types, constants, physical parameters
-    ├── term_utils.f90       # ANSI colors, terminal size, Bresenham line draw
+    ├── term_utils.f90       # ANSI colors, terminal size, Bresenham, alt screen
     ├── parser.f90           # CIF / PDB / .cell file parsers
     ├── cell_writer.f90      # CASTEP .cell file generator (%BLOCK format)
     ├── param_writer.f90     # CASTEP .param file generator (key-value)
     ├── bands_parser.f90     # CASTEP .bands file parser
     ├── bands_plotter.f90    # Band structure ASCII + SVG plotter
     ├── pdos_parser.f90      # Binary .pdos_bin / .pdos_weights parser
+    ├── phonon_dos.f90       # .phonon parser, phonon DOS, IR & Raman spectra
     ├── dos_compute.f90      # Gaussian smearing DOS + PDOS computation
     ├── dos_plotter.f90      # DOS / PDOS ASCII + SVG + CSV plotter
     ├── cli_menu.f90         # PreCASTEP configuration menu
