@@ -6,6 +6,9 @@ module poscastep_menu
         MAX_LINE_LEN, IO_INVALID_INPUT, IO_SUCCESS, IO_USER_QUIT, strip_quotes
     use phonon_dos, only: phonon_dos_data_t, parse_phonon_file, compute_phonon_dos, &
         compute_ir_spectrum, compute_raman_spectrum, free_phonon_dos_data
+    use polarizability, only: pol_data_t, parse_castep_epsilon, parse_cp2k_dipoles, &
+        unwrap_dipoles, detrend_dipoles, compute_static_dielectric, &
+        compute_polarizability, free_pol_data
     use bands_parser, only: parse_bands_file, free_bands_data
     use bands_plotter, only: BANDS_MODE_ASCII, BANDS_MODE_SVG, &
         plot_bands_ascii, write_bands_svg
@@ -25,6 +28,7 @@ module poscastep_menu
     integer, parameter :: POS_PHONON_DOS = 4
     integer, parameter :: POS_IR_SPEC    = 5
     integer, parameter :: POS_RAMAN_SPEC = 6
+    integer, parameter :: POS_POLARIZABILITY = 7
 
 contains
 
@@ -49,6 +53,7 @@ contains
             write(*, '(a)') '  4. Plot Phonon DOS'
             write(*, '(a)') '  5. Plot IR Spectrum'
             write(*, '(a)') '  6. Plot Raman Spectrum'
+            write(*, '(a)') '  7. Static Polarizability'
             write(*, '(a)') '  Q. Back'
             write(*, '(a)', advance='no') '  Select option: '
 
@@ -91,8 +96,11 @@ contains
             case (POS_RAMAN_SPEC)
                 call handle_raman_menu(iostat)
                 if (iostat == IO_USER_QUIT) return
+            case (POS_POLARIZABILITY)
+                call handle_polarizability_menu(iostat)
+                if (iostat == IO_USER_QUIT) return
             case default
-                write(*, '(a)') '  Invalid option. Enter 1-6, or Q.'
+                write(*, '(a)') '  Invalid option. Enter 1-7, or Q.'
             end select
         end do
     end subroutine run_poscastep_menu
@@ -1271,5 +1279,194 @@ contains
             filename = trim(filename) // ext
         end if
     end subroutine ensure_ext
+
+    subroutine handle_polarizability_menu(iostat)
+        !! Static polarizability via AIMD polarization fluctuation method
+        integer, intent(out) :: iostat
+        type(pol_data_t) :: pol
+        character(len=MAX_LINE_LEN) :: castep_path, cp2k_dir, input
+        character(len=256) :: msg
+        integer :: ios
+        real(dp) :: time_step_ps
+        character(len=MAX_LINE_LEN), save :: last_castep_path = ''
+        character(len=MAX_LINE_LEN), save :: last_cp2k_dir = ''
+
+        iostat = 0
+
+        ! --- CASTEP .castep file ---
+        write(*, '(a)', advance='no') '  Enter CASTEP .castep file path'
+        if (len_trim(last_castep_path) > 0) &
+            write(*, '(a)', advance='no') ' [' // trim(last_castep_path) // ']'
+        write(*, '(a)') ': '
+        read(*, '(a)', iostat=ios) castep_path
+        if (ios /= 0) return
+        castep_path = adjustl(castep_path); call strip_quotes(castep_path)
+        if (castep_path == 'q' .or. castep_path == 'Q') then
+            iostat = 0; return
+        end if
+        if (len_trim(castep_path) == 0 .and. len_trim(last_castep_path) > 0) then
+            castep_path = last_castep_path
+        end if
+        if (len_trim(castep_path) == 0) then
+            write(*, '(a)') '  No file specified.'; return
+        end if
+        last_castep_path = trim(castep_path)
+
+        ! Parse ε_∞
+        write(*, '(a)') '  Parsing optical dielectric tensor...'
+        call parse_castep_epsilon(trim(castep_path), pol%eps_inf, ios, msg)
+        if (ios /= 0) then
+            write(*, '(a,a)') '  Error: ', trim(msg)
+            return
+        end if
+        write(*, '(a)') '  Optical dielectric tensor ε_∞ (from CASTEP):'
+        call print_matrix(pol%eps_inf)
+
+        ! --- CP2K dipole directory ---
+        write(*, '(a)', advance='no') '  Enter CP2K dipole directory path'
+        if (len_trim(last_cp2k_dir) > 0) &
+            write(*, '(a)', advance='no') ' [' // trim(last_cp2k_dir) // ']'
+        write(*, '(a)') ': '
+        read(*, '(a)', iostat=ios) cp2k_dir
+        if (ios /= 0) return
+        cp2k_dir = adjustl(cp2k_dir); call strip_quotes(cp2k_dir)
+        if (cp2k_dir == 'q' .or. cp2k_dir == 'Q') then
+            iostat = 0; return
+        end if
+        if (len_trim(cp2k_dir) == 0 .and. len_trim(last_cp2k_dir) > 0) then
+            cp2k_dir = last_cp2k_dir
+        end if
+        if (len_trim(cp2k_dir) == 0) then
+            write(*, '(a)') '  No directory specified.'; return
+        end if
+        last_cp2k_dir = trim(cp2k_dir)
+
+        ! --- Cell parameters ---
+        write(*, '(a)', advance='no') '  Enter cell a, b, c (Å, comma-separated): '
+        read(*, '(a)', iostat=ios) input
+        if (ios /= 0) then
+            write(*, '(a)') '  Invalid input.'; return
+        end if
+        call strip_quotes(input)
+        if (input == 'q' .or. input == 'Q') then
+            iostat = 0; return
+        end if
+        read(input, *, iostat=ios) pol%cell_abc(1:3)
+        if (ios /= 0) then
+            write(*, '(a)') '  Invalid format. Expected: a, b, c'; return
+        end if
+        ! Compute volume (assuming orthogonal cell)
+        pol%volume_ang3 = pol%cell_abc(1) * pol%cell_abc(2) * pol%cell_abc(3)
+        write(*, '(a,f10.2,a)') '  Cell volume: ', pol%volume_ang3, ' ų'
+
+        ! --- Temperature ---
+        write(*, '(a)', advance='no') '  Enter temperature (K): '
+        read(*, '(a)', iostat=ios) input
+        if (ios /= 0) then
+            write(*, '(a)') '  Invalid input.'; return
+        end if
+        call strip_quotes(input)
+        if (input == 'q' .or. input == 'Q') then
+            iostat = 0; return
+        end if
+        read(input, *, iostat=ios) pol%temperature
+        if (ios /= 0 .or. pol%temperature <= 0.0_dp) then
+            write(*, '(a)') '  Invalid temperature.'; return
+        end if
+        write(*, '(a,f8.1,a)') '  Temperature: ', pol%temperature, ' K'
+
+        ! --- Time step ---
+        write(*, '(a)', advance='no') '  Enter MD time step (fs) [1.0]: '
+        read(*, '(a)', iostat=ios) input
+        time_step_ps = 0.001_dp  ! default 1 fs = 0.001 ps
+        if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
+            if (adjustl(trim(input)) == 'q' .or. adjustl(trim(input)) == 'Q') then
+                iostat = 0; return
+            end if
+            read(input, *, iostat=ios) time_step_ps
+            if (ios == 0) time_step_ps = time_step_ps * 0.001_dp  ! fs → ps
+        end if
+
+        ! --- Expected frames ---
+        write(*, '(a)', advance='no') '  Expected number of frames [0=auto]: '
+        read(*, '(a)', iostat=ios) input
+        if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
+            if (adjustl(trim(input)) == 'q' .or. adjustl(trim(input)) == 'Q') then
+                iostat = 0; return
+            end if
+        end if
+
+        ! --- Parse CP2K dipoles ---
+        write(*, '(a)') '  Reading CP2K dipole files...'
+        call parse_cp2k_dipoles(trim(cp2k_dir), pol, 0, ios, msg)
+        if (ios /= 0) then
+            write(*, '(a,a)') '  Error: ', trim(msg)
+            call free_pol_data(pol); return
+        end if
+        write(*, '(a,i0,a)') '  Loaded ', pol%n_frames, ' dipole frames.'
+
+        ! --- Unwrap ---
+        write(*, '(a)') '  Unwrapping Berry phase jumps...'
+        call unwrap_dipoles(pol)
+        write(*, '(a,i0,a)') '  Detected ', pol%n_unwraps, ' jumps.'
+
+        ! --- Detrend ---
+        write(*, '(a)') '  Removing linear drift...'
+        call detrend_dipoles(pol, time_step_ps)
+        write(*, '(a,3(f8.4,a))') '  Drift rates: ', &
+            pol%drift_rate(1), ', ', pol%drift_rate(2), ', ', pol%drift_rate(3), ' Debye/ps'
+
+        ! --- Compute ---
+        write(*, '(a)') '  Computing static dielectric tensor...'
+        call compute_static_dielectric(pol, ios, msg)
+        if (ios /= 0) then
+            write(*, '(a,a)') '  Error: ', trim(msg)
+            call free_pol_data(pol); return
+        end if
+
+        call compute_polarizability(pol)
+
+        ! --- Print results ---
+        write(*, '(a)') ''
+        write(*, '(a)') '  ======= Results ======='
+        write(*, '(a)') ''
+        write(*, '(a)') '  Ionic dielectric tensor ε_ion:'
+        call print_matrix(pol%eps_ion)
+        write(*, '(a)') ''
+        write(*, '(a)') '  Static dielectric tensor ε_static:'
+        call print_matrix(pol%eps_static)
+        write(*, '(a)') ''
+        write(*, '(a,f10.2)') '  ε_∞,iso = ', trace_iso(pol%eps_inf)
+        write(*, '(a,f10.2)') '  ε_ion,iso = ', trace_iso(pol%eps_ion)
+        write(*, '(a,f10.2)') '  ε_static,iso = ', trace_iso(pol%eps_static)
+        write(*, '(a)') ''
+        write(*, '(a)') '  Static polarizability α_static (ų):'
+        call print_matrix(pol%alpha_static)
+        write(*, '(a)') ''
+        write(*, '(a,f10.1)') '  α_∞,iso = ', trace_iso(pol%alpha_inf)
+        write(*, '(a,f10.1)') '  α_ion,iso = ', trace_iso(pol%alpha_ion)
+        write(*, '(a,f10.1)') '  α_static,iso = ', trace_iso(pol%alpha_static)
+        write(*, '(a)') ''
+
+        call free_pol_data(pol)
+    end subroutine handle_polarizability_menu
+
+
+    subroutine print_matrix(mat)
+        !! Print 3×3 matrix with formatting
+        real(dp), intent(in) :: mat(3,3)
+        integer :: i
+        do i = 1, 3
+            write(*, '(a,3f12.4)') '    ', mat(i, 1:3)
+        end do
+    end subroutine print_matrix
+
+
+    function trace_iso(mat) result(val)
+        !! Compute isotropic average: (mat_xx + mat_yy + mat_zz) / 3
+        real(dp), intent(in) :: mat(3,3)
+        real(dp) :: val
+        val = (mat(1,1) + mat(2,2) + mat(3,3)) / 3.0_dp
+    end function trace_iso
 
 end module poscastep_menu

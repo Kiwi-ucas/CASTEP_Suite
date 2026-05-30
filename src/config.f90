@@ -19,6 +19,13 @@ module castep_config
     real(dp), parameter, public :: pi = 3.14159265358979323846_dp
     real(dp), parameter, public :: HARTREE_TO_EV = 27.211386245988_dp
 
+    ! Physical constants for polarizability calculations
+    real(dp), parameter, public :: EPSILON_0 = 8.854187817e-12_dp   ! F/m
+    real(dp), parameter, public :: KBOLTZMANN = 1.380649e-23_dp     ! J/K
+    real(dp), parameter, public :: DEBYE_TO_CM = 3.33564e-30_dp     ! Debye → C·m
+    real(dp), parameter, public :: ANG3_TO_M3 = 1.0e-30_dp          ! Å³ → m³
+    real(dp), parameter, public :: DEBYE_PER_ANG = 4.803204_dp      ! e·Å → Debye
+
     ! Tag names used throughout
     character(len=*), parameter, public :: &
         TAG_A            = '_cell_length_a', &
@@ -156,6 +163,9 @@ module castep_config
         IO_BANDS_PARSE_ERROR = 109, &
         IO_PDOS_NOT_FOUND    = 110, &
         IO_PDOS_PARSE_ERROR  = 111, &
+        IO_EPS_NOT_FOUND   = 112, &
+        IO_EPS_PARSE_ERROR = 113, &
+        IO_DIPOLE_ERROR    = 114, &
         IO_USER_QUIT     = -1
 
     !! Atom data type
