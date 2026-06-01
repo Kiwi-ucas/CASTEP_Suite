@@ -102,17 +102,17 @@ contains
         character(len=*), intent(out), optional :: iomsg
         character(len=MAX_LINE_LEN) :: line, fname, cmd
         character(len=32) :: file_list
-        integer :: unit, ios, iframe, n_files
+        integer :: list_unit, dip_unit, ios, iframe, n_files
         real(dp) :: dx, dy, dz
 
         iostat = 0
 
         ! Generate file list
         file_list = '.dipole_list_tmp'
-        cmd = 'ls ' // trim(dir_path) // '/dipole* > ' // trim(file_list) // ' 2>/dev/null'
+        cmd = 'ls ' // trim(dir_path) // '/*dipole* > ' // trim(file_list) // ' 2>/dev/null'
         call execute_command_line(trim(cmd), wait=.true.)
 
-        open(newunit=unit, file=trim(file_list), status='old', action='read', iostat=ios)
+        open(newunit=list_unit, file=trim(file_list), status='old', action='read', iostat=ios)
         if (ios /= 0) then
             iostat = IO_DIPOLE_ERROR
             if (present(iomsg)) iomsg = 'Cannot list dipole files in: ' // trim(dir_path)
@@ -122,13 +122,13 @@ contains
         ! Count files
         n_files = 0
         do
-            read(unit, '(a)', iostat=ios) line
+            read(list_unit, '(a)', iostat=ios) line
             if (ios /= 0) exit
             if (len_trim(line) > 0) n_files = n_files + 1
         end do
 
         if (n_files == 0) then
-            close(unit, status='delete')
+            close(list_unit, status='delete')
             iostat = IO_DIPOLE_ERROR
             if (present(iomsg)) iomsg = 'No dipole files found in: ' // trim(dir_path)
             return
@@ -142,42 +142,46 @@ contains
         data%dipoles_clean = 0.0_dp
 
         ! Read all files
-        rewind(unit)
+        rewind(list_unit)
         do iframe = 1, n_files
-            read(unit, '(a)', iostat=ios) fname
+            read(list_unit, '(a)', iostat=ios) fname
             if (ios /= 0) then
                 iostat = IO_DIPOLE_ERROR
                 if (present(iomsg)) iomsg = 'Error reading file list at frame'
-                close(unit, status='delete')
+                close(list_unit, status='delete')
                 return
             end if
 
-            open(newunit=unit, file=trim(fname), status='old', action='read', iostat=ios)
+            open(newunit=dip_unit, file=trim(fname), status='old', action='read', iostat=ios)
             if (ios /= 0) then
                 iostat = IO_DIPOLE_ERROR
                 if (present(iomsg)) iomsg = 'Cannot open: ' // trim(fname)
-                close(unit, status='delete')
+                close(list_unit, status='delete')
                 return
             end if
 
-            ! Read header line
-            read(unit, '(a)', iostat=ios) line
-            if (ios /= 0) then
-                close(unit)
+            ! Skip lines until "Dipole moment [Debye]"
+            do
+                read(dip_unit, '(a)', iostat=ios) line
+                if (ios /= 0) exit
+                if (index(line, 'Dipole moment') > 0) exit
+            end do
+            if (ios /= 0 .or. index(line, 'Dipole moment') == 0) then
+                close(dip_unit)
                 iostat = IO_DIPOLE_ERROR
-                if (present(iomsg)) iomsg = 'Error reading header in: ' // trim(fname)
+                if (present(iomsg)) iomsg = 'Dipole moment not found in: ' // trim(fname)
                 return
             end if
 
             ! Read dipole values: "  X= xxxxx Y= yyyyy Z= zzzzz  Total= ttttt"
-            read(unit, '(a)', iostat=ios) line
+            read(dip_unit, '(a)', iostat=ios) line
             if (ios /= 0) then
-                close(unit)
+                close(dip_unit)
                 iostat = IO_DIPOLE_ERROR
-                if (present(iomsg)) iomsg = 'Error reading dipole in: ' // trim(fname)
+                if (present(iomsg)) iomsg = 'Error reading dipole values in: ' // trim(fname)
                 return
             end if
-            close(unit)
+            close(dip_unit)
 
             ! Parse X= Y= Z= values
             call parse_dipole_line(line, dx, dy, dz, ios)
@@ -190,7 +194,7 @@ contains
             data%dipoles(iframe, 2) = dy
             data%dipoles(iframe, 3) = dz
         end do
-        close(unit, status='delete')
+        close(list_unit, status='delete')
 
         ! Warn if file count differs from expected
         if (n_frames_exp > 0 .and. n_files /= n_frames_exp) then
