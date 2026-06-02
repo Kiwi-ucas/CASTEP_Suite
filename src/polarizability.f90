@@ -9,8 +9,8 @@ module polarizability
 
     public :: pol_data_t, parse_castep_epsilon, parse_cp2k_dipoles, &
               unwrap_dipoles, detrend_dipoles, &
-              compute_static_dielectric, compute_polarizability, &
-              free_pol_data
+              compute_static_dielectric, compute_static_dielectric_windowed, &
+              compute_polarizability, free_pol_data
 
     type :: pol_data_t
         ! CASTEP optical dielectric tensor ε_∞ (3×3)
@@ -243,32 +243,31 @@ contains
     subroutine unwrap_dipoles(data)
         !! Unwrap Berry phase polarization quantum jumps
         !! Pq,α = DEBYE_PER_ANG × a_α [Debye]
-        !! If |ΔD| > Pq/2, apply correction ±Pq
+        !! If |ΔD| > Pq/2, apply cumulative offset ±Pq
         type(pol_data_t), intent(inout) :: data
-        real(dp) :: pq(3), delta
+        real(dp) :: pq(3), delta, offset(3)
         integer :: i, j
 
-        ! Compute polarization quantum for each direction
         do j = 1, 3
             pq(j) = DEBYE_PER_ANG * data%cell_abc(j)
         end do
-
+        offset = 0.0_dp
         data%n_unwraps = 0
 
         do i = 2, data%n_frames
             do j = 1, 3
                 delta = data%dipoles(i, j) - data%dipoles(i-1, j)
                 if (delta > pq(j) * 0.5_dp) then
-                    data%dipoles(i, j) = data%dipoles(i, j) - pq(j)
+                    offset(j) = offset(j) - pq(j)
                     data%n_unwraps = data%n_unwraps + 1
                 else if (delta < -pq(j) * 0.5_dp) then
-                    data%dipoles(i, j) = data%dipoles(i, j) + pq(j)
+                    offset(j) = offset(j) + pq(j)
                     data%n_unwraps = data%n_unwraps + 1
                 end if
+                data%dipoles(i, j) = data%dipoles(i, j) + offset(j)
             end do
         end do
 
-        ! Copy to clean array
         data%dipoles_clean = data%dipoles
     end subroutine unwrap_dipoles
 
@@ -384,6 +383,182 @@ contains
         ! ε_static = ε_∞ + ε_ion
         data%eps_static = data%eps_inf + data%eps_ion
     end subroutine compute_static_dielectric
+
+
+    subroutine compute_static_dielectric_windowed(data, time_step_fs, iostat, iomsg)
+        !! Window-based static dielectric with extrapolation to W→0
+        !! Removes Li+ diffusion via per-window detrend + median
+        !! Extrapolates to zero window size for vibrational limit
+        type(pol_data_t), intent(inout) :: data
+        real(dp), intent(in) :: time_step_fs
+        integer, intent(out) :: iostat
+        character(len=*), intent(out), optional :: iomsg
+
+        real(dp) :: ws_ps(4) = [0.1_dp, 0.2_dp, 0.5_dp, 1.0_dp]
+        integer, parameter :: N_WS = 4
+        real(dp) :: vol_m3, kt, denom, dt_ps
+        real(dp) :: med_eps_ion(N_WS)
+        integer :: i, j, iw, n_win, nf, win_start, win_end
+        real(dp) :: slope, intercept, dn
+        real(dp), allocatable :: dw(:, :), cov(:, :), eps_ion(:, :)
+        real(dp) :: iso_vals(1000), med_iso, sum_x, sum_y, sum_xx, sum_xy
+
+        iostat = 0
+
+        if (data%n_frames < 2) then
+            iostat = IO_DIPOLE_ERROR
+            if (present(iomsg)) iomsg = 'Need at least 2 frames'
+            return
+        end if
+
+        dt_ps = time_step_fs / 1000.0_dp  ! fs → ps
+        vol_m3 = data%volume_ang3 * ANG3_TO_M3
+        kt = KBOLTZMANN * data%temperature
+        denom = EPSILON_0 * kt * vol_m3
+
+        write(*, '(a)') ''
+        write(*, '(a)') '  Window-size convergence:'
+        write(*, '(a)') '  Window (ps)   N_wins   ε_ion (median)'
+        write(*, '(a)') '  ----------   ------   --------------'
+
+        do iw = 1, N_WS
+            nf = nint(ws_ps(iw) / dt_ps)
+            if (nf < 4 .or. nf > data%n_frames / 2) cycle
+            n_win = data%n_frames / nf
+            if (n_win > 1000) n_win = 1000
+
+            allocate(dw(nf, 3), cov(3, 3), eps_ion(3, 3))
+            do i = 1, n_win
+                win_start = (i - 1) * nf + 1
+                win_end = win_start + nf - 1
+
+                ! Copy window data and detrend
+                do j = 1, 3
+                    dw(:, j) = data%dipoles_clean(win_start:win_end, j)
+                end do
+                call detrend_window(dw, nf)
+
+                ! Covariance of this window
+                call compute_covariance_single(dw, nf, cov)
+                cov = cov * DEBYE_TO_CM**2
+                eps_ion = cov / denom
+                iso_vals(i) = (eps_ion(1,1) + eps_ion(2,2) + eps_ion(3,3)) / 3.0_dp
+            end do
+
+            ! Median over windows
+            med_iso = median(iso_vals(1:n_win))
+            med_eps_ion(iw) = med_iso
+            write(*, '(a,f6.1,a,i8,a,f8.3)') '  ', ws_ps(iw), '         ', n_win, '     ', med_iso
+            deallocate(dw, cov, eps_ion)
+        end do
+
+        ! Linear extrapolation to W→0 using all valid windows
+        sum_x = 0.0_dp; sum_y = 0.0_dp; sum_xx = 0.0_dp; sum_xy = 0.0_dp
+        dn = 0.0_dp
+        do iw = 1, N_WS
+            if (med_eps_ion(iw) > 0.0_dp) then
+                dn = dn + 1.0_dp
+                sum_x = sum_x + ws_ps(iw)
+                sum_y = sum_y + med_eps_ion(iw)
+                sum_xx = sum_xx + ws_ps(iw)**2
+                sum_xy = sum_xy + ws_ps(iw) * med_eps_ion(iw)
+            end if
+        end do
+
+        if (dn >= 2.0_dp) then
+            slope = (dn * sum_xy - sum_x * sum_y) / (dn * sum_xx - sum_x**2)
+            intercept = (sum_y - slope * sum_x) / dn
+            write(*, '(a)') ''
+            write(*, '(a,f8.3)') '  ε_ion (W→0 extrapolation): ', max(0.0_dp, intercept)
+            write(*, '(a,f8.3)') '  Diffusion slope dε/dW:     ', slope
+
+            ! Write back to pol for downstream display
+            data%eps_ion = 0.0_dp
+            do j = 1, 3
+                data%eps_ion(j, j) = max(0.0_dp, intercept)
+            end do
+            data%eps_static = data%eps_inf + data%eps_ion
+        end if
+    end subroutine compute_static_dielectric_windowed
+
+
+    subroutine detrend_window(dw, nf)
+        !! Linear detrend of a single window's dipole data
+        real(dp), intent(inout) :: dw(:,:)
+        integer, intent(in) :: nf
+        real(dp) :: sum_t, sum_t2, sum_d, sum_td, slope, intercept, dn
+        integer :: i, j
+
+        dn = real(nf, dp)
+        sum_t = dn * (dn + 1.0_dp) * 0.5_dp
+        sum_t2 = dn * (dn + 1.0_dp) * (2.0_dp * dn + 1.0_dp) / 6.0_dp
+
+        do j = 1, 3
+            sum_d = sum(dw(1:nf, j))
+            sum_td = 0.0_dp
+            do i = 1, nf
+                sum_td = sum_td + real(i, dp) * dw(i, j)
+            end do
+            slope = (dn * sum_td - sum_t * sum_d) / (dn * sum_t2 - sum_t * sum_t)
+            intercept = (sum_d - slope * sum_t) / dn
+            do i = 1, nf
+                dw(i, j) = dw(i, j) - (slope * real(i, dp) + intercept)
+            end do
+        end do
+    end subroutine detrend_window
+
+
+    subroutine compute_covariance_single(dw, nf, cov)
+        !! Compute 3×3 covariance of detrended window data
+        real(dp), intent(in) :: dw(:,:)
+        integer, intent(in) :: nf
+        real(dp), intent(out) :: cov(3,3)
+        real(dp) :: m_mean(3)
+        integer :: i, j, k
+
+        m_mean = 0.0_dp
+        do i = 1, nf
+            m_mean = m_mean + dw(i, :)
+        end do
+        m_mean = m_mean / real(nf, dp)
+
+        cov = 0.0_dp
+        do i = 1, nf
+            do j = 1, 3
+                do k = 1, 3
+                    cov(j, k) = cov(j, k) + (dw(i, j) - m_mean(j)) * (dw(i, k) - m_mean(k))
+                end do
+            end do
+        end do
+        cov = cov / real(nf - 1, dp)
+    end subroutine compute_covariance_single
+
+
+    pure function median(arr) result(m)
+        !! Median of an array (in-place sorting via simple selection for small N)
+        real(dp), intent(in) :: arr(:)
+        real(dp) :: m
+        real(dp), allocatable :: tmp(:)
+        integer :: n, i, j, min_idx
+        real(dp) :: temp
+
+        n = size(arr)
+        allocate(tmp(n))
+        tmp = arr
+        ! Selection sort to median position
+        do i = 1, n / 2 + 1
+            min_idx = i
+            do j = i + 1, n
+                if (tmp(j) < tmp(min_idx)) min_idx = j
+            end do
+            temp = tmp(i); tmp(i) = tmp(min_idx); tmp(min_idx) = temp
+        end do
+        if (mod(n, 2) == 1) then
+            m = tmp(n / 2 + 1)
+        else
+            m = (tmp(n / 2) + tmp(n / 2 + 1)) * 0.5_dp
+        end if
+    end function median
 
 
     subroutine compute_polarizability(data)

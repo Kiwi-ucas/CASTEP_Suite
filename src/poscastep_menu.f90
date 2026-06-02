@@ -8,7 +8,7 @@ module poscastep_menu
         compute_ir_spectrum, compute_raman_spectrum, free_phonon_dos_data
     use polarizability, only: pol_data_t, parse_castep_epsilon, parse_cp2k_dipoles, &
         unwrap_dipoles, detrend_dipoles, compute_static_dielectric, &
-        compute_polarizability, free_pol_data
+        compute_static_dielectric_windowed, compute_polarizability, free_pol_data
     use bands_parser, only: parse_bands_file, free_bands_data
     use bands_plotter, only: BANDS_MODE_ASCII, BANDS_MODE_SVG, &
         plot_bands_ascii, write_bands_svg
@@ -1410,20 +1410,21 @@ contains
         call unwrap_dipoles(pol)
         write(*, '(a,i0,a)') '  Detected ', pol%n_unwraps, ' jumps.'
 
-        ! --- Detrend ---
-        write(*, '(a)') '  Removing linear drift...'
-        call detrend_dipoles(pol, time_step_ps)
-        write(*, '(a,3(f8.4,a))') '  Drift rates: ', &
-            pol%drift_rate(1), ', ', pol%drift_rate(2), ', ', pol%drift_rate(3), ' Debye/ps'
-
-        ! --- Compute ---
-        write(*, '(a)') '  Computing static dielectric tensor...'
-        call compute_static_dielectric(pol, ios, msg)
+        ! --- Window-based dielectric (per-window detrend + W→0 extrapolation) ---
+        write(*, '(a)') '  Computing static dielectric (window method)...'
+        call compute_static_dielectric_windowed(pol, time_step_ps * 1000.0_dp, ios, msg)
         if (ios /= 0) then
             write(*, '(a,a)') '  Error: ', trim(msg)
             call free_pol_data(pol); return
         end if
 
+        ! Drift info from a quick global detrend (informational only)
+        call detrend_dipoles(pol, time_step_ps)
+        write(*, '(a,3(f8.4,a))') '  Global drift rates: ', &
+            pol%drift_rate(1), ', ', pol%drift_rate(2), ', ', pol%drift_rate(3), ' Debye/ps'
+
+        ! Recompute global + polarizability for backward-compatible output
+        call compute_static_dielectric(pol, ios, msg)
         call compute_polarizability(pol)
 
         ! --- Print results ---
