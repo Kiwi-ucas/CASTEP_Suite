@@ -1,16 +1,28 @@
 module polarizability
     !! Static polarizability via AIMD polarization fluctuation method
     !! Combines CASTEP DFPT optical dielectric tensor with CP2K dipole trajectory
-    use castep_config, only: dp, pi, EPSILON_0, KBOLTZMANN, DEBYE_TO_CM, &
-        ANG3_TO_M3, DEBYE_PER_ANG, MAX_LINE_LEN, &
-        IO_EPS_NOT_FOUND, IO_EPS_PARSE_ERROR, IO_DIPOLE_ERROR
+    use castep_config, only: dp, pi, MAX_LINE_LEN
     implicit none
     private
 
-    public :: pol_data_t, parse_castep_epsilon, parse_cp2k_dipoles, &
-              unwrap_dipoles, detrend_dipoles, &
-              compute_static_dielectric, compute_static_dielectric_windowed, &
+    public :: pol_data_t, parse_castep_epsilon, parse_castep_cell, &
+              parse_cp2k_dipoles, unwrap_dipoles, &
+              compute_static_dielectric_windowed, &
               compute_polarizability, free_pol_data
+    ! Public for drift_analysis module (not compiled into main program)
+    public :: EPSILON_0, KBOLTZMANN, DEBYE_TO_CM, ANG3_TO_M3, DEBYE_PER_ANG
+
+    ! Physical constants
+    real(dp), parameter :: EPSILON_0 = 8.854187817e-12_dp     ! F/m
+    real(dp), parameter :: KBOLTZMANN = 1.380649e-23_dp       ! J/K
+    real(dp), parameter :: DEBYE_TO_CM = 3.33564e-30_dp       ! Debye → C·m
+    real(dp), parameter :: ANG3_TO_M3 = 1.0e-30_dp            ! Å³ → m³
+    real(dp), parameter :: DEBYE_PER_ANG = 4.803204_dp        ! e·Å → Debye
+
+    ! Error codes
+    integer, parameter :: IO_EPS_NOT_FOUND  = 112
+    integer, parameter :: IO_EPS_PARSE_ERROR = 113
+    integer, parameter :: IO_DIPOLE_ERROR   = 114
 
     type :: pol_data_t
         ! CASTEP optical dielectric tensor ε_∞ (3×3)
@@ -20,10 +32,8 @@ module polarizability
         real(dp) :: temperature = 0.0_dp
         real(dp) :: volume_ang3 = 0.0_dp
         real(dp) :: cell_abc(3) = 0.0_dp  ! a, b, c in Angstrom
-        ! Raw dipole trajectory (n_frames, 3) in Debye
+        ! Dipole trajectory (n_frames, 3) in Debye (unwrapped in-place)
         real(dp), allocatable :: dipoles(:,:)
-        ! Unwrapped + detrended dipoles in Debye
-        real(dp), allocatable :: dipoles_clean(:,:)
         ! Results (3×3 tensors)
         real(dp) :: eps_static(3,3) = 0.0_dp
         real(dp) :: eps_ion(3,3) = 0.0_dp
@@ -32,11 +42,8 @@ module polarizability
         real(dp) :: alpha_inf(3,3) = 0.0_dp
         ! Unwrap statistics
         integer :: n_unwraps = 0
-        ! Detrend statistics
-        real(dp) :: drift_rate(3) = 0.0_dp  ! Debye/ps
     end type
 
-    integer, parameter :: MAX_FILES = 200000
     character(len=*), parameter :: EOM = 'No optical dielectric tensor found'
 
 contains
@@ -90,27 +97,101 @@ contains
     end subroutine parse_castep_epsilon
 
 
-    subroutine parse_cp2k_dipoles(dir_path, data, n_frames_exp, iostat, iomsg)
+    subroutine parse_castep_cell(filename, cell_abc, iostat, iomsg)
+        !! Extract lattice parameters a, b, c from CASTEP .castep file.
+        !! Format:  a =   10.128028   alpha =  90.000000
+        !!          b =   10.128028   beta  =  90.000000
+        !!          c =   10.128028   gamma =  90.000000
+        !! Each parameter is on its own line; read the 3 lines after the header.
+        character(len=*), intent(in)  :: filename
+        real(dp), intent(out)         :: cell_abc(3)
+        integer, intent(out)          :: iostat
+        character(len=*), intent(out), optional :: iomsg
+        character(len=MAX_LINE_LEN) :: line
+        integer :: unit, ios, idx, i
+
+        iostat = 0
+        cell_abc = 0.0_dp
+
+        open(newunit=unit, file=filename, status='old', action='read', iostat=ios)
+        if (ios /= 0) then
+            iostat = IO_EPS_NOT_FOUND
+            if (present(iomsg)) iomsg = 'Cannot open file: ' // trim(filename)
+            return
+        end if
+
+        ! Scan for "Lattice parameters" header
+        do
+            read(unit, '(a)', iostat=ios) line
+            if (ios /= 0) exit
+            if (index(line, 'Lattice parameters') > 0) exit
+        end do
+
+        if (ios /= 0) then
+            close(unit)
+            iostat = IO_EPS_PARSE_ERROR
+            if (present(iomsg)) iomsg = 'Cell parameters not found in: ' // trim(filename)
+            return
+        end if
+
+        ! Read the next 3 lines: a, b, c
+        ! Each line:  a =   10.128028   alpha =  90.000000
+        ! Use " a =" to avoid matching "alpha =" (which also contains "a =")
+        do i = 1, 3
+            read(unit, '(a)', iostat=ios) line
+            if (ios /= 0) exit
+            idx = index(line, ' a =')
+            if (idx == 0) idx = index(line, ' b =')
+            if (idx == 0) idx = index(line, ' c =')
+            if (idx > 0) then
+                read(line(idx+4:), *, iostat=ios) cell_abc(i)
+            else
+                ios = -1
+            end if
+        end do
+        close(unit)
+
+        if (ios /= 0 .or. any(cell_abc <= 0.0_dp)) then
+            iostat = IO_EPS_PARSE_ERROR
+            if (present(iomsg)) iomsg = 'Cell parameters not found in: ' // trim(filename)
+        end if
+    end subroutine parse_castep_cell
+
+
+    subroutine parse_cp2k_dipoles(dir_path, data, iostat, iomsg)
         !! Read CP2K dipole files from directory
         !! Each file has format:
         !!   Dipole moment [Debye]
         !!     X= xxxxx Y= yyyyy Z= zzzzz  Total= ttttt
         character(len=*), intent(in)  :: dir_path
         type(pol_data_t), intent(inout) :: data
-        integer, intent(in)           :: n_frames_exp  ! expected number of frames
         integer, intent(out)          :: iostat
         character(len=*), intent(out), optional :: iomsg
         character(len=MAX_LINE_LEN) :: line, fname, cmd
         character(len=32) :: file_list
         integer :: list_unit, dip_unit, ios, iframe, n_files
+        integer :: cmd_stat, cmd_exit
         real(dp) :: dx, dy, dz
 
         iostat = 0
 
-        ! Generate file list
+        ! Generate file list via `find` (not shell glob).
+        ! `ls dir/*dipole*` expands the glob via argv, which exceeds ARG_MAX
+        ! when the trajectory contains thousands of dipole files.
+        ! `find` walks the directory without argv expansion.
         file_list = '.dipole_list_tmp'
-        cmd = 'ls ' // trim(dir_path) // '/*dipole* > ' // trim(file_list) // ' 2>/dev/null'
-        call execute_command_line(trim(cmd), wait=.true.)
+        ! Use `sort -V` (version sort) to handle filenames with mixed digit
+        ! widths correctly (e.g. dipole_9999.dat before dipole_10000.dat).
+        ! Plain `sort` is lexicographic and breaks at digit-width boundaries.
+        cmd = 'find "' // trim(dir_path) // '" -maxdepth 1 -name "*dipole*" ' // &
+              '2>/dev/null | sort -V > ' // trim(file_list)
+        call execute_command_line(trim(cmd), wait=.true., &
+                                  exitstat=cmd_exit, cmdstat=cmd_stat)
+        if (cmd_stat /= 0 .or. cmd_exit /= 0) then
+            iostat = IO_DIPOLE_ERROR
+            if (present(iomsg)) iomsg = 'Failed to list dipole files in: ' // trim(dir_path)
+            return
+        end if
 
         open(newunit=list_unit, file=trim(file_list), status='old', action='read', iostat=ios)
         if (ios /= 0) then
@@ -137,9 +218,7 @@ contains
         ! Allocate arrays
         data%n_frames = n_files
         allocate(data%dipoles(n_files, 3))
-        allocate(data%dipoles_clean(n_files, 3))
         data%dipoles = 0.0_dp
-        data%dipoles_clean = 0.0_dp
 
         ! Read all files
         rewind(list_unit)
@@ -195,11 +274,6 @@ contains
             data%dipoles(iframe, 3) = dz
         end do
         close(list_unit, status='delete')
-
-        ! Warn if file count differs from expected
-        if (n_frames_exp > 0 .and. n_files /= n_frames_exp) then
-            ! Not an error, just note it
-        end if
     end subroutine parse_cp2k_dipoles
 
 
@@ -243,146 +317,41 @@ contains
     subroutine unwrap_dipoles(data)
         !! Unwrap Berry phase polarization quantum jumps
         !! Pq,α = DEBYE_PER_ANG × a_α [Debye]
-        !! If |ΔD| > Pq/2, apply cumulative offset ±Pq
+        !! Compare consecutive RAW values to detect boundary crossings;
+        !! use nint for multi-quantum correction.  Must compare raw-to-raw
+        !! (not raw-vs-unwrapped), otherwise the comparison basis shifts
+        !! after each real wrap, triggering cascading false wraps.
         type(pol_data_t), intent(inout) :: data
         real(dp) :: pq(3), delta, offset(3)
-        integer :: i, j
+        real(dp), allocatable :: raw(:, :)
+        integer :: i, j, jumps
 
         do j = 1, 3
             pq(j) = DEBYE_PER_ANG * data%cell_abc(j)
         end do
+
+        ! Keep a copy of the original raw values for comparison
+        allocate(raw(data%n_frames, 3))
+        raw = data%dipoles
+
         offset = 0.0_dp
         data%n_unwraps = 0
 
         do i = 2, data%n_frames
             do j = 1, 3
-                delta = data%dipoles(i, j) - data%dipoles(i-1, j)
-                if (delta > pq(j) * 0.5_dp) then
-                    offset(j) = offset(j) - pq(j)
-                    data%n_unwraps = data%n_unwraps + 1
-                else if (delta < -pq(j) * 0.5_dp) then
-                    offset(j) = offset(j) + pq(j)
-                    data%n_unwraps = data%n_unwraps + 1
+                ! Compare consecutive raw values (before any offset)
+                delta = raw(i, j) - raw(i-1, j)
+                jumps = nint(delta / pq(j))
+                if (jumps /= 0) then
+                    offset(j) = offset(j) - real(jumps, dp) * pq(j)
+                    data%n_unwraps = data%n_unwraps + abs(jumps)
                 end if
-                data%dipoles(i, j) = data%dipoles(i, j) + offset(j)
+                data%dipoles(i, j) = raw(i, j) + offset(j)
             end do
         end do
 
-        data%dipoles_clean = data%dipoles
+        deallocate(raw)
     end subroutine unwrap_dipoles
-
-
-    subroutine detrend_dipoles(data, time_step_ps)
-        !! Remove linear drift from Li+ diffusion
-        !! D_detrend(t) = D(t) - (s*t + b) via least squares
-        type(pol_data_t), intent(inout) :: data
-        real(dp), intent(in) :: time_step_ps  ! MD time step in ps
-        real(dp) :: sum_t, sum_t2, sum_d(3), sum_td(3)
-        real(dp) :: denom, s, b, n
-        integer :: i, j
-
-        n = real(data%n_frames, dp)
-        sum_t = 0.0_dp; sum_t2 = 0.0_dp
-        sum_d = 0.0_dp; sum_td = 0.0_dp
-
-        ! Accumulate sums
-        do i = 1, data%n_frames
-            sum_t = sum_t + real(i, dp)
-            sum_t2 = sum_t2 + real(i, dp)**2
-            do j = 1, 3
-                sum_d(j) = sum_d(j) + data%dipoles_clean(i, j)
-                sum_td(j) = sum_td(j) + real(i, dp) * data%dipoles_clean(i, j)
-            end do
-        end do
-
-        denom = n * sum_t2 - sum_t * sum_t
-        if (abs(denom) < 1.0e-30_dp) return
-
-        ! Linear fit and detrend for each direction
-        do j = 1, 3
-            s = (n * sum_td(j) - sum_t * sum_d(j)) / denom
-            b = (sum_d(j) - s * sum_t) / n
-            ! Store drift rate (Debye/ps): s is per frame, convert with time_step_ps
-            data%drift_rate(j) = s / time_step_ps
-            do i = 1, data%n_frames
-                data%dipoles_clean(i, j) = data%dipoles_clean(i, j) - (s * real(i, dp) + b)
-            end do
-        end do
-    end subroutine detrend_dipoles
-
-
-    subroutine compute_static_dielectric(data, iostat, iomsg)
-        !! Compute static dielectric tensor
-        !! ε_αβ = ε_∞,αβ + Cov(M_α, M_β) / (ε₀ k_B T Ω)
-        type(pol_data_t), intent(inout) :: data
-        integer, intent(out)  :: iostat
-        character(len=*), intent(out), optional :: iomsg
-        real(dp) :: m_sum(3), m2_sum(3,3), m_mean(3), cov(3,3)
-        real(dp) :: vol_m3, kt, denom
-        integer :: i, j, k, n
-
-        iostat = 0
-        n = data%n_frames
-
-        if (n < 2) then
-            iostat = IO_DIPOLE_ERROR
-            if (present(iomsg)) iomsg = 'Need at least 2 frames for statistics'
-            return
-        end if
-
-        if (data%temperature <= 0.0_dp) then
-            iostat = IO_DIPOLE_ERROR
-            if (present(iomsg)) iomsg = 'Temperature must be positive'
-            return
-        end if
-
-        if (data%volume_ang3 <= 0.0_dp) then
-            iostat = IO_DIPOLE_ERROR
-            if (present(iomsg)) iomsg = 'Cell volume must be positive'
-            return
-        end if
-
-        ! Convert volume to m³
-        vol_m3 = data%volume_ang3 * ANG3_TO_M3
-
-        ! k_B * T in Joules
-        kt = KBOLTZMANN * data%temperature
-
-        ! Precompute denominator: ε₀ * k_B * T * Ω
-        denom = EPSILON_0 * kt * vol_m3
-
-        ! Compute mean of each component
-        m_sum = 0.0_dp
-        do i = 1, n
-            do j = 1, 3
-                m_sum(j) = m_sum(j) + data%dipoles_clean(i, j)
-            end do
-        end do
-        m_mean = m_sum / real(n, dp)
-
-        ! Compute covariance matrix
-        m2_sum = 0.0_dp
-        do i = 1, n
-            do j = 1, 3
-                do k = 1, 3
-                    m2_sum(j, k) = m2_sum(j, k) + &
-                        (data%dipoles_clean(i, j) - m_mean(j)) * &
-                        (data%dipoles_clean(i, k) - m_mean(k))
-                end do
-            end do
-        end do
-        cov = m2_sum / real(n, dp)
-
-        ! Convert covariance from Debye² to (C·m)²
-        ! M_α = D_α × DEBYE_TO_CM
-        cov = cov * DEBYE_TO_CM**2
-
-        ! ε_ion = Cov / (ε₀ k_B T Ω)
-        data%eps_ion = cov / denom
-
-        ! ε_static = ε_∞ + ε_ion
-        data%eps_static = data%eps_inf + data%eps_ion
-    end subroutine compute_static_dielectric
 
 
     subroutine compute_static_dielectric_windowed(data, time_step_fs, iostat, iomsg)
@@ -434,7 +403,7 @@ contains
 
                 ! Copy window data and detrend
                 do j = 1, 3
-                    dw(:, j) = data%dipoles_clean(win_start:win_end, j)
+                    dw(:, j) = data%dipoles(win_start:win_end, j)
                 end do
                 call detrend_window(dw, nf)
 
@@ -477,7 +446,6 @@ contains
             do j = 1, 3
                 data%eps_ion(j, j) = max(0.0_dp, intercept)
             end do
-            data%eps_static = data%eps_inf + data%eps_ion
         end if
     end subroutine compute_static_dielectric_windowed
 
@@ -583,18 +551,20 @@ contains
 
 
     subroutine free_pol_data(data)
-        !! Deallocate all allocatable arrays
+        !! Deallocate arrays and reset all fields
         type(pol_data_t), intent(inout) :: data
         if (allocated(data%dipoles)) deallocate(data%dipoles)
-        if (allocated(data%dipoles_clean)) deallocate(data%dipoles_clean)
+        data%eps_inf = 0.0_dp
         data%n_frames = 0
-        data%n_unwraps = 0
-        data%drift_rate = 0.0_dp
+        data%temperature = 0.0_dp
+        data%volume_ang3 = 0.0_dp
+        data%cell_abc = 0.0_dp
         data%eps_static = 0.0_dp
         data%eps_ion = 0.0_dp
         data%alpha_static = 0.0_dp
         data%alpha_ion = 0.0_dp
         data%alpha_inf = 0.0_dp
+        data%n_unwraps = 0
     end subroutine free_pol_data
 
 end module polarizability

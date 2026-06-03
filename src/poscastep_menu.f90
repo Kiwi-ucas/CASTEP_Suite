@@ -6,9 +6,10 @@ module poscastep_menu
         MAX_LINE_LEN, IO_INVALID_INPUT, IO_SUCCESS, IO_USER_QUIT, strip_quotes
     use phonon_dos, only: phonon_dos_data_t, parse_phonon_file, compute_phonon_dos, &
         compute_ir_spectrum, compute_raman_spectrum, free_phonon_dos_data
-    use polarizability, only: pol_data_t, parse_castep_epsilon, parse_cp2k_dipoles, &
-        unwrap_dipoles, detrend_dipoles, compute_static_dielectric, &
-        compute_static_dielectric_windowed, compute_polarizability, free_pol_data
+    use polarizability, only: pol_data_t, parse_castep_epsilon, parse_castep_cell, &
+        parse_cp2k_dipoles, unwrap_dipoles, &
+        compute_static_dielectric_windowed, &
+        compute_polarizability, free_pol_data
     use bands_parser, only: parse_bands_file, free_bands_data
     use bands_plotter, only: BANDS_MODE_ASCII, BANDS_MODE_SVG, &
         plot_bands_ascii, write_bands_svg
@@ -1287,7 +1288,7 @@ contains
         character(len=MAX_LINE_LEN) :: castep_path, cp2k_dir, input
         character(len=256) :: msg
         integer :: ios
-        real(dp) :: time_step_ps
+        real(dp) :: time_step_fs
         character(len=MAX_LINE_LEN), save :: last_castep_path = ''
         character(len=MAX_LINE_LEN), save :: last_cp2k_dir = ''
 
@@ -1341,19 +1342,26 @@ contains
         end if
         last_cp2k_dir = trim(cp2k_dir)
 
-        ! --- Cell parameters ---
-        write(*, '(a)', advance='no') '  Enter cell a, b, c (Å, comma-separated): '
-        read(*, '(a)', iostat=ios) input
-        if (ios /= 0) then
-            write(*, '(a)') '  Invalid input.'; return
-        end if
-        call strip_quotes(input)
-        if (input == 'q' .or. input == 'Q') then
-            iostat = 0; return
-        end if
-        read(input, *, iostat=ios) pol%cell_abc(1:3)
-        if (ios /= 0) then
-            write(*, '(a)') '  Invalid format. Expected: a, b, c'; return
+        ! --- Cell parameters (auto-read from .castep, fallback to manual) ---
+        call parse_castep_cell(trim(castep_path), pol%cell_abc, ios, msg)
+        if (ios == 0) then
+            write(*, '(a,3(f12.6,a))') '  Cell from .castep: a=', pol%cell_abc(1), &
+                '  b=', pol%cell_abc(2), '  c=', pol%cell_abc(3), ' Å'
+        else
+            write(*, '(a)') '  Could not read cell from .castep, enter manually.'
+            write(*, '(a)', advance='no') '  Enter cell a, b, c (Å, comma-separated): '
+            read(*, '(a)', iostat=ios) input
+            if (ios /= 0) then
+                write(*, '(a)') '  Invalid input.'; return
+            end if
+            call strip_quotes(input)
+            if (input == 'q' .or. input == 'Q') then
+                iostat = 0; return
+            end if
+            read(input, *, iostat=ios) pol%cell_abc(1:3)
+            if (ios /= 0) then
+                write(*, '(a)') '  Invalid format. Expected: a, b, c'; return
+            end if
         end if
         ! Compute volume (assuming orthogonal cell)
         pol%volume_ang3 = pol%cell_abc(1) * pol%cell_abc(2) * pol%cell_abc(3)
@@ -1378,27 +1386,17 @@ contains
         ! --- Time step ---
         write(*, '(a)', advance='no') '  Enter MD time step (fs) [1.0]: '
         read(*, '(a)', iostat=ios) input
-        time_step_ps = 0.001_dp  ! default 1 fs = 0.001 ps
+        time_step_fs = 1.0_dp  ! default 1 fs
         if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
             if (adjustl(trim(input)) == 'q' .or. adjustl(trim(input)) == 'Q') then
                 iostat = 0; return
             end if
-            read(input, *, iostat=ios) time_step_ps
-            if (ios == 0) time_step_ps = time_step_ps * 0.001_dp  ! fs → ps
-        end if
-
-        ! --- Expected frames ---
-        write(*, '(a)', advance='no') '  Expected number of frames [0=auto]: '
-        read(*, '(a)', iostat=ios) input
-        if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
-            if (adjustl(trim(input)) == 'q' .or. adjustl(trim(input)) == 'Q') then
-                iostat = 0; return
-            end if
+            read(input, *, iostat=ios) time_step_fs
         end if
 
         ! --- Parse CP2K dipoles ---
         write(*, '(a)') '  Reading CP2K dipole files...'
-        call parse_cp2k_dipoles(trim(cp2k_dir), pol, 0, ios, msg)
+        call parse_cp2k_dipoles(trim(cp2k_dir), pol, ios, msg)
         if (ios /= 0) then
             write(*, '(a,a)') '  Error: ', trim(msg)
             call free_pol_data(pol); return
@@ -1412,19 +1410,14 @@ contains
 
         ! --- Window-based dielectric (per-window detrend + W→0 extrapolation) ---
         write(*, '(a)') '  Computing static dielectric (window method)...'
-        call compute_static_dielectric_windowed(pol, time_step_ps * 1000.0_dp, ios, msg)
+        call compute_static_dielectric_windowed(pol, time_step_fs, ios, msg)
         if (ios /= 0) then
             write(*, '(a,a)') '  Error: ', trim(msg)
             call free_pol_data(pol); return
         end if
 
-        ! Drift info from a quick global detrend (informational only)
-        call detrend_dipoles(pol, time_step_ps)
-        write(*, '(a,3(f8.4,a))') '  Global drift rates: ', &
-            pol%drift_rate(1), ', ', pol%drift_rate(2), ', ', pol%drift_rate(3), ' Debye/ps'
-
-        ! Recompute global + polarizability for backward-compatible output
-        call compute_static_dielectric(pol, ios, msg)
+        ! Compute static dielectric and polarizability from windowed ε_ion
+        pol%eps_static = pol%eps_inf + pol%eps_ion
         call compute_polarizability(pol)
 
         ! --- Print results ---
@@ -1448,6 +1441,14 @@ contains
         write(*, '(a,f10.1)') '  α_ion,iso = ', trace_iso(pol%alpha_ion)
         write(*, '(a,f10.1)') '  α_static,iso = ', trace_iso(pol%alpha_static)
         write(*, '(a)') ''
+
+        ! Wait for user to press q to return
+        do
+            write(*, '(a)', advance='no') '  Press q to return to menu: '
+            read(*, '(a)', iostat=ios) input
+            if (ios /= 0) exit
+            if (adjustl(trim(input)) == 'q' .or. adjustl(trim(input)) == 'Q') exit
+        end do
 
         call free_pol_data(pol)
     end subroutine handle_polarizability_menu

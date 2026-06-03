@@ -7,7 +7,7 @@ A Fortran 2008 CLI toolkit for [CASTEP] DFT calculations — generate input file
 | Mode | What it does |
 |------|-------------|
 | **PreCASTEP** | Converts `.cif` / `.pdb` / `.cell` structure files into CASTEP `.cell` + `.param` input files via an interactive menu |
-| **PosCASTEP** | Post-processes CASTEP output: band structure plots with gap analysis, total DOS, projected DOS (s/p/d/f), phonon DOS, IR spectrum, and Raman spectrum — all as interactive ASCII terminal plots, SVG, or CSV |
+| **PosCASTEP** | Post-processes CASTEP output: band structure plots with gap analysis, total DOS, projected DOS (s/p/d/f), phonon DOS, IR spectrum, Raman spectrum, and static polarizability — all as interactive ASCII terminal plots, SVG, or CSV |
 
 ## Requirements
 
@@ -143,6 +143,7 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
   4. Plot Phonon DOS
   5. Plot IR Spectrum
   6. Plot Raman Spectrum
+  7. Static Polarizability
   Q. Back
 ```
 
@@ -198,6 +199,16 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
 - Interactive ASCII plot, CSV export
 - Controls: same as total DOS
 
+### 7. Static Polarizability
+
+- Computes static dielectric constant and polarizability via AIMD polarization fluctuation method
+- Combines CASTEP DFPT optical dielectric tensor (ε_∞) with CP2K Berry phase dipole trajectory
+- Automatic cell parameter extraction from `.castep` file
+- Unwraps Berry phase polarization quantum jumps
+- Window-based analysis: per-window detrend + median + linear extrapolation to W→0 for vibrational limit
+- Outputs: ε_ion, ε_static, α_static (tensors + isotropic scalars)
+- Input: CASTEP `.castep` file, CP2K dipole directory, temperature, MD time step
+
 ## Project structure
 
 ```
@@ -219,6 +230,8 @@ CASTEP_Suite/
     ├── dos_plotter.f90      # DOS / PDOS ASCII + SVG + CSV plotter
     ├── cli_menu.f90         # PreCASTEP configuration menu
     ├── poscastep_menu.f90   # PosCASTEP post-processing menu
+    ├── polarizability.f90   # Static polarizability (AIMD fluctuation method)
+    ├── drift_analysis.f90   # Drift rate diagnostics (not compiled, dev artifact)
     └── main.f90             # Entry point, suite menu dispatcher
 ```
 
