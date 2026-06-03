@@ -6,7 +6,7 @@ module poscastep_menu
         MAX_LINE_LEN, IO_INVALID_INPUT, IO_SUCCESS, IO_USER_QUIT, strip_quotes
     use phonon_dos, only: phonon_dos_data_t, parse_phonon_file, compute_phonon_dos, &
         compute_ir_spectrum, compute_raman_spectrum, free_phonon_dos_data
-    use polarizability, only: pol_data_t, parse_castep_epsilon, parse_castep_cell, &
+    use polarizability, only: pol_data_t, parse_castep_file, &
         parse_cp2k_dipoles, unwrap_dipoles, &
         compute_static_dielectric_windowed, &
         compute_polarizability, free_pol_data
@@ -1313,15 +1313,19 @@ contains
         end if
         last_castep_path = trim(castep_path)
 
-        ! Parse ε_∞
-        write(*, '(a)') '  Parsing optical dielectric tensor...'
-        call parse_castep_epsilon(trim(castep_path), pol%eps_inf, ios, msg)
+        ! Parse ε_∞ and cell parameters from .castep in one pass
+        write(*, '(a)') '  Parsing CASTEP output...'
+        call parse_castep_file(trim(castep_path), pol%eps_inf, pol%cell_abc, &
+                                pol%volume_ang3, ios, msg)
         if (ios /= 0) then
             write(*, '(a,a)') '  Error: ', trim(msg)
             return
         end if
         write(*, '(a)') '  Optical dielectric tensor ε_∞ (from CASTEP):'
         call print_matrix(pol%eps_inf)
+        write(*, '(a,3(f12.6,a))') '  Cell from .castep: a=', pol%cell_abc(1), &
+            '  b=', pol%cell_abc(2), '  c=', pol%cell_abc(3), ' Å'
+        write(*, '(a,f10.2,a)') '  Cell volume: ', pol%volume_ang3, ' ų'
 
         ! --- CP2K dipole directory ---
         write(*, '(a)', advance='no') '  Enter CP2K dipole directory path'
@@ -1341,31 +1345,6 @@ contains
             write(*, '(a)') '  No directory specified.'; return
         end if
         last_cp2k_dir = trim(cp2k_dir)
-
-        ! --- Cell parameters (auto-read from .castep, fallback to manual) ---
-        call parse_castep_cell(trim(castep_path), pol%cell_abc, ios, msg)
-        if (ios == 0) then
-            write(*, '(a,3(f12.6,a))') '  Cell from .castep: a=', pol%cell_abc(1), &
-                '  b=', pol%cell_abc(2), '  c=', pol%cell_abc(3), ' Å'
-        else
-            write(*, '(a)') '  Could not read cell from .castep, enter manually.'
-            write(*, '(a)', advance='no') '  Enter cell a, b, c (Å, comma-separated): '
-            read(*, '(a)', iostat=ios) input
-            if (ios /= 0) then
-                write(*, '(a)') '  Invalid input.'; return
-            end if
-            call strip_quotes(input)
-            if (input == 'q' .or. input == 'Q') then
-                iostat = 0; return
-            end if
-            read(input, *, iostat=ios) pol%cell_abc(1:3)
-            if (ios /= 0) then
-                write(*, '(a)') '  Invalid format. Expected: a, b, c'; return
-            end if
-        end if
-        ! Compute volume (assuming orthogonal cell)
-        pol%volume_ang3 = pol%cell_abc(1) * pol%cell_abc(2) * pol%cell_abc(3)
-        write(*, '(a,f10.2,a)') '  Cell volume: ', pol%volume_ang3, ' ų'
 
         ! --- Temperature ---
         write(*, '(a)', advance='no') '  Enter temperature (K): '
@@ -1410,7 +1389,7 @@ contains
 
         ! --- Window-based dielectric (per-window detrend + W→0 extrapolation) ---
         write(*, '(a)') '  Computing static dielectric (window method)...'
-        call compute_static_dielectric_windowed(pol, time_step_fs, ios, msg)
+        call compute_static_dielectric_windowed(pol, time_step_fs, ios, msg, verbose=.true.)
         if (ios /= 0) then
             write(*, '(a,a)') '  Error: ', trim(msg)
             call free_pol_data(pol); return

@@ -5,7 +5,7 @@ module polarizability
     implicit none
     private
 
-    public :: pol_data_t, parse_castep_epsilon, parse_castep_cell, &
+    public :: pol_data_t, parse_castep_file, &
               parse_cp2k_dipoles, unwrap_dipoles, &
               compute_static_dielectric_windowed, &
               compute_polarizability, free_pol_data
@@ -44,22 +44,34 @@ module polarizability
         integer :: n_unwraps = 0
     end type
 
-    character(len=*), parameter :: EOM = 'No optical dielectric tensor found'
-
 contains
 
-    subroutine parse_castep_epsilon(filename, eps_inf, iostat, iomsg)
-        !! Extract optical dielectric tensor ε_∞ from CASTEP .castep file
+    subroutine parse_castep_file(filename, eps_inf, cell_abc, cell_volume, iostat, iomsg)
+        !! Extract optical dielectric tensor ε_∞ and lattice parameters from .castep
+        !! Single-pass parser — opens the file once and collects all data.
+        !!
+        !! Returns:
+        !!   eps_inf(3,3)   — optical dielectric tensor
+        !!   cell_abc(3)    — lattice parameters a, b, c (Å)
+        !!   cell_volume    — cell volume (Å³) from general parallelepiped formula
         character(len=*), intent(in)  :: filename
         real(dp), intent(out)         :: eps_inf(3,3)
+        real(dp), intent(out)         :: cell_abc(3)
+        real(dp), intent(out)         :: cell_volume
         integer, intent(out)          :: iostat
         character(len=*), intent(out), optional :: iomsg
-        character(len=MAX_LINE_LEN) :: line
+        character(len=MAX_LINE_LEN) :: line, lattice_lines(3)
+        real(dp) :: angles(3)  ! alpha, beta, gamma in degrees
+        real(dp) :: cos_a, cos_b, cos_g, cos2_sum, deg2rad
         integer :: unit, ios, idx, i
-        logical :: found
+        logical :: found_eps, found_cell
 
         iostat = 0
+        if (present(iomsg)) iomsg = ''
         eps_inf = 0.0_dp
+        cell_abc = 0.0_dp
+        cell_volume = 0.0_dp
+        angles = 90.0_dp  ! default orthogonal
 
         open(newunit=unit, file=filename, status='old', action='read', iostat=ios)
         if (ios /= 0) then
@@ -68,94 +80,83 @@ contains
             return
         end if
 
-        found = .false.
+        found_eps = .false.
+        found_cell = .false.
+
         do
             read(unit, '(a)', iostat=ios) line
             if (ios /= 0) exit
-            idx = index(line, 'Optical Permittivity')
-            if (idx > 0) then
-                ! Skip separator line
-                read(unit, '(a)', iostat=ios) line
+
+            ! --- Optical Permittivity (ε_∞) ---
+            if (index(line, 'Optical Permittivity') > 0) then
+                read(unit, '(a)', iostat=ios) line  ! skip separator
                 if (ios /= 0) exit
-                ! Read 3×3 matrix
                 do i = 1, 3
                     read(unit, '(a)', iostat=ios) line
                     if (ios /= 0) exit
                     read(line, *, iostat=ios) eps_inf(i, 1:3)
                     if (ios /= 0) exit
                 end do
-                if (ios == 0) found = .true.
-                exit
+                if (ios == 0) found_eps = .true.
+                cycle
+            end if
+
+            ! --- Lattice parameters ---
+            if (index(line, 'Lattice parameters') > 0) then
+                ! Read and save the 3 lattice lines for dual parsing
+                do i = 1, 3
+                    read(unit, '(a)', iostat=ios) lattice_lines(i)
+                    if (ios /= 0) exit
+                end do
+                if (ios /= 0) cycle
+
+                ! Parse cell lengths and angles from saved lines
+                ! Format: " a =   10.128028   alpha =  90.000000"
+                !         " b =   10.128028   beta  =  90.000000"
+                !         " c =   10.128028   gamma =  90.000000"
+                do i = 1, 3
+                    line = lattice_lines(i)
+                    ! Cell length: use " a =" / " b =" / " c =" (leading space)
+                    if (i == 1) idx = index(line, ' a =')
+                    if (i == 2) idx = index(line, ' b =')
+                    if (i == 3) idx = index(line, ' c =')
+                    if (idx > 0) read(line(idx+4:), *, iostat=ios) cell_abc(i)
+                    if (ios /= 0) cycle
+
+                    ! Angle: look for "alpha =" / "beta  =" / "gamma ="
+                    if (i == 1) idx = index(line, 'alpha =')
+                    if (i == 2) idx = index(line, 'beta  =')
+                    if (i == 3) idx = index(line, 'gamma =')
+                    if (idx > 0) read(line(idx+7:), *, iostat=ios) angles(i)
+                end do
+                if (any(cell_abc > 0.0_dp)) found_cell = .true.
+                cycle
             end if
         end do
         close(unit)
 
-        if (.not. found) then
+        if (.not. found_eps) then
             iostat = IO_EPS_PARSE_ERROR
-            if (present(iomsg)) iomsg = trim(EOM)
-        end if
-    end subroutine parse_castep_epsilon
-
-
-    subroutine parse_castep_cell(filename, cell_abc, iostat, iomsg)
-        !! Extract lattice parameters a, b, c from CASTEP .castep file.
-        !! Format:  a =   10.128028   alpha =  90.000000
-        !!          b =   10.128028   beta  =  90.000000
-        !!          c =   10.128028   gamma =  90.000000
-        !! Each parameter is on its own line; read the 3 lines after the header.
-        character(len=*), intent(in)  :: filename
-        real(dp), intent(out)         :: cell_abc(3)
-        integer, intent(out)          :: iostat
-        character(len=*), intent(out), optional :: iomsg
-        character(len=MAX_LINE_LEN) :: line
-        integer :: unit, ios, idx, i
-
-        iostat = 0
-        cell_abc = 0.0_dp
-
-        open(newunit=unit, file=filename, status='old', action='read', iostat=ios)
-        if (ios /= 0) then
-            iostat = IO_EPS_NOT_FOUND
-            if (present(iomsg)) iomsg = 'Cannot open file: ' // trim(filename)
+            if (present(iomsg)) iomsg = 'No optical dielectric tensor found in: ' // trim(filename)
             return
         end if
 
-        ! Scan for "Lattice parameters" header
-        do
-            read(unit, '(a)', iostat=ios) line
-            if (ios /= 0) exit
-            if (index(line, 'Lattice parameters') > 0) exit
-        end do
-
-        if (ios /= 0) then
-            close(unit)
+        if (.not. found_cell) then
             iostat = IO_EPS_PARSE_ERROR
             if (present(iomsg)) iomsg = 'Cell parameters not found in: ' // trim(filename)
             return
         end if
 
-        ! Read the next 3 lines: a, b, c
-        ! Each line:  a =   10.128028   alpha =  90.000000
-        ! Use " a =" to avoid matching "alpha =" (which also contains "a =")
-        do i = 1, 3
-            read(unit, '(a)', iostat=ios) line
-            if (ios /= 0) exit
-            idx = index(line, ' a =')
-            if (idx == 0) idx = index(line, ' b =')
-            if (idx == 0) idx = index(line, ' c =')
-            if (idx > 0) then
-                read(line(idx+4:), *, iostat=ios) cell_abc(i)
-            else
-                ios = -1
-            end if
-        end do
-        close(unit)
+        ! Compute general parallelepiped volume
+        deg2rad = acos(-1.0_dp) / 180.0_dp
+        cos_a = cos(angles(1) * deg2rad)
+        cos_b = cos(angles(2) * deg2rad)
+        cos_g = cos(angles(3) * deg2rad)
+        cos2_sum = cos_a**2 + cos_b**2 + cos_g**2
 
-        if (ios /= 0 .or. any(cell_abc <= 0.0_dp)) then
-            iostat = IO_EPS_PARSE_ERROR
-            if (present(iomsg)) iomsg = 'Cell parameters not found in: ' // trim(filename)
-        end if
-    end subroutine parse_castep_cell
+        cell_volume = cell_abc(1) * cell_abc(2) * cell_abc(3) * &
+                      sqrt(max(0.0_dp, 1.0_dp - cos2_sum + 2.0_dp * cos_a * cos_b * cos_g))
+    end subroutine parse_castep_file
 
 
     subroutine parse_cp2k_dipoles(dir_path, data, iostat, iomsg)
@@ -174,6 +175,7 @@ contains
         real(dp) :: dx, dy, dz
 
         iostat = 0
+        if (present(iomsg)) iomsg = ''
 
         ! Generate file list via `find` (not shell glob).
         ! `ls dir/*dipole*` expands the glob via argv, which exceeds ARG_MAX
@@ -247,6 +249,7 @@ contains
             end do
             if (ios /= 0 .or. index(line, 'Dipole moment') == 0) then
                 close(dip_unit)
+                close(list_unit, status='delete')
                 iostat = IO_DIPOLE_ERROR
                 if (present(iomsg)) iomsg = 'Dipole moment not found in: ' // trim(fname)
                 return
@@ -256,6 +259,7 @@ contains
             read(dip_unit, '(a)', iostat=ios) line
             if (ios /= 0) then
                 close(dip_unit)
+                close(list_unit, status='delete')
                 iostat = IO_DIPOLE_ERROR
                 if (present(iomsg)) iomsg = 'Error reading dipole values in: ' // trim(fname)
                 return
@@ -265,6 +269,8 @@ contains
             ! Parse X= Y= Z= values
             call parse_dipole_line(line, dx, dy, dz, ios)
             if (ios /= 0) then
+                close(dip_unit)
+                close(list_unit, status='delete')
                 iostat = IO_DIPOLE_ERROR
                 if (present(iomsg)) iomsg = 'Cannot parse dipole values in: ' // trim(fname)
                 return
@@ -354,7 +360,7 @@ contains
     end subroutine unwrap_dipoles
 
 
-    subroutine compute_static_dielectric_windowed(data, time_step_fs, iostat, iomsg)
+    subroutine compute_static_dielectric_windowed(data, time_step_fs, iostat, iomsg, verbose)
         !! Window-based static dielectric with extrapolation to W→0
         !! Removes Li+ diffusion via per-window detrend + median
         !! Extrapolates to zero window size for vibrational limit
@@ -362,17 +368,19 @@ contains
         real(dp), intent(in) :: time_step_fs
         integer, intent(out) :: iostat
         character(len=*), intent(out), optional :: iomsg
+        logical, intent(in), optional :: verbose
 
         real(dp) :: ws_ps(4) = [0.1_dp, 0.2_dp, 0.5_dp, 1.0_dp]
         integer, parameter :: N_WS = 4
         real(dp) :: vol_m3, kt, denom, dt_ps
-        real(dp) :: med_eps_ion(N_WS)
+        real(dp) :: med_eps_ion(N_WS) = 0.0_dp
         integer :: i, j, iw, n_win, nf, win_start, win_end
         real(dp) :: slope, intercept, dn
         real(dp), allocatable :: dw(:, :), cov(:, :), eps_ion(:, :)
         real(dp) :: iso_vals(1000), med_iso, sum_x, sum_y, sum_xx, sum_xy
 
         iostat = 0
+        if (present(iomsg)) iomsg = ''
 
         if (data%n_frames < 2) then
             iostat = IO_DIPOLE_ERROR
@@ -385,10 +393,14 @@ contains
         kt = KBOLTZMANN * data%temperature
         denom = EPSILON_0 * kt * vol_m3
 
-        write(*, '(a)') ''
-        write(*, '(a)') '  Window-size convergence:'
-        write(*, '(a)') '  Window (ps)   N_wins   ε_ion (median)'
-        write(*, '(a)') '  ----------   ------   --------------'
+        if (present(verbose)) then
+            if (verbose) then
+                write(*, '(a)') ''
+                write(*, '(a)') '  Window-size convergence:'
+                write(*, '(a)') '  Window (ps)   N_wins   ε_ion (median)'
+                write(*, '(a)') '  ----------   ------   --------------'
+            end if
+        end if
 
         do iw = 1, N_WS
             nf = nint(ws_ps(iw) / dt_ps)
@@ -417,7 +429,9 @@ contains
             ! Median over windows
             med_iso = median(iso_vals(1:n_win))
             med_eps_ion(iw) = med_iso
-            write(*, '(a,f6.1,a,i8,a,f8.3)') '  ', ws_ps(iw), '         ', n_win, '     ', med_iso
+            if (present(verbose)) then
+                if (verbose) write(*, '(a,f6.1,a,i8,a,f8.3)') '  ', ws_ps(iw), '         ', n_win, '     ', med_iso
+            end if
             deallocate(dw, cov, eps_ion)
         end do
 
@@ -437,9 +451,13 @@ contains
         if (dn >= 2.0_dp) then
             slope = (dn * sum_xy - sum_x * sum_y) / (dn * sum_xx - sum_x**2)
             intercept = (sum_y - slope * sum_x) / dn
-            write(*, '(a)') ''
-            write(*, '(a,f8.3)') '  ε_ion (W→0 extrapolation): ', max(0.0_dp, intercept)
-            write(*, '(a,f8.3)') '  Diffusion slope dε/dW:     ', slope
+            if (present(verbose)) then
+                if (verbose) then
+                    write(*, '(a)') ''
+                    write(*, '(a,f8.3)') '  ε_ion (W→0 extrapolation): ', max(0.0_dp, intercept)
+                    write(*, '(a,f8.3)') '  Diffusion slope dε/dW:     ', slope
+                end if
+            end if
 
             ! Write back to pol for downstream display
             data%eps_ion = 0.0_dp
@@ -540,8 +558,7 @@ contains
 
         do i = 1, 3
             do j = 1, 3
-                kronecker = 0.0_dp
-                if (i == j) kronecker = 1.0_dp
+                kronecker = merge(1.0_dp, 0.0_dp, i == j)
                 data%alpha_static(i, j) = (data%eps_static(i, j) - kronecker) * factor
                 data%alpha_ion(i, j) = data%eps_ion(i, j) * factor
                 data%alpha_inf(i, j) = (data%eps_inf(i, j) - kronecker) * factor
