@@ -268,10 +268,10 @@ contains
             ! Parse LATTICE_ABC content (skip if LATTICE_CART was already seen)
             if (in_lattice .and. .not. cart_seen) then
                 if (.not. read_a_line) then
-                    read(trimmed, '(3F12.7)', iostat=ios_local) data%a, data%b, data%c
+                    read(trimmed, *, iostat=ios_local) data%a, data%b, data%c
                     if (ios_local == 0) read_a_line = .true.
                 else if (.not. read_angle_line) then
-                    read(trimmed, '(3F12.7)', iostat=ios_local) data%alpha, data%beta, data%gamma
+                    read(trimmed, *, iostat=ios_local) data%alpha, data%beta, data%gamma
                     if (ios_local == 0) read_angle_line = .true.
                 end if
                 cycle
@@ -346,7 +346,7 @@ contains
         integer, intent(out) :: iostat
         character(len=*), optional, intent(out) :: iomsg
 
-        integer :: ios, iunit, i, n, n_cols, line_len, start_pos, end_pos
+        integer :: ios, iunit, i, n, n_cols, line_len, start_pos, end_pos, j
         integer :: idx_col(5)
         character(len=256) :: line, tag, val
         logical :: in_atom_loop, in_loop, file_found
@@ -397,8 +397,19 @@ contains
 
             ! Inside a loop block
             if (in_loop) then
-                ! Underscore lines are column headers
+                ! Underscore lines may be loop headers or tag-value pairs (end of loop)
                 if (line_len >= 1 .and. line(1:1) == '_') then
+                    ! Check if this is a tag-value pair (has a value after the tag)
+                    ! If so, exit loop mode and process as a regular tag-value
+                    j = index(line, ' ')
+                    if (j > 0) then
+                        val = clean_str_inline(line(j+1:))
+                        if (len_trim(val) > 0) then
+                            in_loop = .false.
+                            in_atom_loop = .false.
+                            goto 100
+                        end if
+                    end if
                     if (index(line, '_atom_site_label') > 0)       idx_col(1) = n_cols + 1
                     if (index(line, '_atom_site_type_symbol') > 0) idx_col(2) = n_cols + 1
                     if (index(line, '_atom_site_fract_x') > 0)     idx_col(3) = n_cols + 1
@@ -454,6 +465,7 @@ contains
             end if
 
             ! Outside loop block: all lines are tag-value pairs
+100         continue
             tag = ''; val = ''
             i = index(line, ' ')
             if (i > 0) then
@@ -573,8 +585,13 @@ contains
         if (tmp(1:1) == "'" .or. tmp(1:1) == '"') tmp = tmp(2:)
         if (n > 0 .and. tmp(len_trim(tmp):len_trim(tmp)) == "'") tmp = tmp(:len_trim(tmp)-1)
         if (n > 0 .and. tmp(len_trim(tmp):len_trim(tmp)) == '"') tmp = tmp(:len_trim(tmp)-1)
-        do i = 1, min(len_trim(tmp), len(tgt))
+        n = min(len_trim(tmp), len(tgt))
+        do i = 1, n
             tgt(i:i) = tmp(i:i)
+        end do
+        ! Blank-pad remaining positions for safety
+        do i = n + 1, len(tgt)
+            tgt(i:i) = ' '
         end do
     end subroutine copy_str_no_quotes
 

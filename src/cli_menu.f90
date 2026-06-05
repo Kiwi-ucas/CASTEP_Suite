@@ -372,7 +372,7 @@ contains
             write(*, '(a)') '   14. SocketDriver          (暂未开发)'
             write(*, '(a)') '   15. Autosolvation         (暂未开发)'
             write(*, '(a)') '   16. EpCoupling            (暂未开发)'
-            write(*, '(a)') '    Enter choice : ' // trim(prompt_text)
+            write(*, '(a)') '    Enter choice : '
 
             read(*, '(a)', iostat=ios) input
             if (ios /= 0 .or. len_trim(input) == 0) then
@@ -430,7 +430,7 @@ contains
             write(*, '(a)') '    3. HSE06'
             write(*, '(a)') '    4. PBE0'
             write(*, '(a)') '    5. r2scan'
-            write(*, '(a)') '    Enter choice : ' // trim(prompt_text)
+            write(*, '(a)') '    Enter choice : '
 
             read(*, '(a)', iostat=ios) input
             if (ios /= 0 .or. len_trim(input) == 0) then
@@ -470,7 +470,7 @@ contains
         result_cutoff = 400.0_dp
 
         do
-            write(*, '(a, f8.1)') '  Plane-wave cutoff energy (eV) [default: 400.0]: ' // trim(prompt_text)
+            write(*, '(a)') '  Plane-wave cutoff energy (eV) [default: 400.0]: '
             read(*, '(a)', iostat=ios) input
             if (ios /= 0) exit  ! empty input -> default
 
@@ -511,7 +511,7 @@ contains
             write(*, '(a)') '    2. D3'
             write(*, '(a)') '    3. D3-BJ'
             write(*, '(a)') '    4. D4'
-            write(*, '(a)') '    Enter choice : ' // trim(prompt_text)
+            write(*, '(a)') '    Enter choice : '
 
             read(*, '(a)', iostat=ios) input
             if (ios /= 0) then
@@ -556,7 +556,7 @@ contains
             write(*, '(a)') '    1. NCP19     (Norm-conserving)'
             write(*, '(a)') '    2. C19MK2    (Ultrasoft)'
             write(*, '(a)') '    3. SOC19     (Spin-orbit coupling)'
-            write(*, '(a)') '    Enter choice : ' // trim(prompt_text)
+            write(*, '(a)') '    Enter choice : '
 
             read(*, '(a)', iostat=ios) input
             if (ios /= 0) then
@@ -601,7 +601,7 @@ contains
             write(*, '(a)') '  Select K-point scheme:'
             write(*, '(a)') '    1. GAMMA-only'
             write(*, '(a)') '    2. Monkhorst-Pack grid'
-            write(*, '(a)') '    Enter choice : ' // trim(prompt_text)
+            write(*, '(a)') '    Enter choice : '
 
             read(*, '(a)', iostat=ios) input
             if (ios /= 0) then
@@ -658,7 +658,7 @@ contains
         result_tol = '1e-5'
 
         do
-            write(*, '(a, a)') '  SCF tolerance : ' // trim(prompt_text)
+            write(*, '(a)') '  SCF tolerance [default: 1e-5]: '
             read(*, '(a)', iostat=ios) input
             if (ios /= 0) exit  ! empty -> default
 
@@ -707,7 +707,7 @@ contains
             write(*, '(a)') '    1. BFGS'
             write(*, '(a)') '    2. LBFGS'
             write(*, '(a)') '    3. CG'
-            write(*, '(a)') '    Enter choice : ' // trim(prompt_text)
+            write(*, '(a)') '    Enter choice : '
 
             read(*, '(a)', iostat=ios) input
             if (ios /= 0) then
@@ -750,7 +750,7 @@ contains
             write(*, '(a)') '  Select cell optimization mode:'
             write(*, '(a)') '    1. ALL           (relax cell and ions)'
             write(*, '(a)') '    2. FIX_CELL      (relax ions only)'
-            write(*, '(a)') '    Enter choice : ' // trim(prompt_text)
+            write(*, '(a)') '    Enter choice : '
 
             read(*, '(a)', iostat=ios) input
             if (ios /= 0) then
@@ -793,7 +793,7 @@ contains
             write(*, '(a)') '  Select symmetry handling:'
             write(*, '(a)') '    1. NONE (P1)'
             write(*, '(a)') '    2. AUTO (Auto detect by CASTEP)'
-            write(*, '(a)') '    Enter choice : ' // trim(prompt_text)
+            write(*, '(a)') '    Enter choice : '
 
             read(*, '(a)', iostat=ios) input
             if (ios /= 0) then
@@ -837,7 +837,7 @@ contains
             write(*, '(a)') '    2. MEDIUM'
             write(*, '(a)') '    3. FINE'
             write(*, '(a)') '    4. EXTREME (For DFPT Phonon Calculation)'
-            write(*, '(a)') '    Enter choice : ' // trim(prompt_text)
+            write(*, '(a)') '    Enter choice : '
 
             read(*, '(a)', iostat=ios) input
             if (ios /= 0) then
@@ -1144,7 +1144,7 @@ contains
                 end if
             end if
             write(*, '(a)') '    0. Back to main menu'
-            write(*, '(a)') '    Enter choice : ' // trim(prompt_text)
+            write(*, '(a)') '    Enter choice : '
 
             read(*, '(a)', iostat=ios) input
             if (ios /= 0 .or. len_trim(input) == 0) exit
@@ -1379,7 +1379,7 @@ contains
             write(*, '(a)') '  Select spectral task type:'
             write(*, '(a)') '    1. Band Structure and DOS'
             write(*, '(a)') '    2. Band Structure and pDOS'
-            write(*, '(a)') '    Enter choice : ' // trim(prompt_text)
+            write(*, '(a)') '    Enter choice : '
 
             read(*, '(a)', iostat=ios) input
             if (ios /= 0 .or. len_trim(input) == 0) then

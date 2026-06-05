@@ -2,8 +2,10 @@ module poscastep_menu
     !! Interactive CLI menus for PosCASTEP post-processing
     !! Structure: top-level menu -> property-specific sub-menus
     !! Currently implements: Plot Band Structure
-    use castep_config, only: dp, HARTREE_TO_EV, bands_data_t, pdos_data_t, &
-        MAX_LINE_LEN, IO_INVALID_INPUT, IO_SUCCESS, IO_USER_QUIT, strip_quotes
+    use castep_config, only: dp, pi, HARTREE_TO_EV, bands_data_t, pdos_data_t, &
+        cif_data_t, MAX_LINE_LEN, IO_INVALID_INPUT, IO_SUCCESS, IO_USER_QUIT, &
+        IO_FILE_NOT_FOUND, IO_PARSE_ERROR, IO_WRITE_ERROR, strip_quotes
+    use parser, only: parse_cell_inline
     use phonon_dos, only: phonon_dos_data_t, parse_phonon_file, compute_phonon_dos, &
         compute_ir_spectrum, compute_raman_spectrum, free_phonon_dos_data
     use polarizability, only: pol_data_t, parse_castep_file, &
@@ -23,6 +25,7 @@ module poscastep_menu
 
     public :: run_poscastep_menu
 
+    integer, parameter :: POS_CELL2CIF   = 0
     integer, parameter :: POS_BANDS      = 1
     integer, parameter :: POS_DOS        = 2
     integer, parameter :: POS_PDOS       = 3
@@ -48,6 +51,7 @@ contains
             write(*, '(a)') '  ================================'
             write(*, '(a)') '            PosCASTEP'
             write(*, '(a)') '  ================================'
+            write(*, '(a)') '  0. Convert .cell to .cif'
             write(*, '(a)') '  1. Plot Band Structure'
             write(*, '(a)') '  2. Plot DOS'
             write(*, '(a)') '  3. Plot pDOS'
@@ -79,6 +83,9 @@ contains
             end if
 
             select case (choice)
+            case (POS_CELL2CIF)
+                call handle_cell2cif_menu(iostat)
+                if (iostat == IO_USER_QUIT) return
             case (POS_BANDS)
                 call handle_bands_menu(iostat)
                 if (iostat == IO_USER_QUIT) return
@@ -1449,5 +1456,267 @@ contains
         real(dp) :: val
         val = (mat(1,1) + mat(2,2) + mat(3,3)) / 3.0_dp
     end function trace_iso
+
+    ! ----------------------------------------------------------------
+    !  .cell -> .cif converter (Option 0)
+    ! ----------------------------------------------------------------
+
+    subroutine handle_cell2cif_menu(iostat)
+        !! Read a CASTEP .cell file and convert to CIF format
+        integer, intent(out) :: iostat
+        type(cif_data_t) :: cif
+        character(len=512)  :: cell_path, cif_path, stem
+        character(len=256)  :: msg
+        integer :: ios, istat, i
+        logical :: exists
+        character(len=MAX_LINE_LEN) :: input
+
+        iostat = 0
+
+        write(*, '(a)', advance='no') '  Enter .cell file path: '
+        read(*, '(a)', iostat=ios) input
+        if (ios /= 0) return
+        cell_path = adjustl(trim(input))
+        call strip_quotes(cell_path)
+        if (cell_path == 'q' .or. cell_path == 'Q') then
+            iostat = 0; return
+        end if
+        if (len_trim(cell_path) == 0) then
+            write(*, '(a)') '  No file specified.'; return
+        end if
+
+        inquire(file=trim(cell_path), exist=exists)
+        if (.not. exists) then
+            write(*, '(a,a)') '  File not found: ', trim(cell_path)
+            return
+        end if
+
+        write(*, '(a,a)') '  Parsing .cell file: ', trim(cell_path)
+        call parse_cell_inline(trim(cell_path), cif, istat, iomsg=msg)
+        if (istat /= 0) then
+            write(*, '(a,a)') '  Error parsing .cell: ', trim(msg)
+            return
+        end if
+
+        if (cif%n_atoms == 0) then
+            write(*, '(a)') '  Warning: no atoms found in .cell file.'
+        end if
+
+        write(*, '(a)')       '  ------- Cell Summary -------'
+        write(*, '(a,3f10.4)') '  a, b, c (Ang):   ', cif%a, cif%b, cif%c
+        write(*, '(a,3f10.4)') '  alpha, beta, gamma (deg): ', &
+            cif%alpha, cif%beta, cif%gamma
+        write(*, '(a,i0)')     '  Atoms:           ', cif%n_atoms
+        if (len_trim(cif%space_group) > 0) &
+            write(*, '(a,a)')  '  Space group:     ', trim(cif%space_group)
+        if (cif%positions_fractional) then
+            write(*, '(a)')    '  Coordinates:     fractional'
+        else
+            write(*, '(a)')    '  Coordinates:     Cartesian -> converting to fractional'
+        end if
+
+        ! Convert Cartesian to fractional if needed
+        if (.not. cif%positions_fractional) then
+            call convert_to_fractional(cif, istat)
+            if (istat /= 0) then
+                write(*, '(a)') '  Error: zero-volume cell, cannot convert coordinates.'
+                return
+            end if
+        end if
+
+        ! Derive output filename
+        stem = cell_path
+        i = len_trim(stem)
+        do while (i > 0)
+            if (stem(i:i) == '/') then; stem = stem(i+1:); exit; end if
+            i = i - 1
+        end do
+        i = len_trim(stem)
+        do while (i > 0)
+            if (stem(i:i) == '.') then; stem = stem(1:i-1); exit; end if
+            i = i - 1
+        end do
+        cif_path = trim(stem) // '.cif'
+
+        ! Write CIF file
+        call write_cif_file(cif, trim(cif_path), istat, msg)
+        if (istat /= 0) then
+            write(*, '(a,a)') '  Error writing CIF: ', trim(msg)
+        else
+            write(*, '(a,a)') '  CIF file written: ', trim(cif_path)
+        end if
+        write(*, '(a)') '  ----------------------------'
+    end subroutine handle_cell2cif_menu
+
+
+    subroutine convert_to_fractional(cif, iostat)
+        !! Convert Cartesian atom coordinates to fractional using inverse lattice
+        type(cif_data_t), intent(inout) :: cif
+        integer, intent(out) :: iostat
+        real(dp) :: lattice(3,3), inv_lattice(3,3), frac(3)
+        integer :: i
+
+        iostat = 0
+        lattice = compute_lattice_private(cif%a, cif%b, cif%c, &
+            cif%alpha, cif%beta, cif%gamma)
+        inv_lattice = invert_lattice_3x3(lattice)
+
+        ! Check for zero determinant (degenerate cell)
+        if (all(abs(inv_lattice) < 1.0e-30_dp)) then
+            iostat = 1; return
+        end if
+
+        do i = 1, cif%n_atoms
+            frac = cartesian_to_fractional(cif%atoms(i)%x, cif%atoms(i)%y, &
+                cif%atoms(i)%z, inv_lattice)
+            cif%atoms(i)%x = frac(1)
+            cif%atoms(i)%y = frac(2)
+            cif%atoms(i)%z = frac(3)
+        end do
+    end subroutine convert_to_fractional
+
+
+    subroutine write_cif_file(data, filename, iostat, iomsg)
+        !! Write cif_data_t as a standard CIF file
+        type(cif_data_t), intent(in) :: data
+        character(len=*), intent(in) :: filename
+        integer, intent(out) :: iostat
+        character(len=*), intent(out) :: iomsg
+
+        integer :: iunit, ios, i
+        character(len=10) :: date_str
+        character(len=8)  :: date_val
+        character(len=128) :: data_name
+        integer :: n
+
+        iostat = 0; iomsg = ''
+
+        ! Derive data_ name from filename stem
+        data_name = filename
+        n = len_trim(data_name)
+        do while (n > 0)
+            if (data_name(n:n) == '/') then; data_name = data_name(n+1:); exit; end if
+            n = n - 1
+        end do
+        n = len_trim(data_name)
+        do while (n > 0)
+            if (data_name(n:n) == '.') then; data_name = data_name(1:n-1); exit; end if
+            n = n - 1
+        end do
+        data_name = adjustl(data_name)
+
+        open(newunit=iunit, file=trim(filename), status='replace', &
+            action='write', iostat=ios)
+        if (ios /= 0) then
+            iostat = IO_WRITE_ERROR
+            iomsg = 'Cannot open output file: ' // trim(filename)
+            return
+        end if
+
+        call date_and_time(date=date_val)
+        date_str = date_val(1:4) // '-' // date_val(5:6) // '-' // date_val(7:8)
+
+        write(iunit, '(a,a)')       'data_', trim(data_name)
+        write(iunit, '(a,a)')       '_audit_creation_date              ', trim(date_str)
+        write(iunit, '(a)')         '_audit_creation_method            ''CASTEP Suite PosCASTEP'''
+        write(iunit, '(a,a,a)')     "_symmetry_space_group_name_H-M    '", &
+            trim(data%space_group), "'"
+        write(iunit, '(a,f12.4)')  '_cell_length_a                    ', data%a
+        write(iunit, '(a,f12.4)')  '_cell_length_b                    ', data%b
+        write(iunit, '(a,f12.4)')  '_cell_length_c                    ', data%c
+        write(iunit, '(a,f12.4)')  '_cell_angle_alpha                 ', data%alpha
+        write(iunit, '(a,f12.4)')  '_cell_angle_beta                  ', data%beta
+        write(iunit, '(a,f12.4)')  '_cell_angle_gamma                 ', data%gamma
+        write(iunit, '(a)')        'loop_'
+        write(iunit, '(a)')        '_atom_site_label'
+        write(iunit, '(a)')        '_atom_site_type_symbol'
+        write(iunit, '(a)')        '_atom_site_fract_x'
+        write(iunit, '(a)')        '_atom_site_fract_y'
+        write(iunit, '(a)')        '_atom_site_fract_z'
+        do i = 1, data%n_atoms
+            write(iunit, '(a,2x,a,2x,f12.6,2x,f12.6,2x,f12.6)') &
+                trim(data%atoms(i)%label), trim(data%atoms(i)%element), &
+                data%atoms(i)%x, data%atoms(i)%y, data%atoms(i)%z
+        end do
+
+        close(iunit)
+    end subroutine write_cif_file
+
+
+    pure function compute_lattice_private(a, b, c, alpha_deg, beta_deg, gamma_deg) &
+        result(lattice)
+        !! Compute Cartesian lattice vectors from cell parameters.
+        !! Column-major: lattice(:,1)=a_vec, lattice(:,2)=b_vec, lattice(:,3)=c_vec
+        real(dp), intent(in) :: a, b, c, alpha_deg, beta_deg, gamma_deg
+        real(dp) :: lattice(3, 3)
+        real(dp) :: alpha, beta, gamma
+        real(dp) :: cos_alpha, cos_beta, cos_gamma, sin_gamma
+        real(dp) :: vol_factor
+
+        alpha  = alpha_deg * pi / 180.0_dp
+        beta   = beta_deg  * pi / 180.0_dp
+        gamma  = gamma_deg * pi / 180.0_dp
+
+        cos_alpha = dcos(alpha)
+        cos_beta  = dcos(beta)
+        cos_gamma = dcos(gamma)
+        sin_gamma = dsin(gamma)
+
+        lattice(1,1) = a
+        lattice(2,1) = 0.0_dp
+        lattice(3,1) = 0.0_dp
+
+        lattice(1,2) = b * cos_gamma
+        lattice(2,2) = b * sin_gamma
+        lattice(3,2) = 0.0_dp
+
+        lattice(1,3) = c * cos_beta
+        lattice(2,3) = c * (cos_alpha - cos_beta * cos_gamma) / sin_gamma
+
+        vol_factor = 1.0_dp - cos_alpha**2 - cos_beta**2 - cos_gamma**2 &
+                     + 2.0_dp * cos_alpha * cos_beta * cos_gamma
+        if (vol_factor > 0.0_dp) then
+            lattice(3,3) = c * dsqrt(vol_factor) / sin_gamma
+        else
+            lattice(3,3) = 0.0_dp
+        end if
+    end function compute_lattice_private
+
+
+    pure function invert_lattice_3x3(m) result(inv)
+        !! Compute the inverse of a 3x3 matrix (adjugate / determinant)
+        real(dp), intent(in) :: m(3,3)
+        real(dp) :: inv(3,3)
+        real(dp) :: det
+
+        det = m(1,1)*(m(2,2)*m(3,3) - m(2,3)*m(3,2)) &
+            - m(1,2)*(m(2,1)*m(3,3) - m(2,3)*m(3,1)) &
+            + m(1,3)*(m(2,1)*m(3,2) - m(2,2)*m(3,1))
+
+        if (abs(det) < 1.0e-12_dp) then
+            inv = 0.0_dp
+            return
+        end if
+
+        inv(1,1) =  (m(2,2)*m(3,3) - m(2,3)*m(3,2)) / det
+        inv(1,2) = -(m(1,2)*m(3,3) - m(1,3)*m(3,2)) / det
+        inv(1,3) =  (m(1,2)*m(2,3) - m(1,3)*m(2,2)) / det
+        inv(2,1) = -(m(2,1)*m(3,3) - m(2,3)*m(3,1)) / det
+        inv(2,2) =  (m(1,1)*m(3,3) - m(1,3)*m(3,1)) / det
+        inv(2,3) = -(m(1,1)*m(2,3) - m(1,3)*m(2,1)) / det
+        inv(3,1) =  (m(2,1)*m(3,2) - m(2,2)*m(3,1)) / det
+        inv(3,2) = -(m(1,1)*m(3,2) - m(1,2)*m(3,1)) / det
+        inv(3,3) =  (m(1,1)*m(2,2) - m(1,2)*m(2,1)) / det
+    end function invert_lattice_3x3
+
+
+    pure function cartesian_to_fractional(x, y, z, inv_lattice) result(frac)
+        !! Convert Cartesian coordinates to fractional using inverse lattice matrix
+        real(dp), intent(in) :: x, y, z, inv_lattice(3,3)
+        real(dp) :: frac(3)
+        frac(1) = inv_lattice(1,1)*x + inv_lattice(1,2)*y + inv_lattice(1,3)*z
+        frac(2) = inv_lattice(2,1)*x + inv_lattice(2,2)*y + inv_lattice(2,3)*z
+        frac(3) = inv_lattice(3,1)*x + inv_lattice(3,2)*y + inv_lattice(3,3)*z
+    end function cartesian_to_fractional
 
 end module poscastep_menu
