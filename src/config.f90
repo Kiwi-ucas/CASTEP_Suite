@@ -47,7 +47,7 @@ module castep_config
         TASK_ELECTRONIC_SPECTRO   = 'ElectronicSpectroscopy', &
         TASK_GEOMETRY_OPT         = 'GEOMETRYOPTIMISATION', &
         TASK_MOLECULAR_DYN        = 'MOLECULAR_DYNAMICS', &
-        TASK_TRANSITION_STATE     = 'TRANSITION_STATE', &
+        TASK_TRANSITION_STATE     = 'TRANSITIONSTATESEARCH', &
         TASK_PHONON               = 'PHONON', &
         TASK_EFIELD               = 'ELECTRIC_FIELD', &
         TASK_PHONON_EFIELD        = 'PHONON_ELECTRIC_FIELD', &
@@ -136,6 +136,19 @@ module castep_config
         PHONON_CUTOFF_CUMULANT  = 'CUMULANT', &
         PHONON_CUTOFF_SPHERICAL = 'SPHERICAL'
 
+    ! CINEB tangent mode constants
+    character(len=*), parameter, public :: &
+        CINEB_TANGENT_NONE   = 'NONE', &
+        CINEB_TANGENT_BISECT = 'BISECT', &
+        CINEB_TANGENT_HIGH_E = 'HIGH_E', &
+        CINEB_TANGENT_SPLINE = 'SPLINE'
+
+    ! CINEB NEB method (optimizer) constants
+    character(len=*), parameter, public :: &
+        CINEB_METHOD_TPSD   = 'TPSD', &
+        CINEB_METHOD_FIRE   = 'FIRE', &
+        CINEB_METHOD_ODE12R = 'ODE12R'
+
     ! Cell optimization constants
     character(len=*), parameter, public :: &
         CELL_ALL   = 'ALL', &
@@ -192,7 +205,7 @@ module castep_config
         character(len=8)   :: pseudopotential
         character(len=16)  :: kpoint_scheme
         integer            :: kpoint_grid(3)
-        character(len=32)  :: scf_tolerance
+        real(dp)           :: scf_tolerance = 1.0e-5_dp
         character(len=16)  :: optimizer
 
         ! Cell parameters
@@ -212,6 +225,35 @@ module castep_config
         real(dp), allocatable         :: atom_x(:)
         real(dp), allocatable         :: atom_y(:)
         real(dp), allocatable         :: atom_z(:)
+
+        ! CINEB product atom data
+        integer :: prod_num_atoms = 0
+        character(len=8), allocatable :: prod_atom_type(:)
+        real(dp), allocatable         :: prod_atom_x(:)
+        real(dp), allocatable         :: prod_atom_y(:)
+        real(dp), allocatable         :: prod_atom_z(:)
+        logical :: prod_cartesian_coords = .false.
+
+        ! CINEB intermediate atom data
+        integer :: interm_num_atoms = 0
+        character(len=8), allocatable :: interm_atom_type(:)
+        real(dp), allocatable         :: interm_atom_x(:)
+        real(dp), allocatable         :: interm_atom_y(:)
+        real(dp), allocatable         :: interm_atom_z(:)
+        logical :: interm_cartesian_coords = .false.
+
+        ! CINEB file paths
+        character(len=1024) :: prod_file_path    = ''
+        character(len=1024) :: interm_file_path  = ''
+
+        ! CINEB parameters
+        character(len=16) :: cineb_max_images      = '11'
+        character(len=16) :: cineb_spring_constant = '0.1'
+        character(len=16) :: cineb_max_iter        = '50'
+        character(len=16) :: cineb_tangent_mode    = 'SPLINE'
+        character(len=16) :: cineb_neb_method      = 'ODE12R'
+        character(len=16) :: cineb_climbing        = 'TRUE'
+        character(len=16) :: ts_geom_tolerance     = 'MEDIUM'
 
         ! Symmetry
         logical :: has_space_group
@@ -334,7 +376,7 @@ contains
         cfg%pseudopotential   = PSEUDO_C19MK2
         cfg%kpoint_scheme     = KPOINT_GAMMA
         cfg%kpoint_grid       = 0
-        cfg%scf_tolerance     = '1e-5'
+        cfg%scf_tolerance     = 1.0e-5_dp
         cfg%optimizer         = OPT_BFGS
         cfg%cell_length      = 0.0_dp
         cfg%cell_angle       = 90.0_dp
@@ -391,10 +433,33 @@ contains
         cfg%efield_oscillator_q         = 50.0_dp
         cfg%efield_calculate_nonlinear  = 'NONE'
 
+        ! CINEB defaults
+        cfg%prod_num_atoms        = 0
+        cfg%interm_num_atoms      = 0
+        cfg%prod_cartesian_coords  = .false.
+        cfg%interm_cartesian_coords = .false.
+        cfg%prod_file_path         = ''
+        cfg%interm_file_path       = ''
+        cfg%cineb_max_images       = '11'
+        cfg%cineb_spring_constant  = '0.1'
+        cfg%cineb_max_iter         = '50'
+        cfg%cineb_tangent_mode     = CINEB_TANGENT_SPLINE
+        cfg%cineb_neb_method       = CINEB_METHOD_ODE12R
+        cfg%cineb_climbing         = 'TRUE'
+        cfg%ts_geom_tolerance      = GEO_MEDIUM
+
         if (allocated(cfg%atom_type)) deallocate(cfg%atom_type)
         if (allocated(cfg%atom_x)) deallocate(cfg%atom_x)
         if (allocated(cfg%atom_y)) deallocate(cfg%atom_y)
         if (allocated(cfg%atom_z)) deallocate(cfg%atom_z)
+        if (allocated(cfg%prod_atom_type)) deallocate(cfg%prod_atom_type)
+        if (allocated(cfg%prod_atom_x)) deallocate(cfg%prod_atom_x)
+        if (allocated(cfg%prod_atom_y)) deallocate(cfg%prod_atom_y)
+        if (allocated(cfg%prod_atom_z)) deallocate(cfg%prod_atom_z)
+        if (allocated(cfg%interm_atom_type)) deallocate(cfg%interm_atom_type)
+        if (allocated(cfg%interm_atom_x)) deallocate(cfg%interm_atom_x)
+        if (allocated(cfg%interm_atom_y)) deallocate(cfg%interm_atom_y)
+        if (allocated(cfg%interm_atom_z)) deallocate(cfg%interm_atom_z)
     end subroutine default_config
 
     type(castep_config_t) function new_castep_config() result(cfg)
@@ -522,7 +587,7 @@ end function new_castep_config
         case (TASK_ELECTRONIC_SPECTRO)
             castep_name = 'ElectronicSpectroscopy'
         case (TASK_TRANSITION_STATE)
-            castep_name = 'TRANSITION_STATE'
+            castep_name = TASK_TRANSITION_STATE
         case (TASK_EFIELD)
             castep_name = 'EFIELD'
         case (TASK_PHONON_EFIELD)
@@ -575,6 +640,14 @@ end function new_castep_config
         if (allocated(this%atom_x))    deallocate(this%atom_x)
         if (allocated(this%atom_y))    deallocate(this%atom_y)
         if (allocated(this%atom_z))    deallocate(this%atom_z)
+        if (allocated(this%prod_atom_type)) deallocate(this%prod_atom_type)
+        if (allocated(this%prod_atom_x))    deallocate(this%prod_atom_x)
+        if (allocated(this%prod_atom_y))    deallocate(this%prod_atom_y)
+        if (allocated(this%prod_atom_z))    deallocate(this%prod_atom_z)
+        if (allocated(this%interm_atom_type)) deallocate(this%interm_atom_type)
+        if (allocated(this%interm_atom_x))    deallocate(this%interm_atom_x)
+        if (allocated(this%interm_atom_y))    deallocate(this%interm_atom_y)
+        if (allocated(this%interm_atom_z))    deallocate(this%interm_atom_z)
     end subroutine finalize_castep_config
 
 end module castep_config

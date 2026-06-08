@@ -25,6 +25,8 @@ module cli_menu
          PSEUDO_NCP19, PSEUDO_C19MK2, PSEUDO_SOC19, &
          KPOINT_GAMMA, KPOINT_MONKHORST_PACK, &
          OPT_BFGS, OPT_LBFGS, OPT_CG, &
+         CINEB_TANGENT_NONE, CINEB_TANGENT_BISECT, CINEB_TANGENT_HIGH_E, CINEB_TANGENT_SPLINE, &
+         CINEB_METHOD_TPSD, CINEB_METHOD_FIRE, CINEB_METHOD_ODE12R, &
          MAX_LINE_LEN, IO_INVALID_INPUT, IO_SUCCESS, IO_USER_QUIT, &
          castep_config_t, default_config, compare_tags, int2str, strip_quotes
     implicit none
@@ -34,11 +36,9 @@ module cli_menu
     public :: ask_input_file
     public :: ask_task_type
     public :: ask_xc_functional
-    public :: ask_cutoff_energy
     public :: ask_vdw_method
     public :: ask_pseudopotential
     public :: ask_kpoint_scheme
-    public :: ask_scf_tolerance
     public :: ask_optimizer
     public :: ask_cell_opt_mode
     public :: ask_symmetry_source
@@ -57,7 +57,6 @@ module cli_menu
          MENU_KPOINT      = 6, &
          MENU_SCF         = 7, &
          MENU_SYMMETRY    = 8, &
-         MENU_OPTIMIZER   = 9, &
          MENU_QUIT        = -1, &
          MENU_ADVANCED    = -2, &
          MENU_NONLINEAR   = -3
@@ -70,7 +69,7 @@ contains
         integer, intent(out) :: iostat
         integer :: choice, ios
         character(len=MAX_LINE_LEN) :: input
-        logical :: cif_ready, needs_geo_params, needs_phonon_params, show_spectral_menu
+        logical :: cif_ready, needs_geo_params, needs_phonon_params, show_spectral_menu, needs_cineb_params
         character(len=32) :: spectral_display
         character(len=512) :: base_name
 
@@ -91,6 +90,7 @@ contains
                               .or. trim(cfg%task_type) == TASK_PHONON_EFIELD &
                               .or. trim(cfg%task_type) == TASK_THERMODYNAMICS &
                               .or. trim(cfg%task_type) == TASK_EFIELD)
+            needs_cineb_params = (trim(cfg%task_type) == TASK_TRANSITION_STATE)
 
             write(*, '(a)') ''
             write(*, '(a)') '  ================================'
@@ -115,19 +115,22 @@ contains
             write(*, '(a)') '  4. vdW correction          (' // trim(cfg%vdw_method)              // ')'
             write(*, '(a)') '  5. Pseudopotential         (' // trim(cfg%pseudopotential)           // ')'
             write(*, '(a)') '  6. K-point                 (' // trim(kpoint_label(cfg%kpoint_scheme)) // ')'
-            write(*, '(a)') '  7. SCF tolerance           (' // trim(scf_label(cfg%scf_tolerance))  // ')'
+            write(*, '(a)') '  7. SCF tolerance           (' // trim(sci_str(cfg%scf_tolerance)) // ')'
             write(*, '(a)') '  8. Symmetry                (' // trim(sym_label(cfg%sym_source))     // ')'
+            if (show_spectral_menu) then
+                write(*, '(a)') '  9. Spectral Task           (' // trim(spectral_label(spectral_display)) // ')'
+            end if
             if (needs_geo_params) then
-                write(*, '(a)') '  9. Optimizer              (' // trim(cfg%optimizer)             // ')'
-                write(*, '(a)') ' 10. Cell opt mode          (' // trim(cfg%cell_opt_mode)         // ')'
-                write(*, '(a)') ' 11. Geo tolerance          (' // trim(geom_tol_label(cfg%geom_tolerance)) // ')'
+                write(*, '(a)') '  9. Optimizer               (' // trim(cfg%optimizer)             // ')'
+                write(*, '(a)') ' 10. Cell opt mode           (' // trim(cfg%cell_opt_mode)         // ')'
+                write(*, '(a)') ' 11. Geo tolerance           (' // trim(geom_tol_label(cfg%geom_tolerance)) // ')'
             end if
             if (needs_phonon_params) then
                 write(*, '(a, a, a)')  '  9. Phonon q-point scheme   (', &
                     trim(qpoint_label(cfg%phonon_qpoint_scheme, cfg%phonon_kpoint_mp_grid)), ')'
                 write(*, '(a, a, a)')  ' 10. Phonon method           (', trim(cfg%phonon_method), ')'
                 write(*, '(a, a, a)')  ' 11. Phonon fine method      (', trim(cfg%phonon_fine_method), ')'
-                write(*, '(a, es9.1, a)') ' 12. Phonon energy tol       (', cfg%phonon_energy_tol, ')'
+                write(*, '(a)') ' 12. Phonon energy tol       (' // trim(sci_str(cfg%phonon_energy_tol)) // ')'
                 if (trim(cfg%phonon_method) == PHONON_METHOD_FD) then
                     write(*, '(a)') ' 13. Phonon supercell matrix'
                 end if
@@ -136,8 +139,13 @@ contains
                         trim(qpoint_label(cfg%phonon_fine_qpoint_scheme, cfg%phonon_fine_kpoint_mp_grid)), ')'
                 end if
             end if
-            if (show_spectral_menu) then
-                write(*, '(a)') ' 20. Spectral Task          (' // trim(spectral_display) // ')'
+            if (needs_cineb_params) then
+                write(*, '(a)') '  9. CINEB max images        (' // trim(cfg%cineb_max_images) // ')'
+                write(*, '(a)') ' 10. CINEB spring constant   (' // trim(cfg%cineb_spring_constant) // ' eV/A^2)'
+                write(*, '(a)') ' 11. CINEB tangent mode      (' // trim(cfg%cineb_tangent_mode) // ')'
+                write(*, '(a)') ' 12. CINEB NEB method        (' // trim(cfg%cineb_neb_method) // ')'
+                write(*, '(a)') ' 13. CINEB max iterations    (' // trim(cfg%cineb_max_iter) // ')'
+                write(*, '(a)') ' 14. TS tolerance            (' // trim(geom_tol_label(cfg%ts_geom_tolerance)) // ')'
             end if
             write(*, '(a)') '  Q. Back'
             write(*, '(a)') ' Select option : '
@@ -167,6 +175,14 @@ contains
 
             select case (choice)
             case (MENU_GENERATE)
+                if (needs_cineb_params) then
+                    call ask_input_file('Product structure file path (.cif/.pdb/.cell): ', &
+                        cfg%prod_file_path, iostat)
+                    if (iostat /= 0) return
+                    call ask_input_file('Intermediate structure file path (.cif/.pdb/.cell): ', &
+                        cfg%interm_file_path, iostat)
+                    if (iostat /= 0) return
+                end if
                 base_name = auto_output_name(cfg%cif_file_path, cfg%task_type)
                 cfg%cell_output_path  = trim(base_name) // '.cell'
                 cfg%param_output_path = trim(base_name) // '.param'
@@ -196,7 +212,7 @@ contains
                 call ask_xc_functional('Select XC functional: ', cfg%xc_functional, iostat)
                 if (iostat /= 0) return
             case (MENU_CUTOFF)
-                call ask_cutoff_energy('Plane-wave cutoff energy (eV): ', cfg%cutoff_energy, iostat)
+                call ask_positive_real('Cutoff energy (eV)', cfg%cutoff_energy, cfg%cutoff_energy, iostat)
                 if (iostat /= 0) return
             case (MENU_VDW)
                 call ask_vdw_method('Select vdW correction: ', cfg%vdw_method, iostat)
@@ -211,20 +227,26 @@ contains
                 call ask_kpoint_scheme('Select K-point scheme: ', cfg%kpoint_scheme, cfg%kpoint_grid, iostat)
                 if (iostat /= 0) return
             case (MENU_SCF)
-                call ask_scf_tolerance('SCF tolerance: ', cfg%scf_tolerance, iostat)
+                call ask_positive_real('SCF tolerance', cfg%scf_tolerance, cfg%scf_tolerance, iostat)
                 if (iostat /= 0) return
             case (MENU_SYMMETRY)
                 call ask_symmetry_source('Select symmetry handling: ', cfg%sym_source, iostat)
                 if (iostat /= 0) return
-            case (MENU_OPTIMIZER)
-                if (needs_phonon_params) then
+            case (9)
+                if (show_spectral_menu) then
+                    call ask_spectral_task('Select spectral task type: ', cfg%spectral_task_type, iostat)
+                else if (needs_cineb_params) then
+                    call ask_cineb_max_images(cfg%cineb_max_images, iostat)
+                else if (needs_phonon_params) then
                     call ask_phonon_qpoint_scheme(cfg, iostat)
                 else
                     call ask_optimizer('Select optimizer: ', cfg%optimizer, iostat)
                 end if
                 if (iostat /= 0) return
             case (10)
-                if (needs_phonon_params) then
+                if (needs_cineb_params) then
+                    call ask_cineb_spring_constant(cfg%cineb_spring_constant, iostat)
+                else if (needs_phonon_params) then
                     call ask_phonon_method('Select phonon method (1=DFPT, 2=FiniteDisp): ', &
                         cfg%phonon_method, iostat)
                     if (trim(cfg%phonon_method) == PHONON_METHOD_DFPT) then
@@ -237,7 +259,9 @@ contains
                 end if
                 if (iostat /= 0) return
             case (11)
-                if (needs_phonon_params) then
+                if (needs_cineb_params) then
+                    call ask_cineb_tangent_mode(cfg%cineb_tangent_mode, iostat)
+                else if (needs_phonon_params) then
                     call ask_phonon_fine_method('Select phonon fine method: ', &
                         cfg%phonon_fine_method, cfg%phonon_method, iostat)
                     if (trim(cfg%phonon_fine_method) == PHONON_FINE_SUPERCELL) then
@@ -248,26 +272,29 @@ contains
                 end if
                 if (iostat /= 0) return
             case (12)
-                if (needs_phonon_params) then
-                    call ask_phonon_energy_tol('Phonon energy tolerance (eV/A^2): ', &
-                        cfg%phonon_energy_tol, iostat)
+                if (needs_cineb_params) then
+                    call ask_cineb_neb_method(cfg%cineb_neb_method, iostat)
+                else if (needs_phonon_params) then
+                    call ask_positive_real('Phonon energy tolerance (eV/A^2)', &
+                        cfg%phonon_energy_tol, cfg%phonon_energy_tol, iostat)
                 else
                     call ask_geom_tolerance('Select geometry optimization tolerance: ', cfg%geom_tolerance, iostat)
                 end if
                 if (iostat /= 0) return
             case (13)
-                if (needs_phonon_params) then
+                if (needs_cineb_params) then
+                    call ask_cineb_max_iter(cfg%cineb_max_iter, iostat)
+                else if (needs_phonon_params) then
                     call ask_phonon_supercell_matrix('Phonon supercell matrix (3x3): ', &
                         cfg%phonon_supercell_matrix, iostat)
                 end if
                 if (iostat /= 0) return
             case (14)
-                if (needs_phonon_params) then
+                if (needs_cineb_params) then
+                    call ask_geom_tolerance('Select TS convergence tolerance: ', cfg%ts_geom_tolerance, iostat)
+                else if (needs_phonon_params) then
                     call ask_phonon_fine_qpoint_scheme(cfg, iostat)
                 end if
-                if (iostat /= 0) return
-            case (20)
-                call ask_spectral_task('Select spectral task type: ', cfg%spectral_task_type, iostat)
                 if (iostat /= 0) return
             case (MENU_ADVANCED)
                 if (needs_phonon_params) then
@@ -363,8 +390,8 @@ contains
             write(*, '(a)') '    5. Phonon+Efield'
             write(*, '(a)') '    6. Efield'
             write(*, '(a)') '    7. Thermodynamics'
-            write(*, '(a)') '    8. MolecularDynamics     (暂未开发)'
-            write(*, '(a)') '    9. TransitionState       (暂未开发)'
+            write(*, '(a)') '    8. CINEB'
+            write(*, '(a)') '    9. MolecularDynamics     (暂未开发)'
             write(*, '(a)') '   10. MagneticResponse      (暂未开发)'
             write(*, '(a)') '   11. Spectral              (暂未开发)'
             write(*, '(a)') '   12. Elastic               (暂未开发)'
@@ -394,8 +421,8 @@ contains
             case (5)  ; result_task = TASK_PHONON_EFIELD
             case (6)  ; result_task = TASK_EFIELD
             case (7)  ; result_task = TASK_THERMODYNAMICS
-            case (8)  ; result_task = TASK_MOLECULAR_DYN
-            case (9)  ; result_task = TASK_TRANSITION_STATE
+            case (8)  ; result_task = TASK_TRANSITION_STATE
+            case (9)  ; result_task = TASK_MOLECULAR_DYN
             case (10) ; result_task = TASK_MAGRES
             case (11) ; result_task = TASK_SPECTRAL
             case (12) ; result_task = TASK_ELASTIC
@@ -459,41 +486,6 @@ contains
         end do
     end subroutine ask_xc_functional
 
-    subroutine ask_cutoff_energy(prompt_text, result_cutoff, iostat)
-        character(len=*), intent(in)  :: prompt_text
-        real(dp), intent(out)         :: result_cutoff
-        integer, intent(out)           :: iostat
-        integer :: ios, ios2, val_int
-        character(len=MAX_LINE_LEN) :: input
-
-        iostat = 0
-        result_cutoff = 400.0_dp
-
-        do
-            write(*, '(a)') '  Plane-wave cutoff energy (eV) [default: 400.0]: '
-            read(*, '(a)', iostat=ios) input
-            if (ios /= 0) exit  ! empty input -> default
-
-            if (len_trim(adjustl(input)) == 0) exit
-
-            ! Handle integer input
-            if (index(input, '.') == 0 .and. index(input, 'd') == 0 .and. index(input, 'e') == 0) then
-                read(input, '(I12)', iostat=ios2) val_int
-                if (ios2 == 0) then
-                    result_cutoff = dble(val_int)
-                end if
-            else
-                read(input, '(F20.10)', iostat=ios2) result_cutoff
-            end if
-            if (ios2 /= 0 .or. result_cutoff <= 0.0_dp) then
-                write(*, '(a)') '  Invalid value. Please enter a positive number.'
-                cycle
-            end if
-
-            exit
-        end do
-    end subroutine ask_cutoff_energy
-
     subroutine ask_vdw_method(prompt_text, result_vdw, iostat)
         character(len=*), intent(in)  :: prompt_text
         character(len=*), intent(out) :: result_vdw
@@ -553,8 +545,8 @@ contains
         do
             write(*, '(a)') ''
             write(*, '(a)') '  Select pseudopotential:'
-            write(*, '(a)') '    1. NCP19     (Norm-conserving)'
-            write(*, '(a)') '    2. C19MK2    (Ultrasoft)'
+            write(*, '(a)') '    1. C19MK2    (Ultrasoft)'
+            write(*, '(a)') '    2. NCP19     (Norm-conserving)'
             write(*, '(a)') '    3. SOC19     (Spin-orbit coupling)'
             write(*, '(a)') '    Enter choice : '
 
@@ -572,8 +564,8 @@ contains
             end if
 
             select case (choice)
-            case (1) ; result_pseudo = PSEUDO_NCP19
-            case (2) ; result_pseudo = PSEUDO_C19MK2
+            case (1) ; result_pseudo = PSEUDO_C19MK2
+            case (2) ; result_pseudo = PSEUDO_NCP19
             case (3) ; result_pseudo = PSEUDO_SOC19
             case default
                 write(*, '(a)') '  Invalid choice. Please enter 1-3.'
@@ -644,52 +636,6 @@ contains
             end select
         end do
     end subroutine ask_kpoint_scheme
-
-    subroutine ask_scf_tolerance(prompt_text, result_tol, iostat)
-        character(len=*), intent(in)  :: prompt_text
-        character(len=*), intent(out) :: result_tol
-        integer, intent(out)           :: iostat
-        integer :: ios, ios2
-        character(len=MAX_LINE_LEN) :: input
-        character(len=MAX_LINE_LEN) :: tmp
-        real(dp) :: dummy_val
-
-        iostat = 0
-        result_tol = '1e-5'
-
-        do
-            write(*, '(a)') '  SCF tolerance [default: 1e-5]: '
-            read(*, '(a)', iostat=ios) input
-            if (ios /= 0) exit  ! empty -> default
-
-            if (len_trim(adjustl(input)) == 0) exit
-
-            tmp = adjustl(trim(input))
-
-            ! Handle scientific notation or plain number
-            if (index(tmp, 'E') > 0 .or. index(tmp, 'e') > 0) then
-                ! Directly save user input for scientific notation
-                read(tmp, '(E22.10)', iostat=ios2) dummy_val
-                if (ios2 == 0 .and. dummy_val > 0.0_dp) then
-                    result_tol = tmp
-                else
-                    write(*, '(a)') '  Invalid value. Please enter a positive number (e.g., 1e-5).'
-                    cycle
-                end if
-            else
-                ! Try plain number: validate then accept directly
-                read(tmp, '(F22.15)', iostat=ios2) dummy_val
-                if (ios2 == 0 .and. dummy_val > 0.0_dp) then
-                    result_tol = tmp
-                else
-                    write(*, '(a)') '  Invalid value. Please enter a positive number (e.g., 1e-5).'
-                    cycle
-                end if
-            end if
-
-            exit
-        end do
-    end subroutine ask_scf_tolerance
 
     subroutine ask_optimizer(prompt_text, result_opt, iostat)
         character(len=*), intent(in)  :: prompt_text
@@ -878,7 +824,7 @@ contains
         case (TASK_ELECTRONIC_SPECTRO)  ; lbl = 'ElectronicSpectroscopy'
         case (TASK_GEOMETRY_OPT)        ; lbl = 'GeometryOptimisation'
         case (TASK_MOLECULAR_DYN)       ; lbl = 'MolecularDynamics'
-        case (TASK_TRANSITION_STATE)    ; lbl = 'TransitionState'
+        case (TASK_TRANSITION_STATE)    ; lbl = 'CINEB'
         case (TASK_PHONON)              ; lbl = 'Phonon'
         case (TASK_EFIELD)              ; lbl = 'Efield'
         case (TASK_PHONON_EFIELD)       ; lbl = 'Phonon+Efield'
@@ -906,7 +852,7 @@ contains
         case (TASK_EFIELD)             ; lbl = 'Efield'
         case (TASK_THERMODYNAMICS)     ; lbl = 'Thermo'
         case (TASK_MOLECULAR_DYN)      ; lbl = 'MolDyn'
-        case (TASK_TRANSITION_STATE)   ; lbl = 'TransState'
+        case (TASK_TRANSITION_STATE)   ; lbl = 'CINEB'
         case (TASK_MAGRES)             ; lbl = 'MagRes'
         case (TASK_SPECTRAL)           ; lbl = 'Spectral'
         case (TASK_EPCOUPLING)         ; lbl = 'EpCoupling'
@@ -954,12 +900,6 @@ contains
             lbl = trim(scheme)
         end if
     end function qpoint_label
-
-    pure function scf_label(tol) result(lbl)
-        character(len=*), intent(in) :: tol
-        character(32) :: lbl
-        lbl = adjustl(tol)
-    end function scf_label
 
     pure function geom_tol_label(tol) result(lbl)
         character(len=*), intent(in) :: tol
@@ -1085,7 +1025,6 @@ contains
         character(len=16), intent(inout), optional :: result_efield_ignore_molec
         logical,  intent(in),    optional :: result_is_dfpt, result_is_efield
         integer :: choice, ios
-        real(dp) :: rval
         character(len=MAX_LINE_LEN) :: input
         logical :: has_phonon, is_dfpt, is_efield
 
@@ -1105,42 +1044,48 @@ contains
             if (has_phonon) then
                 write(*, '(a)') '    6. Calculate phonon DOS      (' // trim(smearing_label(result_phonon_calc_dos)) // ')'
                 if (result_phonon_calc_dos) then
-                    write(*, '(a, f6.1, a)') '    7. Phonon DOS spacing        (' , result_phonon_dos_spacing, ' cm-1)'
-                    write(*, '(a, f8.1, a)') '    8. Phonon DOS limit          (' , result_phonon_dos_limit, ' cm-1)'
+                    write(*, '(a)') '    7. Phonon DOS spacing        (' &
+                        // trim(real_str(result_phonon_dos_spacing, 'f5.1')) // ' cm-1)'
+                    write(*, '(a)') '    8. Phonon DOS limit          (' &
+                        // trim(real_str(result_phonon_dos_limit, 'f8.1')) // ' cm-1)'
                 end if
-                write(*, '(a, a, a)')   '    9. Phonon sum rule method    (' , trim(result_phonon_sum_rule), ')'
+                write(*, '(a)') '    9. Phonon sum rule method    (' // trim(result_phonon_sum_rule) // ')'
                 if (.not. is_dfpt) &
-                    write(*, '(a, f8.3, a)') '   10. Phonon finite disp       (' , result_phonon_finite_disp, ' Bohr)'
-                write(*, '(a, i0, a)')  '   11. Phonon max cycles         (' , result_phonon_max_cycles, ')'
+                    write(*, '(a)') '   10. Phonon finite disp       (' &
+                        // trim(real_str(result_phonon_finite_disp, 'f5.3')) // ' Bohr)'
+                write(*, '(a)') '   11. Phonon max cycles         (' // trim(int2str(result_phonon_max_cycles)) // ')'
                 if (is_dfpt) &
-                    write(*, '(a, a, a)')   '   12. Phonon DFPT method        (' , trim(result_phonon_dfpt_method), ')'
-                write(*, '(a)') '   13. Write force constants    (' // trim(smearing_label(result_phonon_write_fc)) // ')'
-                write(*, '(a)') '   14. Write dynamical matrix   (' // trim(smearing_label(result_phonon_write_dyn)) // ')'
-                write(*, '(a)') '   15. Calc LO/TO splitting     (' // trim(smearing_label(result_phonon_lo_to)) // ')'
+                    write(*, '(a)') '   12. Phonon DFPT method        (' // trim(result_phonon_dfpt_method) // ')'
+                write(*, '(a)') '   13. Write force constants     (' // trim(smearing_label(result_phonon_write_fc)) // ')'
+                write(*, '(a)') '   14. Write dynamical matrix    (' // trim(smearing_label(result_phonon_write_dyn)) // ')'
+                write(*, '(a)') '   15. Calc LO/TO splitting      (' // trim(smearing_label(result_phonon_lo_to)) // ')'
                 if (.not. is_dfpt) then
                     if (trim(result_phonon_fc_cutoff_method) == PHONON_CUTOFF_CUMULANT) then
-                        write(*, '(a, f8.3, a)') '   16. Force constant cutoff scale (' , result_phonon_fc_cutoff, ')'
+                        write(*, '(a)') '   16. Force constant cutoff scale (' &
+                            // trim(real_str(result_phonon_fc_cutoff, 'f5.3')) // ')'
                     else
-                        write(*, '(a, f8.3, a)') '   16. Force constant cutoff   (' , result_phonon_fc_cutoff, ' Bohr)'
+                        write(*, '(a)') '   16. Force constant cutoff    (' &
+                            // trim(real_str(result_phonon_fc_cutoff, 'f5.3')) // ' Bohr)'
                     end if
-                    write(*, '(a, a, a)')   '   17. Fine cutoff method      (' , trim(result_phonon_fc_cutoff_method), ')'
+                    write(*, '(a)') '   17. Fine cutoff method        (' // trim(result_phonon_fc_cutoff_method) // ')'
                 end if
-                write(*, '(a, i0, a)')   '   18. Phonon max CG steps     (' , result_phonon_max_cg, ')'
-                write(*, '(a)') '   19. Use k-point symmetry    (' // trim(smearing_label(result_phonon_kpt_sym)) // ')'
-                write(*, '(a)') '   20. Calculate Born charges  (' // trim(smearing_label(result_calc_born)) // ')'
-                write(*, '(a)') '   21. Calculate Raman         (' // trim(smearing_label(result_calc_raman)) // ')'
+                write(*, '(a)') '   18. Phonon max CG steps       (' // trim(int2str(result_phonon_max_cg)) // ')'
+                write(*, '(a)') '   19. Use k-point symmetry      (' // trim(smearing_label(result_phonon_kpt_sym)) // ')'
+                write(*, '(a)') '   20. Calculate Born charges    (' // trim(smearing_label(result_calc_born)) // ')'
+                write(*, '(a)') '   21. Calculate Raman           (' // trim(smearing_label(result_calc_raman)) // ')'
                 if (result_calc_raman) &
-                    write(*, '(a, a, a)')   '   22. Raman method            (' , trim(result_raman_method), ')'
+                    write(*, '(a)') '   22. Raman method              (' // trim(result_raman_method) // ')'
                 if (is_efield) then
-                    write(*, '(a, a, a)')   '   23. EFIELD DFPT method      (' , trim(result_efield_dfpt), ')'
-                    write(*, '(a, i0, a)')   '   24. EFIELD max cycles        (' , result_efield_max_cycles, ')'
-                    write(*, '(a, es9.1, a)') '   25. EFIELD energy tol        (' , result_efield_energy_tol, ')'
-                    write(*, '(a, i0, a)')   '   26. EFIELD conv. window      (' , result_efield_conv_win, ')'
-                    write(*, '(a, f8.1, a)') '   27. EFIELD freq spacing      (' , result_efield_freq_spacing, ' cm-1)'
-                    write(*, '(a, f8.1, a)') '   28. EFIELD oscillator Q      (' , result_efield_osc_q, ')'
-                    write(*, '(a)') '   29. Calc ion permittivity   (' // trim(smearing_label(result_efield_ion_perm)) // ')'
+                    write(*, '(a)') '   23. EFIELD DFPT method        (' // trim(result_efield_dfpt) // ')'
+                    write(*, '(a)') '   24. EFIELD max cycles         (' // trim(int2str(result_efield_max_cycles)) // ')'
+                    write(*, '(a)') '   25. EFIELD energy tol         (' // trim(sci_str(result_efield_energy_tol)) // ')'
+                    write(*, '(a)') '   26. EFIELD conv. window       (' // trim(int2str(result_efield_conv_win)) // ')'
+                    write(*, '(a)') '   27. EFIELD freq spacing       (' &
+                        // trim(real_str(result_efield_freq_spacing, 'f5.1')) // ' cm-1)'
+                    write(*, '(a)') '   28. EFIELD oscillator Q       (' // trim(real_str(result_efield_osc_q, 'f5.1')) // ')'
+                    write(*, '(a)') '   29. Calc ion permittivity     (' // trim(smearing_label(result_efield_ion_perm)) // ')'
                     if (present(result_efield_ignore_molec)) &
-                        write(*, '(a, a, a)') '   30. EFIELD ignore molec modes (' , trim(result_efield_ignore_molec), ')'
+                        write(*, '(a)') '   30. EFIELD ignore molec modes (' // trim(result_efield_ignore_molec) // ')'
                 end if
             end if
             write(*, '(a)') '    0. Back to main menu'
@@ -1187,21 +1132,13 @@ contains
                 end if
             case (7)
                 if (has_phonon .and. result_phonon_calc_dos) then
-                    write(*, '(a, f6.1, a)') '  Enter phonon DOS spacing [', result_phonon_dos_spacing, ' cm-1]: '
-                    read(*, '(a)', iostat=ios) input
-                    if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
-                        read(input, *, iostat=ios) rval
-                        if (ios == 0 .and. rval > 0.0_dp) result_phonon_dos_spacing = rval
-                    end if
+                    call ask_positive_real('Phonon DOS spacing (cm-1)', &
+                        result_phonon_dos_spacing, result_phonon_dos_spacing, ios)
                 end if
             case (8)
                 if (has_phonon .and. result_phonon_calc_dos) then
-                    write(*, '(a, f8.1, a)') '  Enter phonon DOS limit [', result_phonon_dos_limit, ' cm-1]: '
-                    read(*, '(a)', iostat=ios) input
-                    if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
-                        read(input, *, iostat=ios) rval
-                        if (ios == 0 .and. rval > 0.0_dp) result_phonon_dos_limit = rval
-                    end if
+                    call ask_positive_real('Phonon DOS limit (cm-1)', &
+                        result_phonon_dos_limit, result_phonon_dos_limit, ios)
                 end if
             case (9)
                 if (has_phonon) then
@@ -1209,12 +1146,8 @@ contains
                 end if
             case (10)
                 if (has_phonon .and. .not. is_dfpt) then
-                    write(*, '(a, f8.3, a)') '  Enter finite displacement [', result_phonon_finite_disp, ' Bohr]: '
-                    read(*, '(a)', iostat=ios) input
-                    if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
-                        read(input, *, iostat=ios) rval
-                        if (ios == 0 .and. rval > 0.0_dp) result_phonon_finite_disp = rval
-                    end if
+                    call ask_positive_real('Finite displacement (Bohr)', &
+                        result_phonon_finite_disp, result_phonon_finite_disp, ios)
                 end if
             case (11)
                 if (has_phonon) then
@@ -1242,14 +1175,11 @@ contains
             case (16)
                 if (has_phonon .and. .not. is_dfpt) then
                     if (trim(result_phonon_fc_cutoff_method) == PHONON_CUTOFF_CUMULANT) then
-                        write(*, '(a, f8.3, a)') '  Enter force constant cutoff scale [', result_phonon_fc_cutoff, ']: '
+                        call ask_positive_real('Force constant cutoff scale', &
+                            result_phonon_fc_cutoff, result_phonon_fc_cutoff, ios)
                     else
-                        write(*, '(a, f8.3, a)') '  Enter force constant cutoff [', result_phonon_fc_cutoff, ' Bohr]: '
-                    end if
-                    read(*, '(a)', iostat=ios) input
-                    if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
-                        read(input, *, iostat=ios) rval
-                        if (ios == 0 .and. rval >= 0.0_dp) result_phonon_fc_cutoff = rval
+                        call ask_positive_real('Force constant cutoff (Bohr)', &
+                            result_phonon_fc_cutoff, result_phonon_fc_cutoff, ios)
                     end if
                 end if
             case (17)
@@ -1308,12 +1238,8 @@ contains
                 end if
             case (25)
                 if (has_phonon .and. is_efield) then
-                    write(*, '(a, es9.1, a)') '  Enter EFIELD energy tol [', result_efield_energy_tol, ']: '
-                    read(*, '(a)', iostat=ios) input
-                    if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
-                        read(input, *, iostat=ios) rval
-                        if (ios == 0 .and. rval > 0.0_dp) result_efield_energy_tol = rval
-                    end if
+                    call ask_positive_real('EFIELD energy tol', &
+                        result_efield_energy_tol, result_efield_energy_tol, ios)
                 end if
             case (26)
                 if (has_phonon .and. is_efield) then
@@ -1326,21 +1252,13 @@ contains
                 end if
             case (27)
                 if (has_phonon .and. is_efield) then
-                    write(*, '(a, f8.1, a)') '  Enter EFIELD freq spacing [', result_efield_freq_spacing, ' cm-1]: '
-                    read(*, '(a)', iostat=ios) input
-                    if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
-                        read(input, *, iostat=ios) rval
-                        if (ios == 0 .and. rval > 0.0_dp) result_efield_freq_spacing = rval
-                    end if
+                    call ask_positive_real('EFIELD freq spacing (cm-1)', &
+                        result_efield_freq_spacing, result_efield_freq_spacing, ios)
                 end if
             case (28)
                 if (has_phonon .and. is_efield) then
-                    write(*, '(a, f8.1, a)') '  Enter EFIELD oscillator Q [', result_efield_osc_q, ']: '
-                    read(*, '(a)', iostat=ios) input
-                    if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
-                        read(input, *, iostat=ios) rval
-                        if (ios == 0 .and. rval > 0.0_dp) result_efield_osc_q = rval
-                    end if
+                    call ask_positive_real('EFIELD oscillator Q', &
+                        result_efield_osc_q, result_efield_osc_q, ios)
                 end if
             case (29)
                 if (has_phonon .and. is_efield) &
@@ -1531,24 +1449,6 @@ contains
         end if
     end subroutine ask_phonon_method
 
-    subroutine ask_phonon_energy_tol(prompt_text, tol, iostat)
-        character(len=*), intent(in)    :: prompt_text
-        real(dp),         intent(inout) :: tol
-        integer,          intent(out)   :: iostat
-        real(dp) :: val
-        integer :: ios
-        character(len=MAX_LINE_LEN) :: input
-
-        iostat = 0
-        write(*, '(a, es9.1, a)', advance='no') trim(prompt_text) // ' [', tol, ']: '
-        read(*, '(a)', iostat=ios) input
-        if (ios /= 0) then; iostat = 1; return; end if
-        if (len_trim(input) > 0) then
-            read(input, *, iostat=ios) val
-            if (ios == 0 .and. val > 0.0_dp) tol = val
-        end if
-    end subroutine ask_phonon_energy_tol
-
     subroutine ask_phonon_fine_method(prompt_text, method, current_method, iostat)
         character(len=*), intent(in)    :: prompt_text
         character(len=*), intent(inout) :: method
@@ -1672,5 +1572,198 @@ contains
         end do
         name = trim(stem) // '_' // trim(task_short_label(task))
     end function auto_output_name
+
+
+    subroutine ask_cineb_max_images(result_n, iostat)
+        !! Ask for CINEB path images count (must be >= 3, odd for climbing)
+        character(len=*), intent(inout) :: result_n
+        integer, intent(out)   :: iostat
+        integer :: ios, val
+        character(len=MAX_LINE_LEN) :: input
+
+        iostat = 0
+        do
+            write(*, '(a, a, a)') '  CINEB max path images [', trim(result_n), '] (>=3, odd): '
+            read(*, '(a)', iostat=ios) input
+            if (ios /= 0) then; iostat = ios; return; end if
+            if (len_trim(input) == 0) return
+            if (input(1:1) == 'q' .or. input(1:1) == 'Q') then
+                iostat = IO_USER_QUIT; return
+            end if
+            read(input, '(I6)', iostat=ios) val
+            if (ios /= 0 .or. val < 3) then
+                write(*, '(a)') '  Must be >= 3. Try again.'
+                cycle
+            end if
+            if (mod(val, 2) == 0) then
+                write(*, '(a)') '  Warning: Climbing NEB requires odd number of path points.'
+                write(*, '(a, i0, a)') '  Automatically correcting to ', val + 1, '.'
+                val = val + 1
+            end if
+            write(result_n, '(I0)') val
+            exit
+        end do
+    end subroutine ask_cineb_max_images
+
+
+    subroutine ask_cineb_spring_constant(result_k, iostat)
+        !! Ask for NEB spring constant (eV/A^2), stores as string
+        character(len=*), intent(inout) :: result_k
+        integer, intent(out)    :: iostat
+        real(dp) :: val, default_val
+
+        read(result_k, *, iostat=iostat) default_val
+        if (iostat /= 0) default_val = 0.1_dp
+        call ask_positive_real('CINEB spring constant (eV/A^2)', default_val, val, iostat)
+        if (iostat == 0) then
+            write(result_k, '(f4.1)') val
+            result_k = adjustl(result_k)
+        end if
+    end subroutine ask_cineb_spring_constant
+
+
+    subroutine ask_cineb_tangent_mode(result_mode, iostat)
+        !! Ask for NEB tangent mode
+        character(len=*), intent(inout) :: result_mode
+        integer, intent(out) :: iostat
+        integer :: choice, ios
+        character(len=MAX_LINE_LEN) :: input
+
+        iostat = 0
+        write(*, '(a)') '  CINEB tangent mode:'
+        write(*, '(a)') '    1. NONE'
+        write(*, '(a)') '    2. SPLINE （Accurate）'
+        write(*, '(a)') '    3. HIGH_E'
+        write(*, '(a)') '    4. BISECT'
+        write(*, '(a)', advance='no') '  Select [1-4]: '
+        read(*, '(a)', iostat=ios) input
+        if (ios /= 0) then; iostat = ios; return; end if
+        if (len_trim(input) == 0) return
+        if (input(1:1) == 'q' .or. input(1:1) == 'Q') then
+            iostat = IO_USER_QUIT; return
+        end if
+        read(input, '(I6)', iostat=ios) choice
+        if (ios /= 0) then; iostat = IO_INVALID_INPUT; return; end if
+        select case (choice)
+        case (1); result_mode = CINEB_TANGENT_NONE
+        case (2); result_mode = CINEB_TANGENT_SPLINE
+        case (3); result_mode = CINEB_TANGENT_HIGH_E
+        case (4); result_mode = CINEB_TANGENT_BISECT
+        case default; write(*, '(a)') '  Invalid choice.'; iostat = IO_INVALID_INPUT
+        end select
+    end subroutine ask_cineb_tangent_mode
+
+
+    subroutine ask_cineb_neb_method(result_method, iostat)
+        !! Ask for NEB optimization method
+        character(len=*), intent(inout) :: result_method
+        integer, intent(out) :: iostat
+        integer :: choice, ios
+        character(len=MAX_LINE_LEN) :: input
+
+        iostat = 0
+        write(*, '(a)') '  CINEB NEB method (optimizer):'
+        write(*, '(a)') '    1. ODE12R (Accurate for Refinement)'
+        write(*, '(a)') '    2. FIRE   (Fast but Coarse)'
+        write(*, '(a)') '    3. TPSD   (Medium Cost)'
+        write(*, '(a)', advance='no') '  Select [1-3]: '
+        read(*, '(a)', iostat=ios) input
+        if (ios /= 0) then; iostat = ios; return; end if
+        if (len_trim(input) == 0) return
+        if (input(1:1) == 'q' .or. input(1:1) == 'Q') then
+            iostat = IO_USER_QUIT; return
+        end if
+        read(input, '(I6)', iostat=ios) choice
+        if (ios /= 0) then; iostat = IO_INVALID_INPUT; return; end if
+        select case (choice)
+        case (1); result_method = CINEB_METHOD_TPSD
+        case (2); result_method = CINEB_METHOD_FIRE
+        case (3); result_method = CINEB_METHOD_ODE12R
+        case default; write(*, '(a)') '  Invalid choice.'; iostat = IO_INVALID_INPUT
+        end select
+    end subroutine ask_cineb_neb_method
+
+
+    subroutine ask_cineb_max_iter(result_n, iostat)
+        !! Ask for CINEB max iterations
+        character(len=*), intent(inout) :: result_n
+        integer, intent(out)   :: iostat
+        integer :: ios, val
+        character(len=MAX_LINE_LEN) :: input
+
+        iostat = 0
+        write(*, '(a, a, a)') '  CINEB max iterations [', trim(result_n), ']: '
+        read(*, '(a)', iostat=ios) input
+        if (ios /= 0) then; iostat = ios; return; end if
+        if (len_trim(input) == 0) return
+        if (input(1:1) == 'q' .or. input(1:1) == 'Q') then
+            iostat = IO_USER_QUIT; return
+        end if
+        read(input, '(I6)', iostat=ios) val
+        if (ios /= 0 .or. val < 1) then
+            write(*, '(a)') '  Invalid. Must be >= 1.'
+            iostat = IO_INVALID_INPUT
+            return
+        end if
+        write(result_n, '(I0)') val
+    end subroutine ask_cineb_max_iter
+
+
+
+    pure function sci_str(val) result(s)
+        !! Convert real to scientific notation string without leading spaces
+        real(dp), intent(in) :: val
+        character(len=20) :: s
+        write(s, '(es9.1)') val
+        s = adjustl(s)
+    end function sci_str
+
+    pure function real_str(val, fmt) result(s)
+        !! Convert real to trimmed string using given format specifier
+        real(dp), intent(in) :: val
+        character(len=*), intent(in) :: fmt
+        character(len=20) :: s
+        write(s, '(' // trim(fmt) // ')') val
+        s = adjustl(s)
+    end function real_str
+
+    pure function spectral_label(task) result(lbl)
+        !! Map internal spectral task constant to display label
+        character(len=*), intent(in) :: task
+        character(len=32) :: lbl
+        select case (trim(task))
+        case ('BandStructure')     ; lbl = 'Band Structure and DOS'
+        case ('BandStructure_pDOS'); lbl = 'Band Structure and pDOS'
+        case default               ; lbl = trim(task)
+        end select
+    end function spectral_label
+
+    subroutine ask_positive_real(prompt_text, default_val, result_val, iostat)
+        !! Unified positive-real-number input with validation and retry
+        character(len=*), intent(in)  :: prompt_text
+        real(dp),         intent(in)    :: default_val
+        real(dp),         intent(inout) :: result_val
+        integer,          intent(out) :: iostat
+        real(dp) :: val
+        integer :: ios
+        character(len=MAX_LINE_LEN) :: input
+
+        result_val = default_val
+        iostat = 0
+        do
+            write(*, '(a)') '  ' // trim(prompt_text) // ' [' // trim(sci_str(default_val)) // ']: '
+            read(*, '(a)', iostat=ios) input
+            if (ios /= 0) return
+            if (len_trim(input) == 0) return
+            if (input(1:1) == 'q' .or. input(1:1) == 'Q') then
+                iostat = IO_USER_QUIT; return
+            end if
+            read(input, *, iostat=ios) val
+            if (ios == 0 .and. val > 0.0_dp) then
+                result_val = val; return
+            end if
+            write(*, '(a)') '  Invalid. Enter a positive number (e.g., ' // trim(sci_str(default_val)) // ').'
+        end do
+    end subroutine ask_positive_real
 
 end module cli_menu

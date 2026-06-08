@@ -1,6 +1,6 @@
 # CASTEP_Suite Makefile
 FC      = gfortran
-FCFLAGS = -std=f2008 -g -O2 -ffree-form -fimplicit-none -Wall -Wextra -Wno-unused-dummy-argument
+FCFLAGS = -std=f2018 -g -O2 -ffree-form -fimplicit-none -Wall -Wextra -Wno-unused-dummy-argument
 LDFLAGS =
 
 SRCDIR  = src

@@ -1,6 +1,6 @@
 # CASTEP Suite
 
-A Fortran 2008 CLI toolkit for [CASTEP] DFT calculations — generate input files from crystal structures, and post-process data.
+A Fortran 2018 CLI toolkit for [CASTEP] DFT calculations — generate input files from crystal structures, and post-process data.
 
 ## What it does
 
@@ -11,7 +11,7 @@ A Fortran 2008 CLI toolkit for [CASTEP] DFT calculations — generate input file
 
 ## Requirements
 
-- **gfortran** >= 7.0 (Fortran 2008)
+- **gfortran** >= 7.0 (Fortran 2018)
 - **Make**
 - No external libraries
 
@@ -71,7 +71,7 @@ Output files are auto-named from the input stem and task type (e.g. `Cu_Phonon.c
   Q. Back
 ```
 
-### Task types (7 developed, 9 stubs)
+### Task types (8 developed, 8 stubs)
 
 | # | Task | Status |
 |---|------|--------|
@@ -82,7 +82,8 @@ Output files are auto-named from the input stem and task type (e.g. `Cu_Phonon.c
 | 5 | Phonon+Efield | Done |
 | 6 | Efield | Done |
 | 7 | Thermodynamics | Done |
-| 8-16 | MolecularDynamics … EpCoupling | Stub |
+| 8 | CINEB (NEB+Climbing Image) | Done |
+| 9-16 | MolecularDynamics … EpCoupling | Stub |
 
 ### Key options
 
@@ -113,6 +114,25 @@ Full phonon calculation support with Finite Displacement (FD) and DFPT methods:
 - **Nonlinear optics**: CHI2 calculation
 - Molecular mode exclusion: CRYSTAL(3), MOLECULE(6), LINEAR_MOLECULE(5)
 - Phonon+Efield combined task with full phonon + EFIELD parameter sets
+
+### CINEB transition state search
+
+NEB + Climbing Image transition state search (`TASK : TRANSITIONSTATESEARCH`). Requires 3 structure files:
+
+- **Reaction path**: reactant + product + intermediate guess (separate `.cif`/`.pdb`/`.cell` files)
+- **Climbing Image**: always ON (hardcoded), drives the highest-energy image to the exact saddle point
+- **Path images**: odd number enforced (auto-corrected from even)
+- **Convergence tolerance**: reuses the same 4-level system as geometry optimization (COARSE/MEDIUM/FINE/EXTREME)
+- **Product/intermediate validation**: atom counts must match reactant (hard CASTEP requirement)
+
+| Parameter | Options | Default |
+|-----------|---------|---------|
+| CINEB max images | >= 3, odd | 11 |
+| CINEB spring constant | Any positive number | 0.1 eV/Å² |
+| CINEB tangent mode | NONE, BISECT, HIGH_E, SPLINE | SPLINE |
+| CINEB NEB method | TPSD, FIRE, ODE12R | ODE12R |
+| CINEB max iterations | Any positive integer | 50 |
+| TS tolerance | COARSE, MEDIUM, FINE, EXTREME | MEDIUM |
 
 ### Advanced options
 
@@ -248,7 +268,7 @@ CASTEP_Suite/
 
 | Flag | Purpose |
 |------|---------|
-| `-std=f2008` | Fortran 2008 standard |
+| `-std=f2018` | Fortran 2018 standard |
 | `-fimplicit-none` | Require explicit declarations |
 | `-Wall -Wextra` | Comprehensive warnings |
 | `-O2` | Optimization |

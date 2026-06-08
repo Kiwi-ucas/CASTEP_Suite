@@ -5,7 +5,7 @@ module cell_writer
     !! from write_cell_file.
     use castep_config, only: &
          dp, CELL_ALL, CELL_INTE, TASK_GEOMETRY_OPT, TASK_ELECTRONIC_SPECTRO, SYM_AUTO, &
-         TASK_PHONON, TASK_PHONON_EFIELD, TASK_THERMODYNAMICS, &
+         TASK_PHONON, TASK_PHONON_EFIELD, TASK_THERMODYNAMICS, TASK_TRANSITION_STATE, &
          PHONON_FINE_NONE, PHONON_QPOINT_MP_GRID, PHONON_QPOINT_PATH, &
          PHONON_METHOD_FD, PHONON_FINE_SUPERCELL, &
          KPOINT_GAMMA, KPOINT_MONKHORST_PACK, &
@@ -120,6 +120,82 @@ contains
         deallocate(cart_coords)
     end subroutine write_block_positions_abs
 
+
+    subroutine write_block_positions_abs_product(unit, cfg)
+        !! Write %BLOCK POSITIONS_ABS_PRODUCT for CINEB product structure
+        integer, intent(in) :: unit
+        type(castep_config_t), intent(in) :: cfg
+        real(dp), allocatable :: cart_coords(:,:)
+        integer :: i, j
+
+        if (cfg%prod_num_atoms == 0) return
+
+        allocate(cart_coords(cfg%prod_num_atoms, 3))
+        if (cfg%prod_cartesian_coords) then
+            do i = 1, cfg%prod_num_atoms
+                cart_coords(i,1) = cfg%prod_atom_x(i)
+                cart_coords(i,2) = cfg%prod_atom_y(i)
+                cart_coords(i,3) = cfg%prod_atom_z(i)
+            end do
+        else
+            do i = 1, cfg%prod_num_atoms
+                do j = 1, 3
+                    cart_coords(i,j) = cfg%cell_basis(j,1) * cfg%prod_atom_x(i) &
+                                     + cfg%cell_basis(j,2) * cfg%prod_atom_y(i) &
+                                     + cfg%cell_basis(j,3) * cfg%prod_atom_z(i)
+                end do
+            end do
+        end if
+
+        write(unit, '(a)') '%BLOCK POSITIONS_ABS_PRODUCT'
+        do i = 1, cfg%prod_num_atoms
+            write(unit, '(a, 3(1x, f10.7))') trim(cfg%prod_atom_type(i)), &
+                cart_coords(i,1), cart_coords(i,2), cart_coords(i,3)
+        end do
+        write(unit, '(a)') '%ENDBLOCK POSITIONS_ABS_PRODUCT'
+        write(unit, '(a)') ''
+
+        deallocate(cart_coords)
+    end subroutine write_block_positions_abs_product
+
+
+    subroutine write_block_positions_abs_intermediate(unit, cfg)
+        !! Write %BLOCK POSITIONS_ABS_INTERMEDIATE for CINEB intermediate structure
+        integer, intent(in) :: unit
+        type(castep_config_t), intent(in) :: cfg
+        real(dp), allocatable :: cart_coords(:,:)
+        integer :: i, j
+
+        if (cfg%interm_num_atoms == 0) return
+
+        allocate(cart_coords(cfg%interm_num_atoms, 3))
+        if (cfg%interm_cartesian_coords) then
+            do i = 1, cfg%interm_num_atoms
+                cart_coords(i,1) = cfg%interm_atom_x(i)
+                cart_coords(i,2) = cfg%interm_atom_y(i)
+                cart_coords(i,3) = cfg%interm_atom_z(i)
+            end do
+        else
+            do i = 1, cfg%interm_num_atoms
+                do j = 1, 3
+                    cart_coords(i,j) = cfg%cell_basis(j,1) * cfg%interm_atom_x(i) &
+                                     + cfg%cell_basis(j,2) * cfg%interm_atom_y(i) &
+                                     + cfg%cell_basis(j,3) * cfg%interm_atom_z(i)
+                end do
+            end do
+        end if
+
+        write(unit, '(a)') '%BLOCK POSITIONS_ABS_INTERMEDIATE'
+        do i = 1, cfg%interm_num_atoms
+            write(unit, '(a, 3(1x, f10.7))') trim(cfg%interm_atom_type(i)), &
+                cart_coords(i,1), cart_coords(i,2), cart_coords(i,3)
+        end do
+        write(unit, '(a)') '%ENDBLOCK POSITIONS_ABS_INTERMEDIATE'
+        write(unit, '(a)') ''
+
+        deallocate(cart_coords)
+    end subroutine write_block_positions_abs_intermediate
+
     subroutine write_block_cell_constraints(unit, cfg)
         !! Write %BLOCK CELL_CONSTRAINTS for optimization tasks
         integer, intent(in) :: unit
@@ -229,6 +305,10 @@ contains
             call write_block_cell_constraints(unit, cfg)
             write(unit, '(a)') 'FIX_COM : false'
             write(unit, '(a)') ''
+        end if
+        if (trim(cfg%task_type) == TASK_TRANSITION_STATE) then
+            call write_block_positions_abs_product(unit, cfg)
+            call write_block_positions_abs_intermediate(unit, cfg)
         end if
 
         call write_block_species_pot(unit, cfg)

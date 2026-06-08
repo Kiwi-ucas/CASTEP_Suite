@@ -77,7 +77,7 @@ contains
         call write_kv(unit, 'fine_grid_scale', '3')
         call write_kv(unit, 'finite_basis_corr', '2')
         call write_kv(unit, 'finite_basis_npoints', '3')
-        call write_kv(unit, 'elec_energy_tol', trim(cfg%scf_tolerance))
+        call write_kv(unit, 'elec_energy_tol', energy_tol_str(cfg%scf_tolerance))
         call write_kv(unit, 'max_scf_cycles', trim(int2str(cfg%max_scf_cycles)))
         if (cfg%smearing) then
             call write_kv(unit, 'fix_occupancy', 'false')
@@ -166,8 +166,7 @@ contains
                 call write_kv(unit, 'pdos_calculate_weights', 'false')
             end if
         case (TASK_TRANSITION_STATE)
-            call write_kv(unit, 'ts_method', 'neb')
-            call write_kv(unit, 'images', '5')
+            call write_cineb_params(unit, cfg)
         case (TASK_EFIELD)
             call write_efield_params(unit, cfg)
         case (TASK_PHONON_EFIELD)
@@ -302,6 +301,46 @@ contains
             call write_kv(unit, 'efield_calculate_nonlinear', 'CHI2')
         call write_kv(unit, 'efield_ignore_molec_modes', trim(cfg%efield_ignore_molec_modes))
     end subroutine write_efield_params
+
+
+    subroutine write_cineb_params(unit, cfg)
+        !! Write CINEB (NEB + Climbing Image) transition state search parameters
+        integer, intent(in) :: unit
+        type(castep_config_t), intent(in) :: cfg
+
+        call write_kv(unit, 'tssearch_method', 'NEB')
+        call write_kv(unit, 'tssearch_max_path_points', trim(cfg%cineb_max_images))
+        call write_kv(unit, 'tssearch_neb_spring_constant', &
+            trim(cfg%cineb_spring_constant) // ' eV/ANG**2')
+        call write_kv(unit, 'tssearch_neb_tangent_mode', trim(cfg%cineb_tangent_mode))
+        call write_kv(unit, 'tssearch_neb_method', trim(cfg%cineb_neb_method))
+        call write_kv(unit, 'tssearch_neb_max_iter', trim(cfg%cineb_max_iter))
+        call write_kv(unit, 'tssearch_neb_climbing', trim(cfg%cineb_climbing))
+
+        ! TS convergence tolerance (same 4-level system as geom tolerance)
+        select case (trim(cfg%ts_geom_tolerance))
+        case (GEO_COARSE)
+            call write_kv(unit, 'tssearch_energy_tol', '5e-5')
+            call write_kv(unit, 'tssearch_force_tol',  '0.1')
+            call write_kv(unit, 'tssearch_disp_tol',   '0.005')
+        case (GEO_MEDIUM)
+            call write_kv(unit, 'tssearch_energy_tol', '2e-5')
+            call write_kv(unit, 'tssearch_force_tol',  '0.05')
+            call write_kv(unit, 'tssearch_disp_tol',   '0.002')
+        case (GEO_FINE)
+            call write_kv(unit, 'tssearch_energy_tol', '1e-5')
+            call write_kv(unit, 'tssearch_force_tol',  '0.03')
+            call write_kv(unit, 'tssearch_disp_tol',   '0.001')
+        case (GEO_EXTREME)
+            call write_kv(unit, 'tssearch_energy_tol', '5e-6')
+            call write_kv(unit, 'tssearch_force_tol',  '0.01')
+            call write_kv(unit, 'tssearch_disp_tol',   '5e-4')
+        case default
+            call write_kv(unit, 'tssearch_energy_tol', '2e-5')
+            call write_kv(unit, 'tssearch_force_tol',  '0.05')
+            call write_kv(unit, 'tssearch_disp_tol',   '0.002')
+        end select
+    end subroutine write_cineb_params
 
     pure function real2str(val) result(s)
         real(dp), intent(in) :: val

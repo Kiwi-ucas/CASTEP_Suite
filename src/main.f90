@@ -58,13 +58,13 @@ contains
         !! PreCASTEP workflow: file recognition -> config menu -> generate .cell/.param
         logical, intent(out) :: should_exit
         type(castep_config_t) :: cfg
-        type(cif_data_t)     :: cif
+        type(cif_data_t)     :: cif, prod_cif, interm_cif
         integer               :: istat
         character(len=256)    :: iostat_msg
         character(len=256)    :: formula_chars
         integer               :: i, fidx
         character(len=128)    :: sg_name
-        character(len=4)      :: file_ext
+        character(len=4)      :: file_ext, prod_ext, interm_ext
 
         should_exit = .false.
 
@@ -167,6 +167,79 @@ contains
         cfg%cell_basis = compute_cartesian_lattice(cfg%cell_length(1), cfg%cell_length(2), &
                        cfg%cell_length(3), cfg%cell_angle(1), &
                        cfg%cell_angle(2), cfg%cell_angle(3))
+
+        ! ── CINEB: Parse product and intermediate structures ──
+        if (trim(cfg%task_type) == 'TRANSITIONSTATESEARCH') then
+            ! Parse product structure
+            prod_cif%n_atoms = 0
+            write(*, '(a)') '  Parsing product file: ' // trim(cfg%prod_file_path)
+            prod_ext = get_file_extension(trim(cfg%prod_file_path))
+            if (prod_ext == 'pdb') then
+                call parse_pdb_inline(trim(cfg%prod_file_path), prod_cif, istat, iomsg=iostat_msg)
+            else if (prod_ext == 'cell') then
+                call parse_cell_inline(trim(cfg%prod_file_path), prod_cif, istat, iomsg=iostat_msg)
+            else
+                call parse_cif_inline(trim(cfg%prod_file_path), prod_cif, istat, iomsg=iostat_msg)
+            end if
+            if (istat /= 0) then
+                write(*, '(a)') '  Error parsing product file: ' // trim(iostat_msg)
+                return
+            end if
+            if (prod_cif%n_atoms /= cfg%num_atoms) then
+                write(*, '(a, i0, a, i0)') '  Error: Reactant has ', cfg%num_atoms, &
+                    ' atoms but product has ', prod_cif%n_atoms
+                write(*, '(a)') '  Reactant and product must have the same number of atoms.'
+                return
+            end if
+            cfg%prod_num_atoms = prod_cif%n_atoms
+            allocate(cfg%prod_atom_type(cfg%prod_num_atoms))
+            allocate(cfg%prod_atom_x(cfg%prod_num_atoms))
+            allocate(cfg%prod_atom_y(cfg%prod_num_atoms))
+            allocate(cfg%prod_atom_z(cfg%prod_num_atoms))
+            do i = 1, prod_cif%n_atoms
+                cfg%prod_atom_type(i) = trim(clean_element_symbol(prod_cif%atoms(i)%element))
+                cfg%prod_atom_x(i)    = prod_cif%atoms(i)%x
+                cfg%prod_atom_y(i)    = prod_cif%atoms(i)%y
+                cfg%prod_atom_z(i)    = prod_cif%atoms(i)%z
+            end do
+            cfg%prod_cartesian_coords = .not. prod_cif%positions_fractional
+
+            ! Parse intermediate structure
+            interm_cif%n_atoms = 0
+            write(*, '(a)') '  Parsing intermediate file: ' // trim(cfg%interm_file_path)
+            interm_ext = get_file_extension(trim(cfg%interm_file_path))
+            if (interm_ext == 'pdb') then
+                call parse_pdb_inline(trim(cfg%interm_file_path), interm_cif, istat, iomsg=iostat_msg)
+            else if (interm_ext == 'cell') then
+                call parse_cell_inline(trim(cfg%interm_file_path), interm_cif, istat, iomsg=iostat_msg)
+            else
+                call parse_cif_inline(trim(cfg%interm_file_path), interm_cif, istat, iomsg=iostat_msg)
+            end if
+            if (istat /= 0) then
+                write(*, '(a)') '  Error parsing intermediate file: ' // trim(iostat_msg)
+                return
+            end if
+            if (interm_cif%n_atoms /= cfg%num_atoms) then
+                write(*, '(a, i0, a, i0)') '  Error: Reactant has ', cfg%num_atoms, &
+                    ' atoms but intermediate has ', interm_cif%n_atoms
+                write(*, '(a)') '  Intermediate must have the same number of atoms as reactant.'
+                return
+            end if
+            cfg%interm_num_atoms = interm_cif%n_atoms
+            allocate(cfg%interm_atom_type(cfg%interm_num_atoms))
+            allocate(cfg%interm_atom_x(cfg%interm_num_atoms))
+            allocate(cfg%interm_atom_y(cfg%interm_num_atoms))
+            allocate(cfg%interm_atom_z(cfg%interm_num_atoms))
+            do i = 1, interm_cif%n_atoms
+                cfg%interm_atom_type(i) = trim(clean_element_symbol(interm_cif%atoms(i)%element))
+                cfg%interm_atom_x(i)    = interm_cif%atoms(i)%x
+                cfg%interm_atom_y(i)    = interm_cif%atoms(i)%y
+                cfg%interm_atom_z(i)    = interm_cif%atoms(i)%z
+            end do
+            cfg%interm_cartesian_coords = .not. interm_cif%positions_fractional
+
+            write(*, '(a)') '  Product and intermediate structures validated.'
+        end if
 
         write(*, '(a)') ''
         write(*, '(a)') '  Writing CASTEP .cell file: ' // trim(cfg%cell_output_path)
