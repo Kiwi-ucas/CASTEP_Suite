@@ -5,7 +5,7 @@ module poscastep_menu
     use castep_config, only: dp, pi, HARTREE_TO_EV, bands_data_t, pdos_data_t, &
         cif_data_t, MAX_LINE_LEN, IO_INVALID_INPUT, IO_SUCCESS, IO_USER_QUIT, &
         IO_FILE_NOT_FOUND, IO_PARSE_ERROR, IO_WRITE_ERROR, strip_quotes
-    use parser, only: parse_cell_inline
+    use parser, only: parse_cif_inline, parse_pdb_inline, parse_cell_inline
     use phonon_dos, only: phonon_dos_data_t, parse_phonon_file, compute_phonon_dos, &
         compute_ir_spectrum, compute_raman_spectrum, free_phonon_dos_data
     use polarizability, only: pol_data_t, parse_castep_file, &
@@ -25,7 +25,7 @@ module poscastep_menu
 
     public :: run_poscastep_menu
 
-    integer, parameter :: POS_CELL2CIF   = 0
+    integer, parameter :: POS_CONVERTER  = 0
     integer, parameter :: POS_BANDS      = 1
     integer, parameter :: POS_DOS        = 2
     integer, parameter :: POS_PDOS       = 3
@@ -51,7 +51,7 @@ contains
             write(*, '(a)') '  ================================'
             write(*, '(a)') '            PosCASTEP'
             write(*, '(a)') '  ================================'
-            write(*, '(a)') '  0. Convert .cell to .cif'
+            write(*, '(a)') '  0. Format Converter (.cell/.cif/.pdb)'
             write(*, '(a)') '  1. Plot Band Structure'
             write(*, '(a)') '  2. Plot DOS'
             write(*, '(a)') '  3. Plot pDOS'
@@ -83,8 +83,8 @@ contains
             end if
 
             select case (choice)
-            case (POS_CELL2CIF)
-                call handle_cell2cif_menu(iostat)
+            case (POS_CONVERTER)
+                call handle_format_converter_menu(iostat)
                 if (iostat == IO_USER_QUIT) return
             case (POS_BANDS)
                 call handle_bands_menu(iostat)
@@ -1458,95 +1458,141 @@ contains
     end function trace_iso
 
     ! ----------------------------------------------------------------
-    !  .cell -> .cif converter (Option 0)
+    !  Universal Format Converter (Option 0): CIF ↔ PDB ↔ CELL
     ! ----------------------------------------------------------------
 
-    subroutine handle_cell2cif_menu(iostat)
-        !! Read a CASTEP .cell file and convert to CIF format
+    subroutine handle_format_converter_menu(iostat)
+        !! Convert between CIF, PDB, and CASTEP .cell formats
         integer, intent(out) :: iostat
         type(cif_data_t) :: cif
-        character(len=512)  :: cell_path, cif_path, stem
+        character(len=512)  :: in_path, out_path, stem
         character(len=256)  :: msg
-        integer :: ios, istat, i
+        character(len=4)    :: in_fmt
+        integer :: ios, istat, out_choice
         logical :: exists
         character(len=MAX_LINE_LEN) :: input
 
         iostat = 0
 
-        write(*, '(a)', advance='no') '  Enter .cell file path: '
+        write(*, '(a)', advance='no') '  Enter input file (.cif/.pdb/.cell): '
         read(*, '(a)', iostat=ios) input
         if (ios /= 0) return
-        cell_path = adjustl(trim(input))
-        call strip_quotes(cell_path)
-        if (cell_path == 'q' .or. cell_path == 'Q') then
+        in_path = adjustl(trim(input))
+        call strip_quotes(in_path)
+        if (in_path == 'q' .or. in_path == 'Q') then
             iostat = 0; return
         end if
-        if (len_trim(cell_path) == 0) then
+        if (len_trim(in_path) == 0) then
             write(*, '(a)') '  No file specified.'; return
         end if
 
-        inquire(file=trim(cell_path), exist=exists)
+        inquire(file=trim(in_path), exist=exists)
         if (.not. exists) then
-            write(*, '(a,a)') '  File not found: ', trim(cell_path)
+            write(*, '(a,a)') '  File not found: ', trim(in_path)
             return
         end if
 
-        write(*, '(a,a)') '  Parsing .cell file: ', trim(cell_path)
-        call parse_cell_inline(trim(cell_path), cif, istat, iomsg=msg)
+        ! Auto-detect format from extension
+        in_fmt = get_ext_lower(in_path)
+        select case (trim(in_fmt))
+        case ('cif');  continue
+        case ('pdb');  continue
+        case ('cell'); continue
+        case default
+            write(*, '(a)') '  Unsupported format. Use .cif, .pdb, or .cell files.'
+            return
+        end select
+        write(*, '(a,a)') '  Input format: ', trim(in_fmt)
+
+        ! Parse
+        write(*, '(a)') '  Parsing...'
+        select case (trim(in_fmt))
+        case ('cif');  call parse_cif_inline(trim(in_path), cif, istat, iomsg=msg)
+        case ('pdb');  call parse_pdb_inline(trim(in_path), cif, istat, iomsg=msg)
+        case ('cell'); call parse_cell_inline(trim(in_path), cif, istat, iomsg=msg)
+        end select
         if (istat /= 0) then
-            write(*, '(a,a)') '  Error parsing .cell: ', trim(msg)
+            write(*, '(a,a)') '  Error: ', trim(msg)
             return
         end if
 
         if (cif%n_atoms == 0) then
-            write(*, '(a)') '  Warning: no atoms found in .cell file.'
+            write(*, '(a)') '  Warning: no atoms found.'
         end if
 
         write(*, '(a)')       '  ------- Cell Summary -------'
-        write(*, '(a,3f10.4)') '  a, b, c (Ang):   ', cif%a, cif%b, cif%c
-        write(*, '(a,3f10.4)') '  alpha, beta, gamma (deg): ', &
-            cif%alpha, cif%beta, cif%gamma
-        write(*, '(a,i0)')     '  Atoms:           ', cif%n_atoms
-        if (len_trim(cif%space_group) > 0) &
-            write(*, '(a,a)')  '  Space group:     ', trim(cif%space_group)
+        write(*, '(a,3f10.4)') '  a,b,c (Ang):       ', cif%a, cif%b, cif%c
+        write(*, '(a,3f10.4)') '  alpha,beta,gamma:  ', cif%alpha, cif%beta, cif%gamma
+        write(*, '(a,i0)')     '  Atoms:             ', cif%n_atoms
+        if (len_trim(cif%space_group) > 0 .and. cif%space_group /= 'P1') &
+            write(*, '(a,a)')  '  Space group:       ', trim(cif%space_group)
         if (cif%positions_fractional) then
-            write(*, '(a)')    '  Coordinates:     fractional'
+            write(*, '(a)')    '  Coordinates:       fractional'
         else
-            write(*, '(a)')    '  Coordinates:     Cartesian -> converting to fractional'
+            write(*, '(a)')    '  Coordinates:       Cartesian'
         end if
 
-        ! Convert Cartesian to fractional if needed
-        if (.not. cif%positions_fractional) then
-            call convert_to_fractional(cif, istat)
-            if (istat /= 0) then
-                write(*, '(a)') '  Error: zero-volume cell, cannot convert coordinates.'
-                return
-            end if
+        ! Output format selection
+        write(*, '(a)') ''
+        write(*, '(a)') '  Select output format:'
+        write(*, '(a)') '    1. CASTEP .cell'
+        write(*, '(a)') '    2. CIF  (.cif)'
+        write(*, '(a)') '    3. PDB  (.pdb)'
+        write(*, '(a)') '    Q. Back'
+        write(*, '(a)', advance='no') '    Enter choice: '
+        read(*, '(a)', iostat=ios) input
+        if (ios /= 0) return
+        if (input(1:1) == 'q' .or. input(1:1) == 'Q') then
+            iostat = 0; return
+        end if
+        read(input, *, iostat=ios) out_choice
+        if (ios /= 0 .or. out_choice < 1 .or. out_choice > 3) then
+            write(*, '(a)') '  Invalid choice.'; return
         end if
 
         ! Derive output filename
-        stem = cell_path
-        i = len_trim(stem)
-        do while (i > 0)
-            if (stem(i:i) == '/') then; stem = stem(i+1:); exit; end if
-            i = i - 1
-        end do
-        i = len_trim(stem)
-        do while (i > 0)
-            if (stem(i:i) == '.') then; stem = stem(1:i-1); exit; end if
-            i = i - 1
-        end do
-        cif_path = trim(stem) // '.cif'
+        stem = get_file_stem(in_path)
 
-        ! Write CIF file
-        call write_cif_file(cif, trim(cif_path), istat, msg)
+        ! Convert coordinates + write
+        select case (out_choice)
+        case (1)  ! → CELL (POSITIONS_ABS, Cartesian)
+            if (cif%positions_fractional) then
+                call convert_to_cartesian(cif, istat)
+                if (istat /= 0) then
+                    write(*, '(a)') '  Error: zero-volume cell.'; return
+                end if
+            end if
+            out_path = trim(stem) // '.cell'
+            call write_cell_simple(cif, trim(out_path), istat, msg)
+
+        case (2)  ! → CIF (fractional)
+            if (.not. cif%positions_fractional) then
+                call convert_to_fractional(cif, istat)
+                if (istat /= 0) then
+                    write(*, '(a)') '  Error: zero-volume cell.'; return
+                end if
+            end if
+            out_path = trim(stem) // '.cif'
+            call write_cif_file(cif, trim(out_path), istat, msg)
+
+        case (3)  ! → PDB (Cartesian)
+            if (cif%positions_fractional) then
+                call convert_to_cartesian(cif, istat)
+                if (istat /= 0) then
+                    write(*, '(a)') '  Error: zero-volume cell.'; return
+                end if
+            end if
+            out_path = trim(stem) // '.pdb'
+            call write_pdb_file(cif, trim(out_path), istat, msg)
+        end select
+
         if (istat /= 0) then
-            write(*, '(a,a)') '  Error writing CIF: ', trim(msg)
+            write(*, '(a,a)') '  Error: ', trim(msg)
         else
-            write(*, '(a,a)') '  CIF file written: ', trim(cif_path)
+            write(*, '(a,a)') '  File written: ', trim(out_path)
         end if
         write(*, '(a)') '  ----------------------------'
-    end subroutine handle_cell2cif_menu
+    end subroutine handle_format_converter_menu
 
 
     subroutine convert_to_fractional(cif, iostat)
@@ -1718,5 +1764,155 @@ contains
         frac(2) = inv_lattice(2,1)*x + inv_lattice(2,2)*y + inv_lattice(2,3)*z
         frac(3) = inv_lattice(3,1)*x + inv_lattice(3,2)*y + inv_lattice(3,3)*z
     end function cartesian_to_fractional
+
+
+    subroutine convert_to_cartesian(cif, iostat)
+        !! Convert fractional atom coordinates to Cartesian using lattice matrix
+        type(cif_data_t), intent(inout) :: cif
+        integer, intent(out) :: iostat
+        real(dp) :: lattice(3,3), cart(3)
+        integer :: i
+
+        iostat = 0
+        lattice = compute_lattice_private(cif%a, cif%b, cif%c, &
+            cif%alpha, cif%beta, cif%gamma)
+
+        do i = 1, cif%n_atoms
+            cart(1) = lattice(1,1)*cif%atoms(i)%x + lattice(1,2)*cif%atoms(i)%y &
+                      + lattice(1,3)*cif%atoms(i)%z
+            cart(2) = lattice(2,1)*cif%atoms(i)%x + lattice(2,2)*cif%atoms(i)%y &
+                      + lattice(2,3)*cif%atoms(i)%z
+            cart(3) = lattice(3,1)*cif%atoms(i)%x + lattice(3,2)*cif%atoms(i)%y &
+                      + lattice(3,3)*cif%atoms(i)%z
+            cif%atoms(i)%x = cart(1)
+            cif%atoms(i)%y = cart(2)
+            cif%atoms(i)%z = cart(3)
+        end do
+        cif%positions_fractional = .false.
+    end subroutine convert_to_cartesian
+
+
+    subroutine write_cell_simple(data, filename, iostat, iomsg)
+        !! Write a minimal .cell file from cif_data_t (LATTICE_ABC + POSITIONS_ABS)
+        type(cif_data_t), intent(in) :: data
+        character(len=*), intent(in) :: filename
+        integer, intent(out) :: iostat
+        character(len=*), intent(out) :: iomsg
+        integer :: iunit, ios, i
+
+        iostat = 0; iomsg = ''
+
+        open(newunit=iunit, file=trim(filename), status='replace', &
+            action='write', iostat=ios)
+        if (ios /= 0) then
+            iostat = IO_WRITE_ERROR
+            iomsg = 'Cannot open output file: ' // trim(filename)
+            return
+        end if
+
+        write(iunit, '(a)') '%BLOCK LATTICE_ABC'
+        write(iunit, '(3(f12.7,1x))') data%a, data%b, data%c
+        write(iunit, '(3(f12.7,1x))') data%alpha, data%beta, data%gamma
+        write(iunit, '(a)') '%ENDBLOCK LATTICE_ABC'
+        write(iunit, '(a)') ''
+        write(iunit, '(a)') '%BLOCK POSITIONS_ABS'
+        do i = 1, data%n_atoms
+            write(iunit, '(a,2x,3(f12.6,1x))') trim(data%atoms(i)%element), &
+                data%atoms(i)%x, data%atoms(i)%y, data%atoms(i)%z
+        end do
+        write(iunit, '(a)') '%ENDBLOCK POSITIONS_ABS'
+        close(iunit)
+    end subroutine write_cell_simple
+
+
+    subroutine write_pdb_file(data, filename, iostat, iomsg)
+        !! Write PDB format from cif_data_t (coordinates must be Cartesian)
+        type(cif_data_t), intent(in) :: data
+        character(len=*), intent(in) :: filename
+        integer, intent(out) :: iostat
+        character(len=*), intent(out) :: iomsg
+        integer :: iunit, ios, i
+        character(len=6) :: atom_label
+        character(len=80) :: line
+
+        iostat = 0; iomsg = ''
+
+        open(newunit=iunit, file=trim(filename), status='replace', &
+            action='write', iostat=ios)
+        if (ios /= 0) then
+            iostat = IO_WRITE_ERROR
+            iomsg = 'Cannot open output file: ' // trim(filename)
+            return
+        end if
+
+        ! TITLE
+        write(iunit, '(a)') 'TITLE     Converted by CASTEP Suite PosCASTEP'
+
+        ! CRYST1: a(F9.3) b(F9.3) c(F9.3) alpha(F7.2) beta(F7.2) gamma(F7.2) spg(11x) z(4x)
+        write(iunit, '(a,3f9.3,3f7.2,1x,a,1x,i4)') 'CRYST1', &
+            data%a, data%b, data%c, &
+            data%alpha, data%beta, data%gamma, &
+            'P 1', 1
+
+        ! ATOM records
+        do i = 1, data%n_atoms
+            atom_label = adjustl(data%atoms(i)%element)
+            write(line, '(a,i5,1x,a4,1x,a4,1x,a1,1x,i4,4x,3f8.3,2f6.2,6x,a2)') &
+                'ATOM  ', mod(i, 99999), atom_label(1:4), 'MOL ', 'A', &
+                mod(i, 9999), data%atoms(i)%x, data%atoms(i)%y, data%atoms(i)%z, &
+                1.0, 0.0, atom_label(1:2)
+            write(iunit, '(a)') trim(line)
+        end do
+
+        write(iunit, '(a)') 'END'
+        close(iunit)
+    end subroutine write_pdb_file
+
+
+    pure function get_file_stem(path) result(stem)
+        !! Extract basename without directory and extension
+        character(len=*), intent(in) :: path
+        character(len=512) :: stem
+        integer :: n
+
+        stem = trim(path)
+        ! Strip directory prefix
+        n = len_trim(stem)
+        do while (n > 0)
+            if (stem(n:n) == '/') then; stem = stem(n+1:); exit; end if
+            n = n - 1
+        end do
+        ! Strip extension
+        n = len_trim(stem)
+        do while (n > 0)
+            if (stem(n:n) == '.') then; stem = stem(1:n-1); exit; end if
+            n = n - 1
+        end do
+    end function get_file_stem
+
+
+    pure function get_ext_lower(path) result(ext)
+        !! Get lowercase file extension (e.g. 'cif', 'pdb', 'cell')
+        character(len=*), intent(in) :: path
+        character(len=4) :: ext
+        integer :: i, n
+
+        ext = ''
+        n = len_trim(path)
+        ! Find last dot
+        i = n
+        do while (i > 0)
+            if (path(i:i) == '.') then
+                ext = path(i+1:n)
+                exit
+            end if
+            i = i - 1
+        end do
+        ! Convert to lowercase
+        do i = 1, len_trim(ext)
+            if (ext(i:i) >= 'A' .and. ext(i:i) <= 'Z') &
+                ext(i:i) = char(iachar(ext(i:i)) + 32)
+        end do
+    end function get_ext_lower
 
 end module poscastep_menu

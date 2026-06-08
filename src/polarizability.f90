@@ -178,14 +178,14 @@ contains
         if (present(iomsg)) iomsg = ''
 
         ! Generate file list via `find` (not shell glob).
-        ! `ls dir/*dipole*` expands the glob via argv, which exceeds ARG_MAX
+        ! `ls dir/*cell_dipole*` expands the glob via argv, which exceeds ARG_MAX
         ! when the trajectory contains thousands of dipole files.
         ! `find` walks the directory without argv expansion.
         file_list = '.dipole_list_tmp'
         ! Use `sort -V` (version sort) to handle filenames with mixed digit
         ! widths correctly (e.g. dipole_9999.dat before dipole_10000.dat).
         ! Plain `sort` is lexicographic and breaks at digit-width boundaries.
-        cmd = 'find "' // trim(dir_path) // '" -maxdepth 1 -name "*dipole*" ' // &
+        cmd = 'find "' // trim(dir_path) // '" -maxdepth 1 -name "*cell_dipole*" ' // &
               '2>/dev/null | sort -V > ' // trim(file_list)
         call execute_command_line(trim(cmd), wait=.true., &
                                   exitstat=cmd_exit, cmdstat=cmd_stat)
