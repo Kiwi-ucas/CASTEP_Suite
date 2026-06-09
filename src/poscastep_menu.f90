@@ -20,6 +20,7 @@ module poscastep_menu
     use dos_compute, only: compute_total_dos, compute_pdos, N_CHANNELS
     use dos_plotter, only: DOS_MODE_ASCII, DOS_MODE_SVG, DOS_MODE_EXPORT, &
         plot_dos_ascii, write_dos_svg, write_dos_csv, plot_pdos_ascii, write_pdos_csv
+    use crystal_json, only: write_crystal_json_cif
     implicit none
     private
 
@@ -33,6 +34,7 @@ module poscastep_menu
     integer, parameter :: POS_IR_SPEC    = 5
     integer, parameter :: POS_RAMAN_SPEC = 6
     integer, parameter :: POS_POLARIZABILITY = 7
+    integer, parameter :: POS_VIEW_STRUCTURE = -1
 
 contains
 
@@ -51,6 +53,7 @@ contains
             write(*, '(a)') '  ================================'
             write(*, '(a)') '            PosCASTEP'
             write(*, '(a)') '  ================================'
+            write(*, '(a)') ' -1. View Crystal Structure (3D)'
             write(*, '(a)') '  0. Format Converter (.cell/.cif/.pdb)'
             write(*, '(a)') '  1. Plot Band Structure'
             write(*, '(a)') '  2. Plot DOS'
@@ -107,8 +110,11 @@ contains
             case (POS_POLARIZABILITY)
                 call handle_polarizability_menu(iostat)
                 if (iostat == IO_USER_QUIT) return
+            case (POS_VIEW_STRUCTURE)
+                call handle_view_structure(iostat)
+                if (iostat == IO_USER_QUIT) return
             case default
-                write(*, '(a)') '  Invalid option. Enter 1-7, or Q.'
+                write(*, '(a)') '  Invalid option. Enter 0-7, -1, or Q.'
             end select
         end do
     end subroutine run_poscastep_menu
@@ -1914,5 +1920,121 @@ contains
                 ext(i:i) = char(iachar(ext(i:i)) + 32)
         end do
     end function get_ext_lower
+
+
+    subroutine launch_viewer(json_path)
+        character(len=*), intent(in) :: json_path
+        character(len=MAX_LINE_LEN) :: viewer_cmd
+        integer :: unit, ios
+        viewer_cmd = find_viewer()
+        if (len_trim(viewer_cmd) == 0) then
+            write(*, '(a)') '  crystal-viewer not found.'
+            write(*, '(a)') '  Build it: cd crystal-viewer && cargo build --release'
+            write(*, '(a)') '  Or download from: https://github.com/Kiwi-ucas/CASTEP_Suite/releases'
+        else
+            write(*, '(a)') '  Launching Crystal Viewer...'
+            call execute_command_line(trim(viewer_cmd) // ' ' // trim(json_path) // ' > /dev/null 2>&1', wait=.true.)
+            ! Clean up generated JSON
+            open(newunit=unit, file=trim(json_path), status='old', iostat=ios)
+            if (ios == 0) close(unit, status='delete')
+        end if
+    end subroutine launch_viewer
+
+
+    function find_viewer() result(cmd)
+        !! Auto-detect crystal-viewer relative to CASTEP_Suite executable
+        character(len=MAX_LINE_LEN) :: cmd
+        character(len=MAX_LINE_LEN) :: exe_path, exe_dir
+        integer :: slash_pos
+        logical :: exists
+
+        call get_command_argument(0, exe_path)
+        slash_pos = index(trim(exe_path), '/', back=.true.)
+        if (slash_pos > 0) then
+            exe_dir = exe_path(1:slash_pos)
+        else
+            exe_dir = ''
+        end if
+        ! 1) Dev layout: crystal-viewer/target/release/crystal-viewer
+        cmd = trim(exe_dir) // 'crystal-viewer/target/release/crystal-viewer'
+        inquire(file=trim(cmd), exist=exists)
+        if (exists) return
+        ! 2) Release layout: crystal-viewer in same directory
+        cmd = trim(exe_dir) // 'crystal-viewer'
+        inquire(file=trim(cmd), exist=exists)
+        if (.not. exists) cmd = ''
+    end function find_viewer
+
+
+    subroutine handle_view_structure(iostat)
+        !! Parse a CIF/PDB/cell file and launch crystal-viewer for 3D rendering
+        integer, intent(out) :: iostat
+        type(cif_data_t) :: cif
+        character(len=MAX_LINE_LEN) :: file_path, json_path, ext
+        integer :: ios
+        logical :: exists
+
+        iostat = 0
+
+        ! ── File input ──
+        write(*, '(a)', advance='no') '  Enter structure file (.cif/.pdb/.cell): '
+        read(*, '(a)', iostat=ios) file_path
+        if (ios /= 0) return
+        file_path = adjustl(file_path); call strip_quotes(file_path)
+        if (file_path == 'q' .or. file_path == 'Q') then
+            iostat = 0; return
+        end if
+        if (len_trim(file_path) == 0) then
+            write(*, '(a)') '  No file specified.'; return
+        end if
+
+        ! Check file exists
+        inquire(file=trim(file_path), exist=exists)
+        if (.not. exists) then
+            write(*, '(a)') '  File not found: ' // trim(file_path); return
+        end if
+
+        ! ── Detect format ──
+        ext = get_ext_lower(file_path)
+        select case (trim(ext))
+        case ('cif')
+            call parse_cif_inline(trim(file_path), cif, ios)
+        case ('pdb')
+            call parse_pdb_inline(trim(file_path), cif, ios)
+        case ('cell')
+            call parse_cell_inline(trim(file_path), cif, ios)
+        case default
+            write(*, '(a)') '  Unsupported format. Use .cif, .pdb, or .cell.'
+            return
+        end select
+
+        if (ios /= 0) then
+            write(*, '(a)') '  Error parsing file.'
+            call free_cif_data(cif); return
+        end if
+
+        write(*, '(a,i0,a)') '  Parsed ', cif%n_atoms, ' atoms.'
+
+        ! ── Write JSON ──
+        json_path = trim(file_path) // '.json'
+        call write_crystal_json_cif(cif, json_path, ios)
+        call free_cif_data(cif)
+
+        if (ios /= 0) then
+            write(*, '(a)') '  Error writing JSON file.'; return
+        end if
+
+        ! ── Launch viewer ──
+        call launch_viewer(json_path)
+
+    end subroutine handle_view_structure
+
+
+    subroutine free_cif_data(data)
+        !! Deallocate cif_data_t atom arrays
+        type(cif_data_t), intent(inout) :: data
+        if (allocated(data%atoms)) deallocate(data%atoms)
+        data%n_atoms = 0
+    end subroutine free_cif_data
 
 end module poscastep_menu

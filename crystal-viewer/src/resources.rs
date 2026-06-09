@@ -1,0 +1,145 @@
+//! Lookup tables for element properties (radius, color)
+
+use bevy::prelude::Color;
+
+/// Covalent radii in Angstrom (from Cordero et al., 2008)
+pub fn covalent_radius(element: &str) -> f32 {
+    match element {
+        "H" => 0.31, "He" => 0.28, "Li" => 1.28, "Be" => 0.96, "B" => 0.84,
+        "C" => 0.76, "N" => 0.71, "O" => 0.66, "F" => 0.57, "Ne" => 0.58,
+        "Na" => 1.66, "Mg" => 1.41, "Al" => 1.21, "Si" => 1.11, "P" => 1.07,
+        "S" => 1.05, "Cl" => 0.99, "Ar" => 1.06, "K" => 2.03, "Ca" => 1.76,
+        "Sc" => 1.70, "Ti" => 1.60, "V" => 1.53, "Cr" => 1.39, "Mn" => 1.39,
+        "Fe" => 1.32, "Co" => 1.26, "Ni" => 1.24, "Cu" => 1.28, "Zn" => 1.22,
+        "Ga" => 1.22, "Ge" => 1.20, "As" => 1.19, "Se" => 1.20, "Br" => 1.20,
+        "Kr" => 1.16, "Rb" => 2.20, "Sr" => 1.95, "Y" => 1.90, "Zr" => 1.75,
+        "Nb" => 1.64, "Mo" => 1.54, "Tc" => 1.47, "Ru" => 1.46, "Rh" => 1.42,
+        "Pd" => 1.39, "Ag" => 1.45, "Cd" => 1.44, "In" => 1.42, "Sn" => 1.39,
+        "Sb" => 1.39, "Te" => 1.38, "I" => 1.39, "Xe" => 1.40,
+        "Cs" => 2.44, "Ba" => 2.15, "La" => 2.07, "Ce" => 2.04, "Pr" => 2.03,
+        "Nd" => 2.01, "Pm" => 1.99, "Sm" => 1.98, "Eu" => 1.98, "Gd" => 1.96,
+        "Tb" => 1.94, "Dy" => 1.92, "Ho" => 1.92, "Er" => 1.89, "Tm" => 1.90,
+        "Yb" => 1.87, "Lu" => 1.87, "Hf" => 1.75, "Ta" => 1.70, "W" => 1.62,
+        "Re" => 1.51, "Os" => 1.44, "Ir" => 1.41, "Pt" => 1.36, "Au" => 1.36,
+        "Hg" => 1.32, "Tl" => 1.45, "Pb" => 1.46, "Bi" => 1.48, "Po" => 1.40,
+        "At" => 1.50, "Rn" => 1.50, "Fr" => 2.60, "Ra" => 2.21, "Ac" => 2.15,
+        "Th" => 2.06, "Pa" => 2.00, "U" => 1.96, "Np" => 1.90, "Pu" => 1.87,
+        "Am" => 1.80, "Cm" => 1.69,
+        _ => 1.50,
+    }
+}
+
+/// CPK / Jmol colors
+pub fn element_color(element: &str) -> Color {
+    match element {
+        "H"  => Color::srgb(1.00, 1.00, 1.00),
+        "He" => Color::srgb(0.85, 1.00, 1.00),
+        "Li" => Color::srgb(0.80, 0.50, 1.00),
+        "Be" => Color::srgb(0.76, 1.00, 0.00),
+        "B"  => Color::srgb(1.00, 0.71, 0.71),
+        "C"  => Color::srgb(0.20, 0.20, 0.20),
+        "N"  => Color::srgb(0.14, 0.14, 1.00),
+        "O"  => Color::srgb(1.00, 0.05, 0.05),
+        "F"  => Color::srgb(0.56, 0.88, 0.31),
+        "Ne" => Color::srgb(0.70, 1.00, 1.00),
+        "Na" => Color::srgb(0.67, 0.36, 0.95),
+        "Mg" => Color::srgb(0.54, 1.00, 0.00),
+        "Al" => Color::srgb(0.75, 0.65, 0.65),
+        "Si" => Color::srgb(0.94, 0.78, 0.63),
+        "P"  => Color::srgb(1.00, 0.50, 0.00),
+        "S"  => Color::srgb(1.00, 1.00, 0.00),
+        "Cl" => Color::srgb(0.12, 0.94, 0.12),
+        "Ar" => Color::srgb(0.50, 1.00, 1.00),
+        "K"  => Color::srgb(0.56, 0.25, 0.83),
+        "Ca" => Color::srgb(0.24, 1.00, 0.00),
+        "Sc" => Color::srgb(0.90, 0.90, 0.90),
+        "Ti" => Color::srgb(0.75, 0.76, 0.78),
+        "V"  => Color::srgb(0.65, 0.65, 0.67),
+        "Cr" => Color::srgb(0.54, 0.60, 0.78),
+        "Mn" => Color::srgb(0.61, 0.48, 0.78),
+        "Fe" => Color::srgb(0.88, 0.40, 0.20),
+        "Co" => Color::srgb(0.94, 0.56, 0.63),
+        "Ni" => Color::srgb(0.31, 0.82, 0.31),
+        "Cu" => Color::srgb(0.72, 0.45, 0.20),
+        "Zn" => Color::srgb(0.49, 0.50, 0.69),
+        "Ga" => Color::srgb(0.76, 0.56, 0.56),
+        "Ge" => Color::srgb(0.40, 0.56, 0.56),
+        "As" => Color::srgb(0.74, 0.50, 0.89),
+        "Se" => Color::srgb(1.00, 0.63, 0.00),
+        "Br" => Color::srgb(0.65, 0.16, 0.16),
+        "Kr" => Color::srgb(0.36, 0.72, 0.82),
+        "Rb" => Color::srgb(0.44, 0.18, 0.69),
+        "Sr" => Color::srgb(0.00, 1.00, 0.00),
+        "Y"  => Color::srgb(0.58, 1.00, 1.00),
+        "Zr" => Color::srgb(0.58, 0.88, 0.88),
+        "Nb" => Color::srgb(0.45, 0.76, 0.79),
+        "Mo" => Color::srgb(0.33, 0.71, 0.71),
+        "Tc" => Color::srgb(0.23, 0.62, 0.62),
+        "Ru" => Color::srgb(0.14, 0.56, 0.56),
+        "Rh" => Color::srgb(0.04, 0.49, 0.55),
+        "Pd" => Color::srgb(0.00, 0.41, 0.52),
+        "Ag" => Color::srgb(0.88, 0.88, 1.00),
+        "Cd" => Color::srgb(1.00, 0.85, 0.56),
+        "In" => Color::srgb(0.65, 0.46, 0.45),
+        "Sn" => Color::srgb(0.40, 0.50, 0.50),
+        "Sb" => Color::srgb(0.62, 0.39, 0.71),
+        "Te" => Color::srgb(0.83, 0.48, 0.00),
+        "I"  => Color::srgb(0.58, 0.00, 0.58),
+        "Xe" => Color::srgb(0.26, 0.62, 0.69),
+        "Cs" => Color::srgb(0.34, 0.09, 0.56),
+        "Ba" => Color::srgb(0.00, 0.79, 0.00),
+        "La" => Color::srgb(0.44, 0.83, 1.00),
+        "Ce" => Color::srgb(1.00, 1.00, 0.78),
+        "Pr" => Color::srgb(0.85, 1.00, 0.78),
+        "Nd" => Color::srgb(0.78, 1.00, 0.78),
+        "Pm" => Color::srgb(0.64, 1.00, 0.78),
+        "Sm" => Color::srgb(0.56, 1.00, 0.78),
+        "Eu" => Color::srgb(0.38, 1.00, 0.78),
+        "Gd" => Color::srgb(0.27, 1.00, 0.78),
+        "Tb" => Color::srgb(0.19, 1.00, 0.78),
+        "Dy" => Color::srgb(0.12, 1.00, 0.78),
+        "Ho" => Color::srgb(0.00, 1.00, 0.61),
+        "Er" => Color::srgb(0.00, 0.90, 0.46),
+        "Tm" => Color::srgb(0.00, 0.83, 0.32),
+        "Yb" => Color::srgb(0.00, 0.75, 0.22),
+        "Lu" => Color::srgb(0.00, 0.67, 0.14),
+        "Hf" => Color::srgb(0.30, 0.76, 1.00),
+        "Ta" => Color::srgb(0.30, 0.65, 1.00),
+        "W"  => Color::srgb(0.13, 0.58, 0.84),
+        "Re" => Color::srgb(0.15, 0.49, 0.67),
+        "Os" => Color::srgb(0.15, 0.40, 0.59),
+        "Ir" => Color::srgb(0.09, 0.33, 0.53),
+        "Pt" => Color::srgb(0.82, 0.82, 0.88),
+        "Au" => Color::srgb(1.00, 0.84, 0.14),
+        "Hg" => Color::srgb(0.72, 0.72, 0.82),
+        "Tl" => Color::srgb(0.65, 0.33, 0.30),
+        "Pb" => Color::srgb(0.34, 0.35, 0.38),
+        "Bi" => Color::srgb(0.62, 0.31, 0.71),
+        "Po" => Color::srgb(0.67, 0.36, 0.00),
+        "At" => Color::srgb(0.46, 0.31, 0.27),
+        "Rn" => Color::srgb(0.26, 0.51, 0.59),
+        "Fr" => Color::srgb(0.26, 0.00, 0.40),
+        "Ra" => Color::srgb(0.00, 0.49, 0.00),
+        "Ac" => Color::srgb(0.44, 0.67, 0.98),
+        "Th" => Color::srgb(0.00, 0.73, 1.00),
+        "Pa" => Color::srgb(0.00, 0.63, 1.00),
+        "U"  => Color::srgb(0.00, 0.56, 1.00),
+        "Np" => Color::srgb(0.00, 0.50, 1.00),
+        "Pu" => Color::srgb(0.00, 0.42, 1.00),
+        "Am" => Color::srgb(0.33, 0.36, 0.95),
+        "Cm" => Color::srgb(0.47, 0.36, 0.89),
+        _ => Color::srgb(1.00, 0.08, 0.58), // pink for unknown
+    }
+}
+
+/// Atom display radius (scaled for visibility, not physical)
+pub fn atom_radius(element: &str) -> f32 {
+    covalent_radius(element) * 0.5
+}
+
+/// Detect bonds between atoms: true if distance < sum of covalent radii * factor
+pub fn has_bond(el1: &str, el2: &str, distance: f32, factor: f32) -> bool {
+    let r1 = covalent_radius(el1);
+    let r2 = covalent_radius(el2);
+    distance < (r1 + r2) * factor
+}
