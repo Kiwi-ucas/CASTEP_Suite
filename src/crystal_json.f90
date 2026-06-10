@@ -1,11 +1,11 @@
 module crystal_json
     !! Generate crystal_data.json for the Rust Crystal Viewer
-    use castep_config, only: dp, pi, castep_config_t, cif_data_t
+    use castep_config, only: dp, pi, castep_config_t, cif_data_t, IO_PARSE_ERROR
     use parser, only: clean_element_symbol
     implicit none
     private
 
-    public :: write_crystal_json, write_crystal_json_cif
+    public :: write_crystal_json, write_crystal_json_cif, read_crystal_json_to_cif
 
 contains
 
@@ -120,5 +120,156 @@ contains
             vc(3) = 0.0_dp
         end if
     end subroutine lattice_vectors
+
+
+    subroutine read_crystal_json_to_cif(json_path, cif, modified, iostat, iomsg)
+        !! Read crystal_data.json back into cif_data_t.
+        !! Sets modified=.true. if the JSON has "modified": true.
+        character(len=*), intent(in) :: json_path
+        type(cif_data_t), intent(out) :: cif
+        logical, intent(out) :: modified
+        integer, intent(out) :: iostat
+        character(len=*), intent(out) :: iomsg
+
+        integer :: unit, ios, atom_idx
+        character(len=512) :: line
+        logical :: in_atoms
+
+        iostat = 0
+        iomsg = ''
+        modified = .false.
+        cif%n_atoms = 0
+        in_atoms = .false.
+
+        open(newunit=unit, file=trim(json_path), status='old', action='read', iostat=ios)
+        if (ios /= 0) then
+            iostat = IO_PARSE_ERROR
+            iomsg = 'Cannot open JSON file: ' // trim(json_path)
+            return
+        end if
+
+        ! ── First pass: count atoms ──
+        do
+            read(unit, '(a)', iostat=ios) line
+            if (ios /= 0) exit
+            line = adjustl(line)
+            if (index(line, '"element"') > 0) then
+                cif%n_atoms = cif%n_atoms + 1
+            end if
+        end do
+
+        if (cif%n_atoms == 0) then
+            iostat = IO_PARSE_ERROR
+            iomsg = 'No atoms found in JSON file'
+            close(unit)
+            return
+        end if
+
+        allocate(cif%atoms(cif%n_atoms), stat=ios)
+        if (ios /= 0) then
+            iostat = IO_PARSE_ERROR
+            iomsg = 'Memory allocation failed'
+            close(unit)
+            return
+        end if
+
+        ! ── Second pass: parse values ──
+        rewind(unit)
+        atom_idx = 0
+        do
+            read(unit, '(a)', iostat=ios) line
+            if (ios /= 0) exit
+            line = adjustl(line)
+
+            ! Lattice parameters
+            if (index(line, '"a"') > 0 .and. index(line, '"alpha"') == 0) then
+                call extract_json_real(line, cif%a, ios)
+            else if (index(line, '"b"') > 0 .and. index(line, '"beta"') == 0) then
+                call extract_json_real(line, cif%b, ios)
+            else if (index(line, '"c"') > 0) then
+                call extract_json_real(line, cif%c, ios)
+            else if (index(line, '"alpha"') > 0) then
+                call extract_json_real(line, cif%alpha, ios)
+            else if (index(line, '"beta"') > 0) then
+                call extract_json_real(line, cif%beta, ios)
+            else if (index(line, '"gamma"') > 0) then
+                call extract_json_real(line, cif%gamma, ios)
+
+            ! positions_fractional flag
+            else if (index(line, '"positions_fractional"') > 0) then
+                if (index(line, 'true') > 0) cif%positions_fractional = .true.
+
+            ! modified flag
+            else if (index(line, '"modified"') > 0) then
+                if (index(line, 'true') > 0) modified = .true.
+
+            ! Atom data
+            else if (index(line, '"element"') > 0) then
+                atom_idx = atom_idx + 1
+                if (atom_idx <= cif%n_atoms) then
+                    call extract_json_string(line, cif%atoms(atom_idx)%element)
+                end if
+            else if (index(line, '"x"') > 0 .and. atom_idx > 0 .and. atom_idx <= cif%n_atoms) then
+                call extract_json_real(line, cif%atoms(atom_idx)%x, ios)
+            else if (index(line, '"y"') > 0 .and. atom_idx > 0 .and. atom_idx <= cif%n_atoms) then
+                call extract_json_real(line, cif%atoms(atom_idx)%y, ios)
+            else if (index(line, '"z"') > 0 .and. atom_idx > 0 .and. atom_idx <= cif%n_atoms) then
+                call extract_json_real(line, cif%atoms(atom_idx)%z, ios)
+            end if
+        end do
+
+        close(unit)
+        cif%space_group = 'P1'
+        cif%positions_fractional = .false.  ! viewer always outputs Cartesian
+    end subroutine read_crystal_json_to_cif
+
+
+    subroutine extract_json_real(line, val, ios)
+        !! Extract a real number from a JSON line like  "key": value,
+        character(len=*), intent(in) :: line
+        real(dp), intent(out) :: val
+        integer, intent(out) :: ios
+        integer :: colon_pos, end_pos
+        character(len=256) :: tmp
+
+        val = 0.0_dp
+        ios = 0
+
+        colon_pos = index(line, ':')
+        if (colon_pos == 0) then
+            ios = 1; return
+        end if
+
+        tmp = adjustl(line(colon_pos+1:))
+        ! Remove trailing comma
+        end_pos = len_trim(tmp)
+        if (end_pos > 0) then
+            if (tmp(end_pos:end_pos) == ',' .or. tmp(end_pos:end_pos) == '}') then
+                tmp(end_pos:end_pos) = ' '
+            end if
+        end if
+
+        read(tmp, *, iostat=ios) val
+    end subroutine extract_json_real
+
+
+    subroutine extract_json_string(line, str)
+        !! Extract a quoted string from a JSON line like  "key": "value",
+        character(len=*), intent(in) :: line
+        character(len=*), intent(out) :: str
+        integer :: colon_pos, quote_start, quote_end
+
+        str = ''
+        colon_pos = index(line, ':')
+        if (colon_pos == 0) return
+        ! Find opening quote after colon
+        quote_start = index(line(colon_pos:), '"')
+        if (quote_start == 0) return
+        quote_start = colon_pos + quote_start - 1  ! convert to absolute position
+        ! Find closing quote
+        quote_end = index(line(quote_start+1:), '"')
+        if (quote_end == 0) return
+        str = line(quote_start+1:quote_start+quote_end-1)
+    end subroutine extract_json_string
 
 end module crystal_json

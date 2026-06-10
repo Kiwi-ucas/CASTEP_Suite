@@ -9,16 +9,27 @@ pub struct PickingState {
     pub hovered: i32,
     pub atom_positions: Vec<Vec3>,
     pub atom_material_handles: Vec<Handle<StandardMaterial>>,
+    pub atom_entities: Vec<Entity>,
+    pub parent_indices: Vec<usize>,
     pub click_start: Option<Vec2>,
+    pub modified: bool,
 }
 
 impl PickingState {
-    pub fn new(positions: Vec<Vec3>, handles: Vec<Handle<StandardMaterial>>) -> Self {
+    pub fn new(
+        positions: Vec<Vec3>,
+        handles: Vec<Handle<StandardMaterial>>,
+        entities: Vec<Entity>,
+        parent_indices: Vec<usize>,
+    ) -> Self {
         Self {
             selected: -1, hovered: -1,
             atom_positions: positions,
             atom_material_handles: handles,
+            atom_entities: entities,
+            parent_indices,
             click_start: None,
+            modified: false,
         }
     }
 }
@@ -119,13 +130,23 @@ pub fn highlight_atoms(
     picking: Res<PickingState>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    let sel_parent = if picking.selected >= 0 && (picking.selected as usize) < picking.parent_indices.len() {
+        Some(picking.parent_indices[picking.selected as usize])
+    } else { None };
+    let hov_parent = if picking.hovered >= 0 && (picking.hovered as usize) < picking.parent_indices.len() {
+        Some(picking.parent_indices[picking.hovered as usize])
+    } else { None };
+
     for i in 0..picking.atom_material_handles.len() {
         let handle = &picking.atom_material_handles[i];
         let Some(mat) = materials.get_mut(handle) else { continue };
-        let idx = i as i32;
-        if idx == picking.selected {
+        let my_parent = if i < picking.parent_indices.len() {
+            Some(picking.parent_indices[i])
+        } else { None };
+
+        if sel_parent.is_some() && my_parent == sel_parent {
             mat.emissive = LinearRgba::rgb(1.0, 0.5, 0.1);
-        } else if idx == picking.hovered {
+        } else if hov_parent.is_some() && my_parent == hov_parent {
             mat.emissive = LinearRgba::rgb(0.3, 0.3, 0.3);
         } else {
             mat.emissive = LinearRgba::BLACK;

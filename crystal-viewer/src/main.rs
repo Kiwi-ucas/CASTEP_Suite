@@ -28,16 +28,19 @@ fn main() {
         .add_systems(Update, orbit_camera)
         .add_systems(Update, (click_pick, hover_pick).chain())
         .add_systems(Update, highlight_atoms)
+        .add_systems(Update, move_selected_atom.after(highlight_atoms))
         .add_systems(Update, ui_system.after(highlight_atoms))
         .add_systems(Update, display_mode_system)
         .add_systems(Update, toggle_projection)
-        .insert_resource(ProjMode::Perspective)
-        .insert_resource(OrthoScale(15.0))
         .run();
 }
 
 #[derive(Resource)] struct CrystalPath(String);
 #[derive(Resource)] struct CrystalScene { center: Vec3 }
+#[derive(Resource, Clone)] struct CrystalStore { data: CrystalData, json_path: String }
+#[derive(Resource)] struct LatticeData { vecs: [Vec3; 3], inv: [Vec3; 3] }
+#[derive(Resource)] struct ImageOffsets(Vec<Vec3>);  // fractional offset for each expanded atom
+#[derive(Resource)] struct MoveState { step: f32 }
 #[derive(Component)] struct MainCamera;
 #[derive(Component)] struct FollowCamera;
 #[derive(Component)] struct AtomMarker;
@@ -65,15 +68,23 @@ enum ProjMode { Perspective, Orthographic }
 
 fn toggle_projection(
     keys: Res<ButtonInput<KeyCode>>,
-    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     mut proj_mode: ResMut<ProjMode>,
-    ortho_scale: ResMut<OrthoScale>,
+    mut ortho_scale: ResMut<OrthoScale>,
+    mut cam_state: ResMut<CameraState>,
     mut camera_q: Query<&mut Projection, With<MainCamera>>,
 ) {
     if keys.just_pressed(KeyCode::KeyP) {
         *proj_mode = match *proj_mode {
-            ProjMode::Perspective => ProjMode::Orthographic,
-            ProjMode::Orthographic => ProjMode::Perspective,
+            ProjMode::Perspective => {
+                // Sync: derive ortho_scale from perspective radius
+                ortho_scale.0 = cam_state.radius * 1.09;
+                ProjMode::Orthographic
+            }
+            ProjMode::Orthographic => {
+                // Sync: derive perspective radius from ortho_scale
+                cam_state.radius = ortho_scale.0 / 1.09;
+                ProjMode::Perspective
+            }
         };
         let Ok(mut proj) = camera_q.get_single_mut() else { return };
         *proj = match *proj_mode {
@@ -81,20 +92,10 @@ fn toggle_projection(
                 fov: 1.0, ..default()
             }),
             ProjMode::Orthographic => {
-                let Ok(window) = windows.get_single() else {
-                    return;
-                };
-                let w = window.physical_width() as f32;
-                let h = window.physical_height() as f32;
-                let aspect = w / h;
-                let vh = ortho_scale.0;
-                let vw = vh * aspect;
+                let s = ortho_scale.0;
                 Projection::Orthographic(OrthographicProjection {
-                    scaling_mode: bevy::render::camera::ScalingMode::Fixed {
-                        width: vw, height: vh,
-                    },
-                    near: 0.0,
-                    far: 1000.0,
+                    scaling_mode: bevy::render::camera::ScalingMode::AutoMin { min_width: s, min_height: s },
+                    near: 0.0, far: 1000.0,
                     ..OrthographicProjection::default_3d()
                 })
             }
@@ -114,7 +115,6 @@ fn orbit_camera(
     proj_mode: Res<ProjMode>,
     mut ortho_scale: ResMut<OrthoScale>,
     scene: Option<Res<CrystalScene>>,
-    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     mut input: Local<InputState>,
     mouse_btn: Res<ButtonInput<MouseButton>>,
     mut mouse_motion: EventReader<MouseMotion>,
@@ -142,23 +142,19 @@ fn orbit_camera(
         };
         if *proj_mode == ProjMode::Orthographic {
             ortho_scale.0 = (ortho_scale.0 - dy * ortho_scale.0 * 0.1).clamp(1.0, 200.0);
+            cam_state.radius = ortho_scale.0 / 1.09;  // keep in sync
             // Rebuild ortho projection with new scale
             if let Ok(mut proj) = proj_q.get_single_mut() {
-                if let Ok(window) = windows.get_single() {
-                    let w = window.physical_width() as f32;
-                    let h = window.physical_height() as f32;
-                    let aspect = w / h;
-                    let vh = ortho_scale.0;
-                    let vw = vh * aspect;
-                    *proj = Projection::Orthographic(OrthographicProjection {
-                        scaling_mode: bevy::render::camera::ScalingMode::Fixed { width: vw, height: vh },
-                        near: 0.0, far: 1000.0,
-                        ..OrthographicProjection::default_3d()
-                    });
-                }
+                let s = ortho_scale.0;
+                *proj = Projection::Orthographic(OrthographicProjection {
+                    scaling_mode: bevy::render::camera::ScalingMode::AutoMin { min_width: s, min_height: s },
+                    near: 0.0, far: 1000.0,
+                    ..OrthographicProjection::default_3d()
+                });
             }
         } else {
             cam_state.radius = (cam_state.radius - dy * cam_state.radius * 0.1).clamp(1.0, 100.0);
+            ortho_scale.0 = cam_state.radius * 1.09;  // keep in sync
         }
     }
 
@@ -170,6 +166,7 @@ fn orbit_camera(
             focus: cam_init.focus, radius: cam_init.radius,
             yaw: cam_init.yaw, pitch: cam_init.pitch,
         };
+        ortho_scale.0 = cam_init.radius * 1.09;
     }
 
     let pos = cam_state.focus + spherical(cam_state.radius, cam_state.yaw, cam_state.pitch);
@@ -185,6 +182,105 @@ fn orbit_camera(
 
 fn spherical(r: f32, yaw: f32, pitch: f32) -> Vec3 {
     Vec3::new(r * pitch.cos() * yaw.sin(), r * pitch.sin(), r * pitch.cos() * yaw.cos())
+}
+
+// ── Atom movement ──
+
+fn move_selected_atom(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut picking: ResMut<PickingState>,
+    mut atoms: Query<&mut Transform, With<AtomMarker>>,
+    mut move_state: ResMut<MoveState>,
+    mut crystal: ResMut<CrystalStore>,
+    lattice: Res<LatticeData>,
+    offsets: Res<ImageOffsets>,
+) {
+    if picking.selected < 0 { return; }
+    let i = picking.selected as usize;
+    if i >= picking.parent_indices.len() { return; }
+
+    let step = move_state.step;
+    let mut dx = 0.0_f32;
+    let mut dy = 0.0_f32;
+    let mut dz = 0.0_f32;
+
+    if keys.just_pressed(KeyCode::KeyL) { dx = step; }
+    if keys.just_pressed(KeyCode::KeyJ) { dx = -step; }
+    if keys.just_pressed(KeyCode::KeyU) { dy = step; }
+    if keys.just_pressed(KeyCode::KeyO) { dy = -step; }
+    if keys.just_pressed(KeyCode::KeyI) { dz = step; }
+    if keys.just_pressed(KeyCode::KeyK) { dz = -step; }
+
+    if keys.just_pressed(KeyCode::BracketRight) {
+        move_state.step = match move_state.step {
+            0.01 => 0.05, 0.05 => 0.1, 0.1 => 0.5, 0.5 => 1.0, _ => 0.01,
+        };
+    }
+    if keys.just_pressed(KeyCode::BracketLeft) {
+        move_state.step = match move_state.step {
+            1.0 => 0.5, 0.5 => 0.1, 0.1 => 0.05, 0.05 => 0.01, _ => 1.0,
+        };
+    }
+
+    if dx != 0.0 || dy != 0.0 || dz != 0.0 {
+        let parent = picking.parent_indices[i];
+        let cart_delta = Vec3::new(dx, dy, dz);
+        let frac_delta = Vec3::new(
+            lattice.inv[0].dot(cart_delta),
+            lattice.inv[1].dot(cart_delta),
+            lattice.inv[2].dot(cart_delta),
+        );
+
+        if parent < crystal.data.atoms.len() {
+            // Get current parent coords in fractional space
+            let (mut pf_x, mut pf_y, mut pf_z) = if crystal.data.positions_fractional {
+                (crystal.data.atoms[parent].x, crystal.data.atoms[parent].y, crystal.data.atoms[parent].z)
+            } else {
+                let cart = Vec3::new(crystal.data.atoms[parent].x, crystal.data.atoms[parent].y, crystal.data.atoms[parent].z);
+                (lattice.inv[0].dot(cart), lattice.inv[1].dot(cart), lattice.inv[2].dot(cart))
+            };
+            // Apply fractional delta
+            pf_x += frac_delta.x;
+            pf_y += frac_delta.y;
+            pf_z += frac_delta.z;
+            // Write back in original storage format
+            if crystal.data.positions_fractional {
+                crystal.data.atoms[parent].x = pf_x;
+                crystal.data.atoms[parent].y = pf_y;
+                crystal.data.atoms[parent].z = pf_z;
+            } else {
+                let new_cart = Vec3::new(pf_x, pf_y, pf_z);
+                crystal.data.atoms[parent].x = lattice.vecs[0].x * pf_x + lattice.vecs[1].x * pf_y + lattice.vecs[2].x * pf_z;
+                crystal.data.atoms[parent].y = lattice.vecs[0].y * pf_x + lattice.vecs[1].y * pf_y + lattice.vecs[2].y * pf_z;
+                crystal.data.atoms[parent].z = lattice.vecs[0].z * pf_x + lattice.vecs[1].z * pf_y + lattice.vecs[2].z * pf_z;
+            }
+            crystal.data.modified = true;
+
+            // Regenerate all images in fractional space, convert to Cartesian
+            let parent_frac = Vec3::new(pf_x, pf_y, pf_z);
+            let vecs = &lattice.vecs;
+            let siblings: Vec<usize> = picking.parent_indices.iter().enumerate()
+                .filter(|(_, &p)| p == parent)
+                .map(|(j, _)| j)
+                .collect();
+            for &j in &siblings {
+                let img_frac = parent_frac + offsets.0[j];
+                let cart = img_frac.x * vecs[0] + img_frac.y * vecs[1] + img_frac.z * vecs[2];
+                picking.atom_positions[j] = cart;
+                let entity = picking.atom_entities[j];
+                if let Ok(mut transform) = atoms.get_mut(entity) {
+                    transform.translation = cart;
+                }
+            }
+        }
+
+        picking.modified = true;
+
+        // Auto-save modified positions to JSON
+        if let Err(e) = crystal.data.write_to_file(&crystal.json_path) {
+            eprintln!("  Failed to save modified positions: {}", e);
+        }
+    }
 }
 
 // ── Geometry ──
@@ -226,26 +322,34 @@ fn setup(
         })
     };
 
-    let positions = data.cartesian_positions();
+    let (positions, parent_indices, image_offsets) = data.expand_to_cell();
     let center = data.center();
     let corners = data.cell_corners();
     let edges = CrystalData::cell_edges();
     let n = positions.len();
 
+    commands.insert_resource(LatticeData {
+        vecs: data.lattice.to_vectors(),
+        inv: data.lattice.inverse_vectors(),
+    });
+
     let sphere = meshes.add(uv_sphere(0.5, 32, 32));
     let mut handles = Vec::with_capacity(n);
+    let mut entities = Vec::with_capacity(n);
 
     for (i, pos) in positions.iter().enumerate() {
-        let el = &data.atoms[i].element;
+        let parent = parent_indices[i];
+        let el = &data.atoms[parent].element;
         let color = resources::element_color(el);
         let mat_handle = materials.add(StandardMaterial {
             base_color: color, metallic: 0.2, perceptual_roughness: 0.5, ..default()
         });
-        commands.spawn((
+        let entity = commands.spawn((
             Mesh3d(sphere.clone()), MeshMaterial3d(mat_handle.clone()),
             Transform::from_translation(*pos), AtomMarker,
-        ));
+        )).id();
         handles.push(mat_handle);
+        entities.push(entity);
     }
 
     // Bonds
@@ -254,7 +358,11 @@ fn setup(
         alpha_mode: AlphaMode::Blend, ..default()
     });
     for i in 0..n { for j in (i+1)..n {
-        if resources::has_bond(&data.atoms[i].element, &data.atoms[j].element,
+        // Skip bonds between images of the same parent atom
+        if parent_indices[i] == parent_indices[j] { continue; }
+        let pi = parent_indices[i];
+        let pj = parent_indices[j];
+        if resources::has_bond(&data.atoms[pi].element, &data.atoms[pj].element,
                                 positions[i].distance(positions[j]), 1.2) {
             spawn_bond(&mut commands, &mut meshes, &bond_mat, positions[i], positions[j], BondMarker);
         }
@@ -276,7 +384,15 @@ fn setup(
         ));
     }
 
-    commands.insert_resource(PickingState::new(positions, handles));
+    commands.insert_resource(PickingState::new(positions, handles, entities, parent_indices));
+    commands.insert_resource(ImageOffsets(image_offsets));
+
+    // Store crystal data + path for auto-save on modification
+    commands.insert_resource(CrystalStore {
+        data: data.clone(),
+        json_path: crystal_path.0.clone(),
+    });
+    commands.insert_resource(MoveState { step: 0.1 });
 
     // Atom metadata for UI
     let elements: Vec<String> = data.atoms.iter().map(|a| a.element.clone()).collect();
@@ -284,7 +400,7 @@ fn setup(
         .map(|(_i, a)| if a.label.is_empty() { a.element.clone() } else { a.label.clone() })
         .collect();
     commands.insert_resource(AtomInfo::new(elements, labels));
-    commands.insert_resource(DisplayMode { mode: 1, show_bonds: true, show_cell: true });
+    commands.insert_resource(DisplayMode { mode: 1, show_bonds: false, show_cell: true });
 
     // Crystal metadata for UI
     let fname = if crystal_path.0.is_empty() {
@@ -300,11 +416,24 @@ fn setup(
         alpha: data.lattice.alpha, beta: data.lattice.beta, gamma: data.lattice.gamma,
     });
 
-    // Init camera
-    let radius = 10.0; let yaw = -0.75; let pitch = 0.5;
+    // Compute default ortho scale from cell bounding box
+    let cell_corners = data.cell_corners();
+    let mut cmin = Vec3::splat(f32::MAX);
+    let mut cmax = Vec3::splat(f32::MIN);
+    for c in &cell_corners {
+        cmin = cmin.min(*c);
+        cmax = cmax.max(*c);
+    }
+    let cell_diag = (cmax - cmin).length();
+    let ortho_scale = (cell_diag * 1.3).max(5.0);
+
+    // Init camera (orthographic by default, looking down Z at XY plane)
+    let radius = ortho_scale; let yaw = 0.0; let pitch = 0.0;
     commands.insert_resource(CameraState { focus: center, radius, yaw, pitch });
     commands.insert_resource(CameraInit { focus: center, radius, yaw, pitch });
     commands.insert_resource(CrystalScene { center });
+    commands.insert_resource(ProjMode::Orthographic);
+    commands.insert_resource(OrthoScale(ortho_scale));
 
     commands.spawn((
         DirectionalLight { illuminance: 8000.0, shadows_enabled: false, ..default() },
@@ -314,8 +443,16 @@ fn setup(
         DirectionalLight { illuminance: 2000.0, ..default() },
         Transform::from_xyz(0.0, -5.0, 0.0).looking_at(center, Vec3::Y),
     ));
+
+    // Build orthographic projection (AutoMin auto-adapts to window aspect ratio)
+    let s = ortho_scale;
     commands.spawn((
         Camera3d::default(),
+        Projection::Orthographic(OrthographicProjection {
+            scaling_mode: bevy::render::camera::ScalingMode::AutoMin { min_width: s, min_height: s },
+            near: 0.0, far: 1000.0,
+            ..OrthographicProjection::default_3d()
+        }),
         Transform::from_xyz(10.0, 8.0, 10.0).looking_at(center, Vec3::Y),
         MainCamera,
     ));
@@ -333,6 +470,7 @@ fn spawn_bond(
         MeshMaterial3d(material.clone()),
         Transform::from_translation(mid).with_rotation(Quat::from_rotation_arc(Vec3::Y, dir)),
         marker,
+        Visibility::Hidden,  // hidden by default, press B to show
     ));
 }
 
@@ -387,5 +525,6 @@ fn default_cu_fcc() -> CrystalData {
             crystal::AtomData { element: "Cu".into(), x: 0.0, y: 1.8075, z: 1.8075, label: "4".into() },
         ],
         positions_fractional: false,
+        modified: false,
     }
 }

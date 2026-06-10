@@ -2,11 +2,12 @@ program CASTEP_Suite
     !! CASTEP Suite: CIF-to-CASTEP converter + post-processing tools
     !! Top-level menu dispatches to PreCASTEP (input generation) or PosCASTEP (post-processing)
     use castep_config, only: dp, castep_config_t, cif_data_t, atom_t, &
-        IO_USER_QUIT, MAX_LINE_LEN, default_config, pi
+        IO_USER_QUIT, IO_PRECASTEP_LAUNCH, MAX_LINE_LEN, default_config, pi
     use cell_writer, only: write_cell_file
     use param_writer, only: write_param_file
     use cli_menu, only: run_main_menu
-    use poscastep_menu, only: run_poscastep_menu
+    use poscastep_menu, only: run_poscastep_menu, precastep_cif_data, has_precastep_data, &
+        precastep_source_file, free_cif_data
     use parser, only: parse_cif_inline, parse_pdb_inline, parse_cell_inline, &
         clean_element_symbol
     implicit none
@@ -47,6 +48,14 @@ program CASTEP_Suite
             if (should_exit) exit
         case (2)
             call run_poscastep_menu(istat)
+            if (istat == IO_PRECASTEP_LAUNCH) then
+                if (has_precastep_data) then
+                    call run_precastep_with_cif(precastep_cif_data, should_exit)
+                    has_precastep_data = .false.
+                    call free_cif_data(precastep_cif_data)
+                    if (should_exit) exit
+                end if
+            end if
         case default
             write(*, '(a)') '  Invalid option. Enter 1, 2, or Q.'
         end select
@@ -281,6 +290,142 @@ contains
         write(*, '(a)') ''
         should_exit = .true.
     end subroutine run_precastep_workflow
+
+    ! ── Helper: populate castep_config_t from cif_data_t ──
+    subroutine populate_cfg_from_cif(cif, cfg)
+        type(cif_data_t), intent(in) :: cif
+        type(castep_config_t), intent(inout) :: cfg
+        integer :: i, fidx
+        character(len=256) :: formula_chars
+
+        if (cif%a <= 0.0_dp .or. cif%b <= 0.0_dp .or. cif%c <= 0.0_dp) then
+            write(*, '(a)') '  Error: Missing or invalid cell parameters.'
+            return
+        end if
+        cfg%cell_length(1) = cif%a
+        cfg%cell_length(2) = cif%b
+        cfg%cell_length(3) = cif%c
+        cfg%cell_angle(1)  = cif%alpha
+        cfg%cell_angle(2)  = cif%beta
+        cfg%cell_angle(3)  = cif%gamma
+        write(*, '(a, f10.3, a, f10.3, a, f10.3)') &
+            '  Cell: a=', cif%a, ' b=', cif%b, ' c=', cif%c
+        if (cif%alpha > 0.0_dp .and. cif%beta > 0.0_dp .and. cif%gamma > 0.0_dp) then
+            write(*, '(a, f8.3, a, f8.3, a, f8.3)') &
+                '    alpha=', cif%alpha, ' beta=', cif%beta, ' gamma=', cif%gamma
+        end if
+
+        if (cif%n_atoms == 0) then
+            write(*, '(a)') '  Error: No atom data in structure.'
+            return
+        end if
+
+        cfg%num_atoms = cif%n_atoms
+        allocate(cfg%atom_type(cfg%num_atoms))
+        allocate(cfg%atom_x(cfg%num_atoms))
+        allocate(cfg%atom_y(cfg%num_atoms))
+        allocate(cfg%atom_z(cfg%num_atoms))
+        do i = 1, cif%n_atoms
+            cfg%atom_type(i) = trim(clean_element_symbol(cif%atoms(i)%element))
+            cfg%atom_x(i)    = cif%atoms(i)%x
+            cfg%atom_y(i)    = cif%atoms(i)%y
+            cfg%atom_z(i)    = cif%atoms(i)%z
+        end do
+
+        cfg%cartesian_coords = .not. cif%positions_fractional
+
+        ! Build formula summary
+        formula_chars = ''
+        do i = 1, cif%n_atoms
+            fidx = len_trim(formula_chars) + 1
+            if (fidx + 6 <= len(formula_chars)) then
+                formula_chars(fidx:fidx+5) = ' ' // trim(cif%atoms(i)%element)
+            end if
+        end do
+        cfg%formula_sum = trim(adjustl(formula_chars))
+
+        write(*, '(a, i0)') '  Atoms: ', cif%n_atoms
+
+        write(*, '(a)') '  Computing lattice vectors...'
+        cfg%cell_basis = compute_cartesian_lattice(cfg%cell_length(1), cfg%cell_length(2), &
+                           cfg%cell_length(3), cfg%cell_angle(1), &
+                           cfg%cell_angle(2), cfg%cell_angle(3))
+    end subroutine populate_cfg_from_cif
+
+    ! ── PreCASTEP workflow from in-memory cif_data_t (PosCASTEP option 2) ──
+    subroutine run_precastep_with_cif(cif, should_exit)
+        type(cif_data_t), intent(inout) :: cif
+        logical, intent(out) :: should_exit
+        type(castep_config_t) :: cfg
+        character(len=256) :: iostat_msg
+        integer :: istat
+
+        should_exit = .false.
+        call default_config(cfg)
+
+        write(*, '(a)') ''
+        write(*, '(a)') '  =================================='
+        write(*, '(a)') '        PreCASTEP (from Viewer)'
+        write(*, '(a)') '  =================================='
+
+        ! Populate cfg directly from cif_data_t (no file parsing needed)
+        call populate_cfg_from_cif(cif, cfg)
+
+        ! Use original input file name for output
+        cfg%cif_file_path = trim(precastep_source_file)
+        cfg%cell_output_path = trim(precastep_source_file) // '.cell'
+        cfg%param_output_path = trim(precastep_source_file) // '.param'
+
+        ! Interactive parameter configuration
+        call run_main_menu(cfg, istat)
+        if (istat == IO_USER_QUIT) then
+            write(*, '(a)') '  Configuration cancelled.'
+            return
+        end if
+        if (istat /= 0) then
+            write(*, '(a)') '  Configuration aborted.'
+            return
+        end if
+
+        ! Write output files
+        write(*, '(a)') ''
+        write(*, '(a)') '  Writing CASTEP .cell file: ' // trim(cfg%cell_output_path)
+        call write_cell_file(trim(cfg%cell_output_path), cfg, istat, iomsg=iostat_msg)
+        if (istat /= 0) then
+            write(*, '(a)') '  Error writing .cell file: ' // trim(iostat_msg)
+            return
+        end if
+
+        write(*, '(a)') '  Writing CASTEP .param file: ' // trim(cfg%param_output_path)
+        call write_param_file(trim(cfg%param_output_path), cfg, istat, iomsg=iostat_msg)
+        if (istat /= 0) then
+            write(*, '(a)') '  Error writing .param file: ' // trim(iostat_msg)
+            return
+        end if
+
+        write(*, '(a)') ''
+        write(*, '(a)') '  =================================='
+        write(*, '(a)') '    PreCASTEP conversion complete!'
+        write(*, '(a)') '  =================================='
+        write(*, '(a)') ''
+        write(*, '(a)') '  Summary:'
+        write(*, '(a)') '    Cell parameters:  a=' // trim(real2str_dp(cfg%cell_length(1))) // ' ' // &
+            'b=' // trim(real2str_dp(cfg%cell_length(2))) // ' ' // &
+            'c=' // trim(real2str_dp(cfg%cell_length(3))) // ' Angstrom'
+        write(*, '(a)') '    Cell angles:      alpha=' // trim(real2str_dp(cfg%cell_angle(1))) // ' ' // &
+            'beta=' // trim(real2str_dp(cfg%cell_angle(2))) // ' ' // &
+            'gamma=' // trim(real2str_dp(cfg%cell_angle(3))) // ' deg'
+        write(*, '(a, i0)') '    Atoms:            ', cfg%num_atoms
+        write(*, '(a, a)') '    XC functional:    ', trim(cfg%xc_functional)
+        write(*, '(a, a, a)') '    Cutoff:           ', trim(real2str_dp(cfg%cutoff_energy)), ' eV'
+        write(*, '(a, a)') '    Task:             ', trim(cfg%task_type)
+        write(*, '(a)') ''
+        write(*, '(a)') '  Output files:'
+        write(*, '(a)') '    ' // trim(cfg%cell_output_path)
+        write(*, '(a)') '    ' // trim(cfg%param_output_path)
+        write(*, '(a)') ''
+        should_exit = .true.
+    end subroutine run_precastep_with_cif
 
     pure function real2str_dp(val) result(s)
         real(dp), intent(in) :: val

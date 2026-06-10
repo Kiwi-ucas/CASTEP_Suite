@@ -4,7 +4,7 @@ module poscastep_menu
     !! Currently implements: Plot Band Structure
     use castep_config, only: dp, pi, HARTREE_TO_EV, bands_data_t, pdos_data_t, &
         cif_data_t, MAX_LINE_LEN, IO_INVALID_INPUT, IO_SUCCESS, IO_USER_QUIT, &
-        IO_FILE_NOT_FOUND, IO_PARSE_ERROR, IO_WRITE_ERROR, strip_quotes
+        IO_FILE_NOT_FOUND, IO_PARSE_ERROR, IO_WRITE_ERROR, IO_PRECASTEP_LAUNCH, strip_quotes
     use parser, only: parse_cif_inline, parse_pdb_inline, parse_cell_inline
     use phonon_dos, only: phonon_dos_data_t, parse_phonon_file, compute_phonon_dos, &
         compute_ir_spectrum, compute_raman_spectrum, free_phonon_dos_data
@@ -20,11 +20,11 @@ module poscastep_menu
     use dos_compute, only: compute_total_dos, compute_pdos, N_CHANNELS
     use dos_plotter, only: DOS_MODE_ASCII, DOS_MODE_SVG, DOS_MODE_EXPORT, &
         plot_dos_ascii, write_dos_svg, write_dos_csv, plot_pdos_ascii, write_pdos_csv
-    use crystal_json, only: write_crystal_json_cif
+    use crystal_json, only: write_crystal_json_cif, read_crystal_json_to_cif
     implicit none
     private
 
-    public :: run_poscastep_menu
+    public :: run_poscastep_menu, free_cif_data
 
     integer, parameter :: POS_CONVERTER  = 0
     integer, parameter :: POS_BANDS      = 1
@@ -35,6 +35,11 @@ module poscastep_menu
     integer, parameter :: POS_RAMAN_SPEC = 6
     integer, parameter :: POS_POLARIZABILITY = 7
     integer, parameter :: POS_VIEW_STRUCTURE = -1
+
+    ! Module-level storage for PreCASTEP handoff (option 2: no file on disk)
+    type(cif_data_t), save, public :: precastep_cif_data
+    character(len=MAX_LINE_LEN), save, public :: precastep_source_file = ''
+    logical, save, public :: has_precastep_data = .false.
 
 contains
 
@@ -113,6 +118,7 @@ contains
             case (POS_VIEW_STRUCTURE)
                 call handle_view_structure(iostat)
                 if (iostat == IO_USER_QUIT) return
+                if (iostat == IO_PRECASTEP_LAUNCH) return
             case default
                 write(*, '(a)') '  Invalid option. Enter 0-7, -1, or Q.'
             end select
@@ -1925,7 +1931,6 @@ contains
     subroutine launch_viewer(json_path)
         character(len=*), intent(in) :: json_path
         character(len=MAX_LINE_LEN) :: viewer_cmd
-        integer :: unit, ios
         viewer_cmd = find_viewer()
         if (len_trim(viewer_cmd) == 0) then
             write(*, '(a)') '  crystal-viewer not found.'
@@ -1934,9 +1939,7 @@ contains
         else
             write(*, '(a)') '  Launching Crystal Viewer...'
             call execute_command_line(trim(viewer_cmd) // ' ' // trim(json_path) // ' > /dev/null 2>&1', wait=.true.)
-            ! Clean up generated JSON
-            open(newunit=unit, file=trim(json_path), status='old', iostat=ios)
-            if (ios == 0) close(unit, status='delete')
+            ! JSON cleanup is handled by handle_view_structure after reading modifications
         end if
     end subroutine launch_viewer
 
@@ -1967,12 +1970,13 @@ contains
 
 
     subroutine handle_view_structure(iostat)
-        !! Parse a CIF/PDB/cell file and launch crystal-viewer for 3D rendering
+        !! Parse a CIF/PDB/cell file, launch crystal-viewer, detect modifications
         integer, intent(out) :: iostat
         type(cif_data_t) :: cif
         character(len=MAX_LINE_LEN) :: file_path, json_path, ext
-        integer :: ios
-        logical :: exists
+        character(len=256) :: msg
+        integer :: ios, unit
+        logical :: exists, modified
 
         iostat = 0
 
@@ -2015,6 +2019,9 @@ contains
 
         write(*, '(a,i0,a)') '  Parsed ', cif%n_atoms, ' atoms.'
 
+        ! Remember source file stem for PreCASTEP handoff
+        precastep_source_file = get_file_stem(file_path)
+
         ! ── Write JSON ──
         json_path = trim(file_path) // '.json'
         call write_crystal_json_cif(cif, json_path, ios)
@@ -2027,7 +2034,166 @@ contains
         ! ── Launch viewer ──
         call launch_viewer(json_path)
 
+        ! ── Read back modified structure ──
+        call read_crystal_json_to_cif(json_path, cif, modified, ios, msg)
+        if (ios /= 0) then
+            write(*, '(a,a)') '  Error reading modified structure: ', trim(msg)
+            ! Clean up JSON and return
+            open(newunit=unit, file=trim(json_path), status='old', iostat=ios)
+            if (ios == 0) close(unit, status='delete')
+            return
+        end if
+
+        if (modified) then
+            write(*, '(a)') '  Structure was modified in viewer.'
+            call modified_structure_menu(cif, json_path, iostat)
+        else
+            ! No modifications — delete JSON and return
+            open(newunit=unit, file=trim(json_path), status='old', iostat=ios)
+            if (ios == 0) close(unit, status='delete')
+            call free_cif_data(cif)
+            iostat = 0
+        end if
+
     end subroutine handle_view_structure
+
+
+    subroutine modified_structure_menu(cif, json_path, iostat)
+        !! Sub-menu shown when viewer modified atom positions.
+        !! Option 1: save to file (CIF/PDB/cell)
+        !! Option 2: hand cif_data_t directly to PreCASTEP (no file on disk)
+        type(cif_data_t), intent(inout) :: cif
+        character(len=*), intent(in) :: json_path
+        integer, intent(out) :: iostat
+
+        character(len=MAX_LINE_LEN) :: input, out_path, fmt_label
+        integer :: ios, choice, fmt_choice, menu_choice, unit
+
+        iostat = 0
+
+        do
+            write(*, '(a)') ''
+            write(*, '(a)') '  ================================'
+            write(*, '(a)') '    Structure has been modified'
+            write(*, '(a)') '  ================================'
+            write(*, '(a)') '  1. Save new structure'
+            write(*, '(a)') '  2. Save new structure and PreCASTEP'
+            write(*, '(a)') '  Q. Back'
+            write(*, '(a)', advance='no') '  Select option: '
+
+            read(*, '(a)', iostat=ios) input
+            if (ios /= 0) exit
+
+            if (len_trim(input) >= 1) then
+                if (input(1:1) == 'q' .or. input(1:1) == 'Q') then
+                    iostat = 0
+                    exit
+                end if
+            end if
+
+            read(input, '(I6)', iostat=ios) choice
+            if (ios /= 0) then
+                write(*, '(a)') '  Invalid input. Enter 1, 2, or Q.'
+                cycle
+            end if
+
+            if (choice == 1 .or. choice == 2) then
+                menu_choice = choice  ! save before format selection overwrites it
+
+                if (menu_choice == 2) then
+                    ! Option 2: hand cif_data_t directly to PreCASTEP (no file on disk)
+                    call copy_cif_data(cif, precastep_cif_data)
+                    has_precastep_data = .true.
+                    iostat = IO_PRECASTEP_LAUNCH
+                    exit
+                end if
+
+                ! ── Option 1: Choose output format ──
+                write(*, '(a)') '  Select output format:'
+                write(*, '(a)') '    1. CASTEP .cell'
+                write(*, '(a)') '    2. CIF  (.cif)'
+                write(*, '(a)') '    3. PDB  (.pdb)'
+                write(*, '(a)', advance='no') '    Enter choice: '
+                read(*, '(a)', iostat=ios) input
+                if (ios /= 0) exit
+                read(input, *, iostat=ios) fmt_choice
+                if (ios /= 0 .or. fmt_choice < 1 .or. fmt_choice > 3) then
+                    write(*, '(a)') '  Invalid choice.'
+                    cycle
+                end if
+
+                ! ── Output filename ──
+                write(*, '(a)', advance='no') '  Enter output filename: '
+                read(*, '(a)', iostat=ios) out_path
+                if (ios /= 0) exit
+                out_path = adjustl(out_path)
+                call strip_quotes(out_path)
+                if (len_trim(out_path) == 0) then
+                    write(*, '(a)') '  No filename specified.'
+                    cycle
+                end if
+
+                ! Convert to appropriate coordinate system and write
+                select case (fmt_choice)
+                case (1)  ! .cell (Cartesian)
+                    if (cif%positions_fractional) call convert_to_cartesian(cif, ios)
+                    call ensure_ext(out_path, '.cell')
+                    fmt_label = '.cell (CASTEP)'
+                    call write_cell_simple(cif, trim(out_path), ios, input)
+                case (2)  ! .cif (fractional)
+                    if (.not. cif%positions_fractional) call convert_to_fractional(cif, ios)
+                    call ensure_ext(out_path, '.cif')
+                    fmt_label = '.cif'
+                    call write_cif_file(cif, trim(out_path), ios, input)
+                case (3)  ! .pdb (Cartesian)
+                    if (cif%positions_fractional) call convert_to_cartesian(cif, ios)
+                    call ensure_ext(out_path, '.pdb')
+                    fmt_label = '.pdb'
+                    call write_pdb_file(cif, trim(out_path), ios, input)
+                end select
+
+                if (ios /= 0) then
+                    write(*, '(a)') '  Error writing file.'
+                    cycle
+                end if
+                write(*, '(a,a)') '  Saved as ', trim(out_path)
+
+                iostat = 0
+                exit
+            else
+                write(*, '(a)') '  Invalid option. Enter 1, 2, or Q.'
+            end if
+        end do
+
+        ! Clean up JSON
+        open(newunit=unit, file=trim(json_path), status='old', iostat=ios)
+        if (ios == 0) close(unit, status='delete')
+
+    end subroutine modified_structure_menu
+
+
+    subroutine copy_cif_data(src, dst)
+        !! Deep copy cif_data_t (including allocatable atoms array)
+        type(cif_data_t), intent(in) :: src
+        type(cif_data_t), intent(out) :: dst
+        integer :: n, istat
+
+        dst%a = src%a
+        dst%b = src%b
+        dst%c = src%c
+        dst%alpha = src%alpha
+        dst%beta = src%beta
+        dst%gamma = src%gamma
+        dst%space_group = src%space_group
+        dst%n_atoms = src%n_atoms
+        dst%positions_fractional = src%positions_fractional
+
+        if (allocated(src%atoms)) then
+            n = size(src%atoms)
+            allocate(dst%atoms(n), stat=istat)
+            if (istat == 0) dst%atoms(1:n) = src%atoms(1:n)
+        end if
+    end subroutine copy_cif_data
 
 
     subroutine free_cif_data(data)

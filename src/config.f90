@@ -169,7 +169,8 @@ module castep_config
         IO_BANDS_PARSE_ERROR = 109, &
         IO_PDOS_NOT_FOUND    = 110, &
         IO_PDOS_PARSE_ERROR  = 111, &
-        IO_USER_QUIT     = -1
+        IO_USER_QUIT     = -1, &
+        IO_PRECASTEP_LAUNCH = -2
 
     !! Atom data type
     type :: atom_t

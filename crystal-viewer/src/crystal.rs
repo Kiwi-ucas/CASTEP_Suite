@@ -1,16 +1,18 @@
 //! Crystal structure data types and JSON parsing
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CrystalData {
     pub lattice: Lattice,
     pub atoms: Vec<AtomData>,
     #[serde(default)]
     pub positions_fractional: bool,
+    #[serde(default)]
+    pub modified: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Lattice {
     pub a: f32,
     pub b: f32,
@@ -49,9 +51,52 @@ impl Lattice {
         a * b * c * (1.0 - cos_a * cos_a - cos_b * cos_b - cos_g * cos_g
             + 2.0 * cos_a * cos_b * cos_g).sqrt()
     }
+
+    /// Compute inverse of the 3×3 Cartesian lattice matrix (columns are a, b, c vectors)
+    pub fn inverse_vectors(&self) -> [Vec3; 3] {
+        let [a, b, c] = self.to_vectors();
+        let m = [
+            [a.x, b.x, c.x],
+            [a.y, b.y, c.y],
+            [a.z, b.z, c.z],
+        ];
+        let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+        if det.abs() < 1e-12 {
+            return [Vec3::ZERO, Vec3::ZERO, Vec3::ZERO];
+        }
+        let inv_det = 1.0 / det;
+        let col0 = Vec3::new(
+            (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det,
+            -(m[1][0] * m[2][2] - m[1][2] * m[2][0]) * inv_det,
+            (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det,
+        );
+        let col1 = Vec3::new(
+            -(m[0][1] * m[2][2] - m[0][2] * m[2][1]) * inv_det,
+            (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det,
+            -(m[0][0] * m[2][1] - m[0][1] * m[2][0]) * inv_det,
+        );
+        let col2 = Vec3::new(
+            (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det,
+            -(m[0][0] * m[1][2] - m[0][2] * m[1][0]) * inv_det,
+            (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det,
+        );
+        [col0, col1, col2]
+    }
+
+    /// Convert Cartesian coordinates to fractional
+    pub fn to_fractional(&self, cart: Vec3) -> Vec3 {
+        let inv = self.inverse_vectors();
+        Vec3::new(
+            inv[0].dot(cart),
+            inv[1].dot(cart),
+            inv[2].dot(cart),
+        )
+    }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AtomData {
     pub element: String,
     pub x: f32,
@@ -113,6 +158,60 @@ impl CrystalData {
             sum += *c;
         }
         sum / 8.0
+    }
+}
+
+impl CrystalData {
+    /// Expand asymmetric unit to full unit cell by applying ±1 translations.
+    /// Returns (Cartesian positions, parent indices, fractional offsets).
+    pub fn expand_to_cell(&self) -> (Vec<Vec3>, Vec<usize>, Vec<Vec3>) {
+        let vecs = self.lattice.to_vectors();
+        let inv = self.lattice.inverse_vectors();
+        let mut positions = Vec::new();
+        let mut parents = Vec::new();
+        let mut offsets = Vec::new();
+
+        for (i, atom) in self.atoms.iter().enumerate() {
+            let frac = if self.positions_fractional {
+                Vec3::new(atom.x, atom.y, atom.z)
+            } else {
+                let cart = Vec3::new(atom.x, atom.y, atom.z);
+                Vec3::new(inv[0].dot(cart), inv[1].dot(cart), inv[2].dot(cart))
+            };
+
+            for di in -1..=1_i32 {
+                for dj in -1_i32..=1 {
+                    for dk in -1_i32..=1 {
+                        let offset = Vec3::new(di as f32, dj as f32, dk as f32);
+                        let f = frac + offset;
+                        if f.x >= -0.001 && f.x <= 1.001
+                            && f.y >= -0.001 && f.y <= 1.001
+                            && f.z >= -0.001 && f.z <= 1.001
+                        {
+                            let cart = f.x * vecs[0] + f.y * vecs[1] + f.z * vecs[2];
+                            positions.push(cart);
+                            parents.push(i);
+                            offsets.push(offset);
+                        }
+                    }
+                }
+            }
+        }
+
+        (positions, parents, offsets)
+    }
+
+    /// Serialize to JSON string
+    pub fn to_json(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let json = serde_json::to_string_pretty(self)?;
+        Ok(json)
+    }
+
+    /// Write modified data back to JSON file
+    pub fn write_to_file(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let json = self.to_json()?;
+        std::fs::write(path, json)?;
+        Ok(())
     }
 }
 

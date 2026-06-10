@@ -76,9 +76,13 @@ contains
         iostat = 0
         cif_ready = .false.
 
-        ! Ask CIF path first
-        call ask_input_file('Input structure file path (.cif/.pdb/.cell): ', cfg%cif_file_path, iostat)
-        if (iostat /= 0) return
+        ! Ask CIF path first (skip if atoms already populated e.g. from viewer)
+        if (cfg%num_atoms == 0) then
+            call ask_input_file('Input structure file path (.cif/.pdb/.cell): ', cfg%cif_file_path, iostat)
+            if (iostat /= 0) return
+        else
+            iostat = 0
+        end if
         cif_ready = .true.
 
         do
