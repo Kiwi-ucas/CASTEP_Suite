@@ -36,7 +36,7 @@ impl Lattice {
         let v2 = Vec3::new(b * gamma.cos(), b * gamma.sin(), 0.0);
         let v3_x = c * beta.cos();
         let v3_y = c * (alpha.cos() - beta.cos() * gamma.cos()) / gamma.sin();
-        let v3_z = (c * c - v3_x * v3_x - v3_y * v3_y).sqrt();
+        let v3_z = (c * c - v3_x * v3_x - v3_y * v3_y).max(0.0).sqrt();
         let v3 = Vec3::new(v3_x, v3_y, v3_z.max(0.0));
 
         [v1, v2, v3]
@@ -63,7 +63,7 @@ impl Lattice {
         let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
                 - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
                 + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-        if det.abs() < 1e-12 {
+        if det.abs() < 1e-6 {
             return [Vec3::ZERO, Vec3::ZERO, Vec3::ZERO];
         }
         let inv_det = 1.0 / det;
@@ -85,14 +85,18 @@ impl Lattice {
         [col0, col1, col2]
     }
 
-    /// Convert Cartesian coordinates to fractional
-    pub fn to_fractional(&self, cart: Vec3) -> Vec3 {
-        let inv = self.inverse_vectors();
+    /// Multiply inverse matrix by vector: M⁻¹ * v (rows of M⁻¹ dot v)
+    pub fn apply_inverse(inv: &[Vec3; 3], v: Vec3) -> Vec3 {
         Vec3::new(
-            inv[0].dot(cart),
-            inv[1].dot(cart),
-            inv[2].dot(cart),
+            inv[0].x * v.x + inv[1].x * v.y + inv[2].x * v.z,
+            inv[0].y * v.x + inv[1].y * v.y + inv[2].y * v.z,
+            inv[0].z * v.x + inv[1].z * v.y + inv[2].z * v.z,
         )
+    }
+
+    /// Convert Cartesian coordinates to fractional: frac = M⁻¹ * cart
+    pub fn to_fractional(&self, cart: Vec3) -> Vec3 {
+        Self::apply_inverse(&self.inverse_vectors(), cart)
     }
 }
 
@@ -176,7 +180,7 @@ impl CrystalData {
                 Vec3::new(atom.x, atom.y, atom.z)
             } else {
                 let cart = Vec3::new(atom.x, atom.y, atom.z);
-                Vec3::new(inv[0].dot(cart), inv[1].dot(cart), inv[2].dot(cart))
+                Lattice::apply_inverse(&inv, cart)
             };
 
             for di in -1..=1_i32 {
@@ -184,9 +188,9 @@ impl CrystalData {
                     for dk in -1_i32..=1 {
                         let offset = Vec3::new(di as f32, dj as f32, dk as f32);
                         let f = frac + offset;
-                        if f.x >= -0.001 && f.x <= 1.001
-                            && f.y >= -0.001 && f.y <= 1.001
-                            && f.z >= -0.001 && f.z <= 1.001
+                        if f.x >= -0.001 && f.x < 1.001
+                            && f.y >= -0.001 && f.y < 1.001
+                            && f.z >= -0.001 && f.z < 1.001
                         {
                             let cart = f.x * vecs[0] + f.y * vecs[1] + f.z * vecs[2];
                             positions.push(cart);

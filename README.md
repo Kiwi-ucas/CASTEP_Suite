@@ -12,6 +12,7 @@ A Fortran 2018 CLI toolkit for [CASTEP] DFT calculations — generate input file
 ## Requirements
 
 - **gfortran** >= 7.0 (Fortran 2018)
+- **cargo/rustc** >= 1.75 (for crystal-viewer; Fortran-only builds work without it)
 - **Make**
 - No external libraries
 
@@ -157,6 +158,8 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
   ================================
             PosCASTEP
   ================================
+ -1. View Crystal Structure (3D)
+  0. Format Converter (.cell/.cif/.pdb)
   1. Plot Band Structure
   2. Plot DOS
   3. Plot pDOS
@@ -219,7 +222,22 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
 - Interactive ASCII plot, CSV export
 - Controls: same as total DOS
 
-### 7. Static Polarizability
+### -1. View Crystal Structure (3D) & Format Converter (0)
+
+**View Crystal Structure** launches a standalone 3D crystal viewer (Rust/Bevy):
+
+- Auto-parses CIF, PDB, or CASTEP .cell files
+- **Full unit cell display**: automatic expansion from asymmetric unit (applies ±1 fractional translations)
+- **Interactive 3D**: right-drag to rotate, scroll to zoom, click/hover to select atoms
+- **Atom editing**: select an atom → use IJKLUO keys (±X/±Y/±Z) to move; all symmetry-equivalent copies move in sync
+- **Display modes**: 1=ball-stick, 2=space-filling, 3=wireframe; B=toggle bonds, C=toggle cell frame, P=toggle ortho/perspective
+- **Step size**: `[`/`]` cycles through 0.01/0.05/0.1/0.5/1.0 Å
+- **Modified structure**: on close, if atoms were moved, prompts to (1) save as CIF/PDB/cell or (2) pass directly to PreCASTEP for input generation
+- JSON auto-cleaned after viewing; output files follow original input name
+
+**Format Converter** converts between CIF, PDB, and CASTEP .cell formats.
+
+### 8. Static Polarizability
 
 - Computes static dielectric constant and polarizability via AIMD polarization fluctuation method
 - Combines CASTEP DFPT optical dielectric tensor (ε_∞) with CP2K Berry phase dipole trajectory
@@ -236,23 +254,32 @@ CASTEP_Suite/
 ├── Makefile
 ├── README.md
 ├── CLAUDE.md
-└── src/
-    ├── config.f90           # Types, constants, physical parameters
-    ├── term_utils.f90       # ANSI colors, terminal size, Bresenham, alt screen
-    ├── parser.f90           # CIF / PDB / .cell file parsers
-    ├── cell_writer.f90      # CASTEP .cell file generator (%BLOCK format)
-    ├── param_writer.f90     # CASTEP .param file generator (key-value)
-    ├── bands_parser.f90     # CASTEP .bands file parser
-    ├── bands_plotter.f90    # Band structure ASCII + SVG plotter
-    ├── pdos_parser.f90      # Binary .pdos_bin / .pdos_weights parser
-    ├── phonon_dos.f90       # .phonon parser, phonon DOS, IR & Raman spectra
-    ├── dos_compute.f90      # Gaussian smearing DOS + PDOS computation
-    ├── dos_plotter.f90      # DOS / PDOS ASCII + SVG + CSV plotter
-    ├── cli_menu.f90         # PreCASTEP configuration menu
-    ├── poscastep_menu.f90   # PosCASTEP post-processing menu
-    ├── polarizability.f90   # Static polarizability (AIMD fluctuation method)
-    ├── drift_analysis.f90   # Drift rate diagnostics (not compiled, dev artifact)
-    └── main.f90             # Entry point, suite menu dispatcher
+├── src/
+│   ├── config.f90           # Types, constants, physical parameters
+│   ├── term_utils.f90       # ANSI colors, terminal size, Bresenham, alt screen
+│   ├── parser.f90           # CIF / PDB / .cell file parsers
+│   ├── cell_writer.f90      # CASTEP .cell file generator (%BLOCK format)
+│   ├── param_writer.f90     # CASTEP .param file generator (key-value)
+│   ├── bands_parser.f90     # CASTEP .bands file parser
+│   ├── bands_plotter.f90    # Band structure ASCII + SVG plotter
+│   ├── pdos_parser.f90      # Binary .pdos_bin / .pdos_weights parser
+│   ├── phonon_dos.f90       # .phonon parser, phonon DOS, IR & Raman spectra
+│   ├── dos_compute.f90      # Gaussian smearing DOS + PDOS computation
+│   ├── dos_plotter.f90      # DOS / PDOS ASCII + SVG + CSV plotter
+│   ├── cli_menu.f90         # PreCASTEP configuration menu
+│   ├── poscastep_menu.f90   # PosCASTEP post-processing + viewer integration
+│   ├── crystal_json.f90     # JSON bridge for Rust crystal-viewer
+│   ├── polarizability.f90   # Static polarizability (AIMD fluctuation method)
+│   ├── drift_analysis.f90   # Drift rate diagnostics (not compiled, dev artifact)
+│   └── main.f90             # Entry point, suite menu dispatcher
+└── crystal-viewer/          # Rust/Bevy 3D viewer subproject
+    ├── Cargo.toml
+    └── src/
+        ├── main.rs           # App setup, camera, movement, display modes
+        ├── crystal.rs        # Data types, lattice math, cell expansion
+        ├── picking.rs        # MVP-projection atom picking/highlighting
+        ├── ui.rs             # egui panels (atom list, info, toolbar)
+        └── resources.rs      # Periodic table (radii, CPK/Jmol colors)
 ```
 
 ## Build options

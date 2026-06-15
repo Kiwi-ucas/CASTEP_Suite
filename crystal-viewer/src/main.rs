@@ -5,7 +5,7 @@ mod crystal; mod resources; mod picking; mod ui;
 use bevy::prelude::*;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::render::mesh::{Mesh, Indices, PrimitiveTopology};
-use crystal::CrystalData;
+use crystal::{CrystalData, Lattice};
 use picking::{PickingState, click_pick, hover_pick, highlight_atoms};
 use ui::{AtomInfo, CrystalMeta, ui_system};
 use std::f32::consts::PI;
@@ -56,15 +56,25 @@ struct DisplayMode {
 
 /// Saved initial camera state for R-key reset
 #[derive(Resource)]
-struct CameraInit { focus: Vec3, radius: f32, yaw: f32, pitch: f32 }
+struct CameraInit(CameraState);
 
-#[derive(Resource)]
-pub struct CameraState { pub focus: Vec3, radius: f32, yaw: f32, pitch: f32 }
+#[derive(Resource, Clone)]
+pub struct CameraState { pub focus: Vec3, pub radius: f32, pub yaw: f32, pub pitch: f32 }
 
 #[derive(Default)] struct InputState { rotating: bool }
 
 #[derive(Resource, PartialEq)]
 enum ProjMode { Perspective, Orthographic }
+
+fn ortho_projection(scale: f32) -> Projection {
+    Projection::Orthographic(OrthographicProjection {
+        scaling_mode: bevy::render::camera::ScalingMode::AutoMin {
+            min_width: scale, min_height: scale,
+        },
+        near: -1000.0, far: 1000.0,
+        ..OrthographicProjection::default_3d()
+    })
+}
 
 fn toggle_projection(
     keys: Res<ButtonInput<KeyCode>>,
@@ -91,14 +101,7 @@ fn toggle_projection(
             ProjMode::Perspective => Projection::Perspective(PerspectiveProjection {
                 fov: 1.0, ..default()
             }),
-            ProjMode::Orthographic => {
-                let s = ortho_scale.0;
-                Projection::Orthographic(OrthographicProjection {
-                    scaling_mode: bevy::render::camera::ScalingMode::AutoMin { min_width: s, min_height: s },
-                    near: 0.0, far: 1000.0,
-                    ..OrthographicProjection::default_3d()
-                })
-            }
+            ProjMode::Orthographic => ortho_projection(ortho_scale.0),
         };
     }
 }
@@ -145,12 +148,7 @@ fn orbit_camera(
             cam_state.radius = ortho_scale.0 / 1.09;  // keep in sync
             // Rebuild ortho projection with new scale
             if let Ok(mut proj) = proj_q.get_single_mut() {
-                let s = ortho_scale.0;
-                *proj = Projection::Orthographic(OrthographicProjection {
-                    scaling_mode: bevy::render::camera::ScalingMode::AutoMin { min_width: s, min_height: s },
-                    near: 0.0, far: 1000.0,
-                    ..OrthographicProjection::default_3d()
-                });
+                *proj = ortho_projection(ortho_scale.0);
             }
         } else {
             cam_state.radius = (cam_state.radius - dy * cam_state.radius * 0.1).clamp(1.0, 100.0);
@@ -162,19 +160,24 @@ fn orbit_camera(
         if let Some(s) = scene.as_ref() { cam_state.focus = s.center; cam_state.radius = 10.0; }
     }
     if keys.just_pressed(KeyCode::KeyR) {
-        *cam_state = CameraState {
-            focus: cam_init.focus, radius: cam_init.radius,
-            yaw: cam_init.yaw, pitch: cam_init.pitch,
-        };
-        ortho_scale.0 = cam_init.radius * 1.09;
+        *cam_state = cam_init.0.clone();
+        ortho_scale.0 = cam_init.0.radius * 1.09;
     }
 
     let pos = cam_state.focus + spherical(cam_state.radius, cam_state.yaw, cam_state.pitch);
     cam.translation = pos;
-    cam.look_at(cam_state.focus, Vec3::Y);
+    // Build rotation quaternion directly from yaw/pitch orbit angles.
+    // spherical() maps (yaw,pitch) to offset; camera looks from offset toward focus.
+    // q_pitch rotates -Z (default look) to the pitched direction;
+    // q_yaw then yaws that result around world Y.
+    let q_pitch = Quat::from_rotation_x(-cam_state.pitch);
+    let q_yaw = Quat::from_rotation_y(cam_state.yaw);
+    cam.rotation = q_yaw * q_pitch;
 
     for mut lt in light_q.iter_mut() {
-        let lp = pos + *cam.right() * cam_state.radius * 0.8 + *cam.up() * cam_state.radius * 0.6;
+        let cam_right = cam.rotation * Vec3::X;
+        let cam_up = cam.rotation * Vec3::Y;
+        let lp = pos + cam_right * cam_state.radius * 0.8 + cam_up * cam_state.radius * 0.6;
         lt.translation = lp;
         lt.look_at(cam_state.focus, Vec3::Y);
     }
@@ -225,11 +228,7 @@ fn move_selected_atom(
     if dx != 0.0 || dy != 0.0 || dz != 0.0 {
         let parent = picking.parent_indices[i];
         let cart_delta = Vec3::new(dx, dy, dz);
-        let frac_delta = Vec3::new(
-            lattice.inv[0].dot(cart_delta),
-            lattice.inv[1].dot(cart_delta),
-            lattice.inv[2].dot(cart_delta),
-        );
+        let frac_delta = Lattice::apply_inverse(&lattice.inv, cart_delta);
 
         if parent < crystal.data.atoms.len() {
             // Get current parent coords in fractional space
@@ -237,7 +236,8 @@ fn move_selected_atom(
                 (crystal.data.atoms[parent].x, crystal.data.atoms[parent].y, crystal.data.atoms[parent].z)
             } else {
                 let cart = Vec3::new(crystal.data.atoms[parent].x, crystal.data.atoms[parent].y, crystal.data.atoms[parent].z);
-                (lattice.inv[0].dot(cart), lattice.inv[1].dot(cart), lattice.inv[2].dot(cart))
+                let frac = Lattice::apply_inverse(&lattice.inv, cart);
+                (frac.x, frac.y, frac.z)
             };
             // Apply fractional delta
             pf_x += frac_delta.x;
@@ -249,7 +249,6 @@ fn move_selected_atom(
                 crystal.data.atoms[parent].y = pf_y;
                 crystal.data.atoms[parent].z = pf_z;
             } else {
-                let new_cart = Vec3::new(pf_x, pf_y, pf_z);
                 crystal.data.atoms[parent].x = lattice.vecs[0].x * pf_x + lattice.vecs[1].x * pf_y + lattice.vecs[2].x * pf_z;
                 crystal.data.atoms[parent].y = lattice.vecs[0].y * pf_x + lattice.vecs[1].y * pf_y + lattice.vecs[2].y * pf_z;
                 crystal.data.atoms[parent].z = lattice.vecs[0].z * pf_x + lattice.vecs[1].z * pf_y + lattice.vecs[2].z * pf_z;
@@ -375,7 +374,7 @@ fn setup(
     });
     for (a, b) in edges {
         let s = corners[a]; let e = corners[b];
-        let mid = (s + e) * 0.5; let dir = (e - s).normalize(); let len = s.distance(e);
+        let mid = (s + e) * 0.5; let dir = (e - s).normalize_or_zero(); let len = s.distance(e);
         commands.spawn((
             Mesh3d(meshes.add(Cuboid::new(0.04, 0.04, len))),
             MeshMaterial3d(edge_mat.clone()),
@@ -430,7 +429,7 @@ fn setup(
     // Init camera (orthographic by default, looking down Z at XY plane)
     let radius = ortho_scale; let yaw = 0.0; let pitch = 0.0;
     commands.insert_resource(CameraState { focus: center, radius, yaw, pitch });
-    commands.insert_resource(CameraInit { focus: center, radius, yaw, pitch });
+    commands.insert_resource(CameraInit(CameraState { focus: center, radius, yaw, pitch }));
     commands.insert_resource(CrystalScene { center });
     commands.insert_resource(ProjMode::Orthographic);
     commands.insert_resource(OrthoScale(ortho_scale));
@@ -444,16 +443,10 @@ fn setup(
         Transform::from_xyz(0.0, -5.0, 0.0).looking_at(center, Vec3::Y),
     ));
 
-    // Build orthographic projection (AutoMin auto-adapts to window aspect ratio)
-    let s = ortho_scale;
     commands.spawn((
         Camera3d::default(),
-        Projection::Orthographic(OrthographicProjection {
-            scaling_mode: bevy::render::camera::ScalingMode::AutoMin { min_width: s, min_height: s },
-            near: 0.0, far: 1000.0,
-            ..OrthographicProjection::default_3d()
-        }),
-        Transform::from_xyz(10.0, 8.0, 10.0).looking_at(center, Vec3::Y),
+        ortho_projection(ortho_scale),
+        Transform::default(),
         MainCamera,
     ));
 
@@ -464,7 +457,7 @@ fn spawn_bond(
     commands: &mut Commands, meshes: &mut ResMut<Assets<Mesh>>,
     material: &Handle<StandardMaterial>, a: Vec3, b: Vec3, marker: BondMarker,
 ) {
-    let mid = (a + b) * 0.5; let dir = (b - a).normalize(); let len = a.distance(b);
+    let mid = (a + b) * 0.5; let dir = (b - a).normalize_or_zero(); let len = a.distance(b);
     commands.spawn((
         Mesh3d(meshes.add(Cylinder::new(0.08, len))),
         MeshMaterial3d(material.clone()),

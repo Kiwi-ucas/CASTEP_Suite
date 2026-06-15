@@ -94,10 +94,11 @@ pub fn click_pick(
         if let (Some(start), Some(end)) = (picking.click_start, window.cursor_position()) {
             if start.distance(end) < 5.0 {
                 let vp = camera.logical_viewport_size().unwrap_or(
-                    Vec2::new(window.physical_width() as f32, window.physical_height() as f32)
+                    Vec2::new(window.width() as f32, window.height() as f32)
                 );
                 let mvp = build_mvp(cam_gt, proj);
-                picking.selected = nearest_atom(&mvp, &picking.atom_positions, end, vp, 30.0);
+                let click_dist = vp.y * 0.06;
+                picking.selected = nearest_atom(&mvp, &picking.atom_positions, end, vp, click_dist);
                 if picking.selected >= 0 {
                     let pos = picking.atom_positions[picking.selected as usize];
                     println!("Selected atom {}: ({:.4}, {:.4}, {:.4})", picking.selected, pos.x, pos.y, pos.z);
@@ -120,10 +121,11 @@ pub fn hover_pick(
         Some(c) => c, None => { picking.hovered = -1; return; }
     };
     let vp = camera.logical_viewport_size().unwrap_or(
-        Vec2::new(window.physical_width() as f32, window.physical_height() as f32)
+        Vec2::new(window.width() as f32, window.height() as f32)
     );
     let mvp = build_mvp(cam_gt, proj);
-    picking.hovered = nearest_atom(&mvp, &picking.atom_positions, cursor, vp, 20.0);
+    let hover_dist = vp.y * 0.06;
+    picking.hovered = nearest_atom(&mvp, &picking.atom_positions, cursor, vp, hover_dist);
 }
 
 pub fn highlight_atoms(

@@ -4,23 +4,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-CASTEP Suite is a Fortran 2018 CLI suite with two modes:
+CASTEP Suite is a Fortran 2018 CLI suite with a Rust/Bevy 3D crystal structure viewer:
 
 1. **PreCASTEP** — converts crystallographic structure files (CIF, PDB, .cell) into CASTEP DFT input files (`.cell` and `.param`)
-2. **PosCASTEP** — post-processes CASTEP output: band structure with gap analysis, total DOS, projected DOS (s/p/d/f), phonon DOS, IR spectrum, Raman spectrum, and static polarizability
+2. **PosCASTEP** — post-processes CASTEP output: band structure with gap analysis, total DOS, projected DOS (s/p/d/f), phonon DOS, IR spectrum, Raman spectrum, static polarizability, and 3D crystal structure viewing
+3. **crystal-viewer** — standalone Rust/Bevy 3D viewer for interactive crystal structure visualization, atom picking, and editing (launched from PosCASTEP -1 or standalone)
 
 Launching `./CASTEP_Suite` shows a top-level suite menu. The PreCASTEP mode exits after successful file generation. PosCASTEP returns to its sub-menu (Q. Back) and then to the suite menu (Q. Quit). No `stop` statements remain — all error/recovery paths use `return`.
 
 ## Build
 
 ```bash
-make          # Release build (gfortran, -O2)
+make          # Release build (gfortran -O2 + cargo --release)
 make debug    # Debug build (-O0, -fcheck=all)
 make run      # Build and run
-make clean    # Remove obj/ and CASTEP_Suite binary
+make clean    # Remove obj/, CASTEP_Suite, and crystal-viewer/target/
 ```
 
-Requirements: gfortran >= 7.0, Make.
+Requirements: gfortran >= 7.0, cargo/rustc >= 1.75, Make.
+
+If cargo is not installed, `make` builds Fortran only and skips the viewer.
 
 ## Running
 
@@ -61,7 +64,10 @@ Interactive menu prompts for CIF/PDB/.cell file path via `ask_input_file`, auto-
 
 ### PosCASTEP (option 2)
 
-Post-processing menu for CASTEP output analysis:
+Post-processing menu for CASTEP output analysis and structure visualization:
+- `-1. View Crystal Structure (3D)` — prompts for CIF/PDB/.cell file → auto-generates JSON → launches crystal-viewer (3D interactive rendering, atom picking, editing with 6-direction movement). If the structure was modified in the viewer, shows a sub-menu:
+  - `1. Save new structure` — save as CIF/PDB/cell to file
+  - `2. Save new structure and PreCASTEP` — pass modified structure directly to PreCASTEP (no intermediate file), then configure and generate .cell/.param
 - `1. Plot Band Structure` — prompts for `.bands` file path, then ASCII terminal plot or SVG output
 - `2. Plot DOS` — total density of states from `.bands` only; ASCII (interactive), SVG, or CSV export
 - `3. Plot pDOS` — projected DOS: enter file prefix (e.g. `Cu`), auto-loads `<prefix>.bands` + `<prefix>.pdos_bin` (or `.pdos_weights`); ASCII (interactive) or CSV export with s/p/d/f columns
@@ -106,9 +112,9 @@ At any file path prompt, type `q` to cancel and return to the PosCASTEP menu. Al
 
 ## Architecture
 
-Sixteen source files in `src/` (15 compiled, 1 uncompiled development artifact):
+Seventeen Fortran source files in `src/` (16 compiled, 1 uncompiled development artifact), plus a Rust subproject:
 
-1. **config.f90** — `castep_config` module. Defines kinds (`dp`), physical constants (`HARTREE_TO_EV`), constants (16 task types including `TASK_TRANSITION_STATE='TRANSITIONSTATESEARCH'` for CINEB, 7 CINEB constants for tangent mode + NEB method, 5 XC functionals: PBE/PBEsol/HSE06/PBE0/r2scan, 4 vdW corrections, 3 pseudopotentials, 3 K-point schemes, 3 optimizers, 4 geo tolerance levels, 3 cell opt modes, 2 symmetry modes, phonon constant groups, I/O error codes), max sizes (MAX_ATOMS=10000, MAX_TAGS=5000, MAX_LOOP_ROWS=50000, MAX_SYM_OPS=400), CIF/CASTEP tag names, and types (`atom_t`, `cif_data_t`, `castep_config_t`, `bands_data_t`). Allocatable fields: `cif_data_t%atoms`, `bands_data_t%kpoint_indices`, `bands_data_t%kpoint_coords`, `bands_data_t%kpath_dist`, `bands_data_t%eigenvalues`. CINEB fields in `castep_config_t`: product/intermediate atom arrays (`prod_atom_type/x/y/z`, `interm_atom_type/x/y/z`), CINEB parameters (`cineb_max_images`, `cineb_spring_constant`, `cineb_max_iter`, `cineb_tangent_mode`, `cineb_neb_method`, `cineb_climbing` — all `character(16)` strings; `ts_geom_tolerance`). `scf_tolerance` is `real(dp)` (was `character(32)`). `castep_config_t` has a `final :: finalize_castep_config` procedure that auto-deallocates reactant, product, and intermediate atom arrays on scope exit. Error codes: `IO_FILE_NOT_FOUND=100`…`IO_USER_QUIT=-1`. Physical constants and polarizability error codes moved to `polarizability` module. Provides `default_config`, `new_castep_config`, tag normalization (`normalize_tag`, `compare_tags`), `string_to_real`, `int2str`, `get_castep_task_name`, `strip_quotes`.
+1. **config.f90** — `castep_config` module. Defines kinds (`dp`), physical constants (`HARTREE_TO_EV`), constants (16 task types including `TASK_TRANSITION_STATE='TRANSITIONSTATESEARCH'` for CINEB, 7 CINEB constants for tangent mode + NEB method, 5 XC functionals: PBE/PBEsol/HSE06/PBE0/r2scan, 4 vdW corrections, 3 pseudopotentials, 3 K-point schemes, 3 optimizers, 4 geo tolerance levels, 3 cell opt modes, 2 symmetry modes, phonon constant groups, I/O error codes), max sizes (MAX_ATOMS=10000, MAX_TAGS=5000, MAX_LOOP_ROWS=50000, MAX_SYM_OPS=400), CIF/CASTEP tag names, and types (`atom_t`, `cif_data_t`, `castep_config_t`, `bands_data_t`). Allocatable fields: `cif_data_t%atoms`, `bands_data_t%kpoint_indices`, `bands_data_t%kpoint_coords`, `bands_data_t%kpath_dist`, `bands_data_t%eigenvalues`. CINEB fields in `castep_config_t`: product/intermediate atom arrays (`prod_atom_type/x/y/z`, `interm_atom_type/x/y/z`), CINEB parameters (`cineb_max_images`, `cineb_spring_constant`, `cineb_max_iter`, `cineb_tangent_mode`, `cineb_neb_method`, `cineb_climbing` — all `character(16)` strings; `ts_geom_tolerance`). `scf_tolerance` is `real(dp)` (was `character(32)`). `castep_config_t` has a `final :: finalize_castep_config` procedure that auto-deallocates reactant, product, and intermediate atom arrays on scope exit. Error codes: `IO_FILE_NOT_FOUND=100`…`IO_USER_QUIT=-1`, `IO_PRECASTEP_LAUNCH=-2`. Physical constants and polarizability error codes moved to `polarizability` module. Provides `default_config`, `new_castep_config`, tag normalization (`normalize_tag`, `compare_tags`), `string_to_real`, `int2str`, `get_castep_task_name`, `strip_quotes`.
 
 2. **term_utils.f90** — `term_utils` module. Leaf module (zero dependencies). Provides shared ANSI color constants (`C_RED`, `C_GREEN`, `C_YELLOW`, `C_CYAN`, `C_BOLD`, `C_DIM`, `C_RESET`, `C_AXIS`), alternate screen buffer constants (`C_ALT_ON`/`C_ALT_OFF`), terminal size detection (`get_term_size` + private `stty_size`), Bresenham line-drawing (`draw_line`), and raw terminal mode management (`enter_raw_mode`/`leave_raw_mode` — encapsulate `stty -icanon -echo min 1` + alternate screen buffer on/off). Used by `bands_plotter`, `dos_plotter`, and `poscastep_menu`.
 
@@ -136,9 +142,29 @@ Sixteen source files in `src/` (15 compiled, 1 uncompiled development artifact):
 
 14. **polarizability.f90** — `polarizability` module. Static polarizability via AIMD polarization fluctuation method. Defines `pol_data_t` type (ε_∞ tensor, dipole trajectory, result tensors, unwrap statistics). Public: `parse_castep_epsilon` — extract optical dielectric tensor from `.castep` file, `parse_cp2k_dipoles` — read CP2K Berry phase dipole files via `find | sort` (handles 10k+ files without ARG_MAX overflow), `unwrap_dipoles` — unwrap polarization quantum jumps (raw-to-raw comparison with cumulative offset, nint for multi-quantum), `compute_static_dielectric_windowed` — window-based ε_ion with per-window detrend + median + W→0 extrapolation, `compute_polarizability` — convert ε tensor to α (ų). Private helpers: `detrend_window` (linear detrend), `compute_covariance_single` (3×3 covariance), `median` (selection sort). Module-level constants: `EPSILON_0`, `KBOLTZMANN`, `DEBYE_TO_CM`, `ANG3_TO_M3`, `DEBYE_PER_ANG`. Error codes: `IO_EPS_NOT_FOUND=112`, `IO_EPS_PARSE_ERROR=113`, `IO_DIPOLE_ERROR=114`.
 
-15. **drift_analysis.f90** — `drift_analysis` module (NOT compiled — development artifact for future anisotropic diffusion analysis). Contains `compute_drift_rates` (per-direction linear drift from unwrapped dipoles) and `compute_global_dielectric` (global covariance ε_ion tensor). Depends on `config` + `polarizability`.
+16. **crystal_json.f90** — `crystal_json` module. JSON bridge between Fortran and Rust crystal-viewer. Public: `write_crystal_json` (from `castep_config_t`), `write_crystal_json_cif` (from `cif_data_t` — auto-converts fractional→Cartesian), `read_crystal_json_to_cif` (parse modified JSON back into `cif_data_t`). Private: `lattice_vectors` (Cartesian lattice from cell params), `extract_json_real`, `extract_json_string`. Depends on `castep_config` + `parser`.
 
-16. **main.f90** — `CASTEP_Suite` program. Suite top-level `do` loop (1. PreCASTEP, 2. PosCASTEP, Q. Quit). PreCASTEP logic in `run_precastep_workflow(should_exit)`: init defaults → file recognition → `run_main_menu` → parse reactant → **if CINEB: parse product + intermediate structures with atom-count validation** → compute lattice → write .cell/.param → exit. All `stop` replaced with `return`. Coordinate system data-driven from parser. Helpers: `real2str_dp`, `compute_cartesian_lattice`, `get_file_extension`, `to_lower_inline`.
+17. **drift_analysis.f90** — `drift_analysis` module (NOT compiled — development artifact for future anisotropic diffusion analysis). Contains `compute_drift_rates` (per-direction linear drift from unwrapped dipoles) and `compute_global_dielectric` (global covariance ε_ion tensor). Depends on `config` + `polarizability`.
+
+18. **main.f90** — `CASTEP_Suite` program. Suite top-level `do` loop (1. PreCASTEP, 2. PosCASTEP, Q. Quit). PreCASTEP logic in `run_precastep_workflow(should_exit)`: init defaults → file recognition → `run_main_menu` → parse reactant → **if CINEB: parse product + intermediate structures with atom-count validation** → compute lattice → write .cell/.param → exit. Also contains `run_precastep_with_cif(cif, should_exit)` for viewer→PreCASTEP handoff (no file parsing) and `populate_cfg_from_cif` helper. All `stop` replaced with `return`. Coordinate system data-driven from parser. Helpers: `real2str_dp`, `compute_cartesian_lattice`, `get_file_extension`, `to_lower_inline`.
+
+### Rust crystal-viewer subproject (`crystal-viewer/`)
+
+Standalone Bevy 0.15 3D application (5 source files, ~900 lines):
+
+- **`crystal.rs`** — `CrystalData`, `Lattice`, `AtomData` types with serde JSON. `Lattice::to_vectors()` (Cartesian lattice), `Lattice::inverse_vectors()` (3×3 inverse), `Lattice::apply_inverse()` (M⁻¹ × vector), `CrystalData::expand_to_cell()` (asymmetric→full unit cell via ±1 fractional translations), `to_json()`/`write_to_file()`.
+- **`main.rs`** — App setup, `orbit_camera` (yaw/pitch quaternion, ortho/perspective toggle), `move_selected_atom` (IJKLUO 6-direction movement, `[]` step adjust), `display_mode_system` (1/2/3 ball-stick/space-filling/wireframe, B bonds, C cell), `toggle_projection` (P key), `ortho_projection()` helper. Default: **orthographic projection**, bonds hidden, camera perpendicular to XY plane.
+- **`picking.rs`** — MVP-projection-based atom picking. `PickingState` with parent indices for symmetry-aware selection. `click_pick`/`hover_pick`/`highlight_atoms` (highlights all symmetry-equivalent atoms). Pick radius = 6% of viewport height.
+- **`ui.rs`** — egui panels: left (asymmetric-unit atom list), right (cell params + selected atom details), bottom toolbar (movement controls when atom selected).
+- **`resources.rs`** — Periodic table data: covalent radii and CPK/Jmol colors for element→color mapping.
+
+Key features:
+- **Cell expansion**: asymmetric unit → full unit cell images via ±1 fractional translations
+- **Symmetry-equivalent sync**: moving one atom moves all its equivalent images
+- **Zoom coupling**: perspective radius ↔ orthographic scale (1.09× factor), no jump on P toggle
+- **Non-orthogonal cell support**: correct M⁻¹ × vector (row-based, not column-dot) for triclinic/hexagonal cells
+- **Auto-save**: modified positions written to JSON on each move; Fortran reads back after viewer exits
+- **Profile**: LTO, strip, opt-level="z" → 15 MB binary; auto-cleans intermediate build files
 
 ### Module dependency chain
 
@@ -152,7 +178,8 @@ term_utils    (leaf)
   ├── pdos_parser     (config)
   ├── phonon_dos      (config)
   ├── dos_compute     (config)
-  ├── polarizability  (config)              ← NEW
+  ├── polarizability  (config)
+  ├── crystal_json    (config + parser)
   ├── bands_plotter   (config + term_utils)
   ├── dos_plotter     (config + term_utils)
   ├── cli_menu        (config)          ─┐
@@ -163,11 +190,15 @@ term_utils    (leaf)
                         pdos_parser +     │
                         phonon_dos +      │
                         dos_compute +     │
-                        dos_plotter +    ─┘
-                        polarizability)   ← NEW dep
+                        dos_plotter +     │
+                        polarizability +  │
+                        crystal_json +   ─┘
+                        parser)
   └── main            (config + parser + cell_writer + param_writer
                         + cli_menu + poscastep_menu)
   drift_analysis      (config + polarizability)  ← NOT compiled
+
+crystal-viewer/       (Rust — standalone 3D viewer subproject)
 ```
 
 `cli_menu` and `poscastep_menu` are sibling modules — they share types/utilities from `castep_config` but do not depend on each other. Post-processing code lives in `poscastep_menu` + `bands_parser` + `bands_plotter` + `pdos_parser` + `dos_compute` + `dos_plotter` + `polarizability` + `term_utils`. `drift_analysis` depends on `config` + `polarizability` but is not compiled into the main program — it is a standalone development artifact for future anisotropic diffusion analysis.
@@ -208,6 +239,11 @@ term_utils    (leaf)
 - **Smearing logic** — off → `fix_occupancy : true`; on → `fix_occupancy : false` + `nextra_bands` + `smearing_width`.
 - **vdW sedc** — `sedc_apply : true` + `sedc_scheme : <method>` when vdW ≠ NONE.
 - **Cutoff energy formatting** — integer when whole-number value, otherwise F12.4.
+- **Crystal viewer integration** — PosCASTEP -1 parses CIF/PDB/cell → `write_crystal_json_cif` generates JSON (Cartesian coords) → `launch_viewer` spawns `crystal-viewer` process → `wait=.true.` blocks until viewer closes → `read_crystal_json_to_cif` reads modified JSON → if modified, shows sub-menu → JSON auto-deleted after handling.
+- **Viewer→PreCASTEP handoff** — Option 2 in modified-structure menu copies `cif_data_t` to module-level `precastep_cif_data` in `poscastep_menu`, returns `IO_PRECASTEP_LAUNCH` to main, which calls `run_precastep_with_cif` skipping file parsing. `run_main_menu` skips `ask_input_file` when `cfg%num_atoms > 0`.
+- **Viewer auto-detection** — `find_viewer()` in poscastep_menu searches relative to executable: dev layout (`crystal-viewer/target/release/crystal-viewer`) then release layout (`crystal-viewer` in same dir).
+- **Viewer defaults**: orthographic projection, camera perpendicular to XY (yaw=0, pitch=0), bonds hidden, zoom auto-fit to cell.
+- **Fractional↔Cartesian conversion** — Rust uses row-based M⁻¹×v (not column-dot) for correct non-orthogonal cells. Both Fortran and Rust compute lattice vectors identically.
 
 ## Extending PosCASTEP
 
