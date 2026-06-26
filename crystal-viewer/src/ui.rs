@@ -4,11 +4,16 @@ use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts};
 use crate::picking::PickingState;
 use crate::MoveState;
+use crate::AddAtomState;
+use crate::CrystalStore;
+use crate::Lattice;
+use crate::resources;
 
 #[derive(Resource)]
 pub struct AtomInfo {
     pub elements: Vec<String>,
     pub labels: Vec<String>,
+    pub radii: Vec<f32>,
 }
 
 #[derive(Resource)]
@@ -19,17 +24,19 @@ pub struct CrystalMeta {
 }
 
 impl AtomInfo {
-    pub fn new(elements: Vec<String>, labels: Vec<String>) -> Self {
-        Self { elements, labels }
+    pub fn new(elements: Vec<String>, labels: Vec<String>, radii: Vec<f32>) -> Self {
+        Self { elements, labels, radii }
     }
 }
 
 pub fn ui_system(
     mut contexts: EguiContexts,
     mut picking: ResMut<PickingState>,
-    atom_info: Res<AtomInfo>,
+    mut atom_info: ResMut<AtomInfo>,
     meta: Option<Res<CrystalMeta>>,
     move_state: Option<Res<MoveState>>,
+    mut add_state: ResMut<AddAtomState>,
+    crystal: Option<Res<CrystalStore>>,
 ) {
     let ctx = contexts.ctx_mut();
 
@@ -58,7 +65,7 @@ pub fn ui_system(
                 // Count images for this parent
                 let img_count = picking.parent_indices.iter().filter(|&&x| x == p).count();
                 ui.label(egui::RichText::new(
-                    format!("[Atom {} ({}) selected, {} images]  I/K:\u{b1}Z  J/L:\u{b1}X  U/O:\u{b1}Y  Step:{:.2}\u{c5}  [/]:adjust",
+                    format!("[Atom {} ({}) selected, {} images]  I/K:\u{b1}Z  J/L:\u{b1}X  U/O:\u{b1}Y  Step:{:.2}\u{c5}  [/]:adjust  D:delete",
                         p, el, img_count, step)
                 ).strong());
             } else {
@@ -71,7 +78,7 @@ pub fn ui_system(
     egui::SidePanel::left("atom_list")
         .resizable(true).default_width(180.0)
         .show(ctx, |ui| {
-            ui.heading("Atoms (asym.)");
+            ui.heading("Atoms");
             ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for i in 0..count {
@@ -85,19 +92,39 @@ pub fn ui_system(
                     } else if hovered {
                         text = text.color(egui::Color32::from_rgb(180, 180, 180));
                     }
-                    let response = ui.selectable_label(selected, text);
-                    if response.clicked() {
-                        if let Some(img) = first_images[i] {
-                            picking.selected = img as i32;
+                    ui.horizontal(|ui| {
+                        let response = ui.selectable_label(selected, text);
+                        if response.clicked() {
+                            if let Some(img) = first_images[i] {
+                                picking.selected = img as i32;
+                            }
                         }
-                    }
-                    if response.hovered() {
-                        if let Some(img) = first_images[i] {
-                            picking.hovered = img as i32;
+                        if response.hovered() {
+                            if let Some(img) = first_images[i] {
+                                picking.hovered = img as i32;
+                            }
                         }
-                    }
+                        // Radius edit
+                        if i < atom_info.radii.len() {
+                            let mut r = atom_info.radii[i];
+                            let resp = ui.add(
+                                egui::DragValue::new(&mut r)
+                                    .speed(0.01)
+                                    .range(0.1..=5.0)
+                                    .suffix(" \u{c5}")
+                            );
+                            if resp.changed() && i < atom_info.radii.len() {
+                                atom_info.radii[i] = r;
+                                picking.modified = true;
+                            }
+                        }
+                    });
                 }
             });
+            ui.separator();
+            if ui.button("\u{2795} Add Atom").clicked() {
+                add_state.show_table = true;
+            }
         });
 
     // ── Right panel ──
@@ -115,6 +142,11 @@ pub fn ui_system(
                 ui.label(format!("\u{3b1} = {:.2}\u{b0}", m.alpha));
                 ui.label(format!("\u{3b2} = {:.2}\u{b0}", m.beta));
                 ui.label(format!("\u{3b3} = {:.2}\u{b0}", m.gamma));
+                // Cell volume from lattice
+                if let Some(c) = crystal.as_ref() {
+                    let vol = c.data.lattice.cell_volume();
+                    ui.label(format!("Volume: {:.2} \u{c5}\u{b3}", vol));
+                }
                 ui.label(format!("Asym. atoms: {}", atom_info.elements.len()));
                 ui.label(format!("Displayed: {}", picking.atom_positions.len()));
                 ui.separator();
@@ -129,10 +161,20 @@ pub fn ui_system(
                     ui.label(format!("Element: {}", atom_info.elements[p]));
                     ui.label(format!("Asym. index: {}", p));
                     if picking.selected >= 0 && (picking.selected as usize) < picking.atom_positions.len() {
-                        let pos = picking.atom_positions[picking.selected as usize];
-                        ui.label(format!("Cart X: {:.4}", pos.x));
-                        ui.label(format!("Cart Y: {:.4}", pos.y));
-                        ui.label(format!("Cart Z: {:.4}", pos.z));
+                        let cart = picking.atom_positions[picking.selected as usize];
+                        ui.label("Cartesian (\u{c5}):");
+                        ui.label(format!("  X: {:.4}", cart.x));
+                        ui.label(format!("  Y: {:.4}", cart.y));
+                        ui.label(format!("  Z: {:.4}", cart.z));
+                        // Show fractional coords if lattice data available
+                        if let Some(c) = crystal.as_ref() {
+                            let inv = c.data.lattice.inverse_vectors();
+                            let frac = Lattice::apply_inverse(&inv, cart);
+                            ui.label("Fractional:");
+                            ui.label(format!("  x: {:.4}", frac.x));
+                            ui.label(format!("  y: {:.4}", frac.y));
+                            ui.label(format!("  z: {:.4}", frac.z));
+                        }
                     }
                 }
                 if ui.button("Deselect").clicked() { picking.selected = -1; }
@@ -140,4 +182,111 @@ pub fn ui_system(
                 ui.label("Click an atom\nto see details");
             }
         });
+
+    // ── Add Atom popup: periodic table ──
+    if add_state.show_table {
+        egui::Window::new("Periodic Table — Select Element")
+            .collapsible(false).resizable(false)
+            .default_width(800.0).default_height(400.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let mut pt_map = std::collections::HashMap::new();
+                for &(sym, r, c) in resources::PERIODIC_TABLE {
+                    pt_map.insert((r, c), sym);
+                }
+                let rows = 9;
+                let cols = 18;
+                let cell_size = 36.0;
+                ui.vertical_centered(|ui| {
+                    ui.heading("Periodic Table of Elements");
+                });
+                ui.add_space(6.0);
+                for r in 0..rows {
+                    ui.horizontal(|ui| {
+                        for c in 0..cols {
+                            if let Some(sym) = pt_map.get(&(r, c)) {
+                                let bg = resources::category_color(sym);
+                                let rich = egui::RichText::new(*sym)
+                                    .size(11.0)
+                                    .color(egui::Color32::WHITE);
+                                let btn = egui::Button::new(rich)
+                                    .fill(bg)
+                                    .min_size(egui::vec2(cell_size, cell_size));
+                                if ui.add(btn).clicked() {
+                                    add_state.selected_element = Some(sym.to_string());
+                                    add_state.show_table = false;
+                                    add_state.coord_x = "0.0".into();
+                                    add_state.coord_y = "0.0".into();
+                                    add_state.coord_z = "0.0".into();
+                                }
+                            } else {
+                                ui.add_sized([cell_size, cell_size], egui::Label::new(""));
+                            }
+                        }
+                    });
+                    if r == 6 || r == 7 {
+                        ui.add_space(20.0);
+                    }
+                }
+                ui.add_space(8.0);
+                // Legend
+                ui.horizontal(|ui| {
+                    for (label, color) in [
+                        ("Alkali", egui::Color32::from_rgb(0x8B, 0x3A, 0x3A)),
+                        ("Alk.earth", egui::Color32::from_rgb(0x8B, 0x69, 0x3A)),
+                        ("Transition", egui::Color32::from_rgb(0x3A, 0x5A, 0x7A)),
+                        ("Halogen", egui::Color32::from_rgb(0x3A, 0x6B, 0x3A)),
+                        ("Noble gas", egui::Color32::from_rgb(0x5A, 0x3A, 0x7A)),
+                        ("Non-metal", egui::Color32::from_rgb(0x3A, 0x6B, 0x6B)),
+                        ("Lanthanide", egui::Color32::from_rgb(0x7A, 0x4A, 0x5A)),
+                        ("Actinide", egui::Color32::from_rgb(0x6A, 0x3A, 0x4A)),
+                    ] {
+                        ui.add(egui::Button::new(
+                            egui::RichText::new(label).size(9.0).color(egui::Color32::WHITE)
+                        ).fill(color).min_size(egui::vec2(60.0, 18.0)));
+                    }
+                });
+                ui.add_space(6.0);
+                if ui.button("Cancel").clicked() {
+                    add_state.show_table = false;
+                    add_state.selected_element = None;
+                }
+            });
+    }
+
+    // ── Coordinate input popup ──
+    if !add_state.show_table && add_state.selected_element.is_some() {
+        let el = add_state.selected_element.as_ref().unwrap().clone();
+        egui::Window::new(format!("Add {} atom — fractional coordinates", el))
+            .collapsible(false).resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Fractional coordinates:");
+                ui.horizontal(|ui| {
+                    ui.label("x:"); ui.text_edit_singleline(&mut add_state.coord_x);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("y:"); ui.text_edit_singleline(&mut add_state.coord_y);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("z:"); ui.text_edit_singleline(&mut add_state.coord_z);
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Confirm").clicked() {
+                        if let (Ok(x), Ok(y), Ok(z)) = (
+                            add_state.coord_x.parse::<f32>(),
+                            add_state.coord_y.parse::<f32>(),
+                            add_state.coord_z.parse::<f32>(),
+                        ) {
+                            add_state.pending = Some((el, x, y, z));
+                            add_state.selected_element = None;
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        add_state.selected_element = None;
+                    }
+                });
+            });
+    }
 }

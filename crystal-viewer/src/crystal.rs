@@ -94,10 +94,6 @@ impl Lattice {
         )
     }
 
-    /// Convert Cartesian coordinates to fractional: frac = M⁻¹ * cart
-    pub fn to_fractional(&self, cart: Vec3) -> Vec3 {
-        Self::apply_inverse(&self.inverse_vectors(), cart)
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -115,18 +111,6 @@ impl CrystalData {
         let content = std::fs::read_to_string(path)?;
         let data: CrystalData = serde_json::from_str(&content)?;
         Ok(data)
-    }
-
-    /// Get Cartesian positions for all atoms
-    pub fn cartesian_positions(&self) -> Vec<Vec3> {
-        let vecs = self.lattice.to_vectors();
-        self.atoms.iter().map(|atom| {
-            if self.positions_fractional {
-                atom.x * vecs[0] + atom.y * vecs[1] + atom.z * vecs[2]
-            } else {
-                Vec3::new(atom.x, atom.y, atom.z)
-            }
-        }).collect()
     }
 
     /// Get the cell corner vertices (8 corners)
@@ -203,6 +187,29 @@ impl CrystalData {
         }
 
         (positions, parents, offsets)
+    }
+
+    /// Expand a single atom at fractional coords to cell images
+    pub fn expand_single_atom(&self, frac: Vec3) -> (Vec<Vec3>, Vec<Vec3>) {
+        let vecs = self.lattice.to_vectors();
+        let mut positions = Vec::new();
+        let mut offsets = Vec::new();
+        for di in -1..=1_i32 {
+            for dj in -1..=1 {
+                for dk in -1..=1 {
+                    let off = Vec3::new(di as f32, dj as f32, dk as f32);
+                    let f = frac + off;
+                    if f.x >= -0.001 && f.x < 1.001
+                        && f.y >= -0.001 && f.y < 1.001
+                        && f.z >= -0.001 && f.z < 1.001
+                    {
+                        positions.push(f.x * vecs[0] + f.y * vecs[1] + f.z * vecs[2]);
+                        offsets.push(off);
+                    }
+                }
+            }
+        }
+        (positions, offsets)
     }
 
     /// Serialize to JSON string

@@ -32,6 +32,50 @@ impl PickingState {
             modified: false,
         }
     }
+
+    /// Add new atom images (one or more from cell expansion) for a new parent atom
+    pub fn add_images(
+        &mut self,
+        positions: Vec<Vec3>,
+        handles: Vec<Handle<StandardMaterial>>,
+        entities: Vec<Entity>,
+        parent_idx: usize,
+    ) {
+        let n = positions.len();
+        for entity in entities {
+            self.atom_entities.push(entity);
+        }
+        for pos in positions {
+            self.atom_positions.push(pos);
+        }
+        for handle in handles {
+            self.atom_material_handles.push(handle);
+        }
+        for _ in 0..n {
+            self.parent_indices.push(parent_idx);
+        }
+    }
+
+    /// Remove all images belonging to the given parent atom
+    pub fn remove_images(&mut self, parent_idx: usize) {
+        let mut indices: Vec<usize> = (0..self.parent_indices.len())
+            .filter(|&i| self.parent_indices[i] == parent_idx)
+            .collect();
+        // Remove in descending order to avoid index shifting
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+        for i in indices {
+            self.atom_entities.remove(i);
+            self.atom_positions.remove(i);
+            self.atom_material_handles.remove(i);
+            self.parent_indices.remove(i);
+        }
+        // Renumber parent indices for atoms after the removed one
+        for p in self.parent_indices.iter_mut() {
+            if *p > parent_idx {
+                *p -= 1;
+            }
+        }
+    }
 }
 
 fn build_mvp(cam_gt: &GlobalTransform, proj: &Projection) -> Mat4 {

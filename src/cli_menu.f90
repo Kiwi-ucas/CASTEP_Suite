@@ -786,7 +786,7 @@ contains
             write(*, '(a)') '    1. COARSE'
             write(*, '(a)') '    2. MEDIUM'
             write(*, '(a)') '    3. FINE'
-            write(*, '(a)') '    4. EXTREME (For DFPT Phonon Calculation)'
+            write(*, '(a)') '    4. EXTREME'
             write(*, '(a)') '    Enter choice : '
 
             read(*, '(a)', iostat=ios) input
@@ -1636,8 +1636,8 @@ contains
         iostat = 0
         write(*, '(a)') '  CINEB tangent mode:'
         write(*, '(a)') '    1. NONE'
-        write(*, '(a)') '    2. SPLINE （Accurate）'
-        write(*, '(a)') '    3. HIGH_E'
+        write(*, '(a)') '    2. SPLINE （Smooth）'
+        write(*, '(a)') '    3. HIGH_E （Accurate）'
         write(*, '(a)') '    4. BISECT'
         write(*, '(a)', advance='no') '  Select [1-4]: '
         read(*, '(a)', iostat=ios) input
@@ -1667,7 +1667,7 @@ contains
 
         iostat = 0
         write(*, '(a)') '  CINEB NEB method (optimizer):'
-        write(*, '(a)') '    1. ODE12R (Accurate for Refinement)'
+        write(*, '(a)') '    1. ODE12R (Accurate)'
         write(*, '(a)') '    2. FIRE   (Fast but Coarse)'
         write(*, '(a)') '    3. TPSD   (Medium Cost)'
         write(*, '(a)', advance='no') '  Select [1-3]: '

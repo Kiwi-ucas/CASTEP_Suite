@@ -5,7 +5,19 @@ edition = "2021"
 description = "Interactive 3D crystal structure viewer for CASTEP Suite"
 
 [dependencies]
-bevy = "0.15"
+# Only the Bevy features we actually need (default-features disabled for faster compilation)
+bevy = { version = "0.15", default-features = false, features = [
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_render",
+    "bevy_winit",
+    "bevy_asset",
+    "bevy_window",
+    "bevy_sprite",         # required by bevy_egui
+    "tonemapping_luts",    # required for default Camera3d tonemapping
+    "multi_threaded",
+    "png",
+] }
 bevy_egui = "0.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

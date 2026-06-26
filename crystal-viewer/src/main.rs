@@ -16,12 +16,7 @@ fn main() {
     let json_path = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
     App::new()
-        .add_plugins(
-            DefaultPlugins
-                .build()
-                .disable::<bevy::audio::AudioPlugin>()
-                .disable::<bevy::gilrs::GilrsPlugin>(),
-        )
+        .add_plugins(DefaultPlugins)
         .add_plugins(bevy_egui::EguiPlugin)
         .insert_resource(CrystalPath(json_path.to_string()))
         .add_systems(Startup, setup)
@@ -29,8 +24,9 @@ fn main() {
         .add_systems(Update, (click_pick, hover_pick).chain())
         .add_systems(Update, highlight_atoms)
         .add_systems(Update, move_selected_atom.after(highlight_atoms))
+        .add_systems(Update, (add_atom_system, delete_atom_system))
         .add_systems(Update, ui_system.after(highlight_atoms))
-        .add_systems(Update, display_mode_system)
+        .add_systems(Update, (display_mode_system, sync_atom_radii))
         .add_systems(Update, toggle_projection)
         .run();
 }
@@ -39,7 +35,23 @@ fn main() {
 #[derive(Resource)] struct CrystalScene { center: Vec3 }
 #[derive(Resource, Clone)] struct CrystalStore { data: CrystalData, json_path: String }
 #[derive(Resource)] struct LatticeData { vecs: [Vec3; 3], inv: [Vec3; 3] }
-#[derive(Resource)] struct ImageOffsets(Vec<Vec3>);  // fractional offset for each expanded atom
+#[derive(Resource)] struct ImageOffsets(pub Vec<Vec3>);  // fractional offset for each expanded atom
+
+/// State machine for Add Atom UI flow
+#[derive(Resource, Default)]
+struct AddAtomState {
+    show_table: bool,
+    selected_element: Option<String>,
+    coord_x: String,
+    coord_y: String,
+    coord_z: String,
+    /// (element, frac_x, frac_y, frac_z) — populated by UI, consumed by add_atom_system
+    pending: Option<(String, f32, f32, f32)>,
+    next_id: u32,
+}
+
+#[derive(Resource)]
+struct CachedSphere(Handle<Mesh>);
 #[derive(Resource)] struct MoveState { step: f32 }
 #[derive(Component)] struct MainCamera;
 #[derive(Component)] struct FollowCamera;
@@ -282,6 +294,139 @@ fn move_selected_atom(
     }
 }
 
+fn add_atom_system(
+    mut add_state: ResMut<AddAtomState>,
+    mut crystal: ResMut<CrystalStore>,
+    mut picking: ResMut<PickingState>,
+    mut offsets: ResMut<ImageOffsets>,
+    mut atom_info: ResMut<ui::AtomInfo>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    sphere: Res<CachedSphere>,
+    mut commands: Commands,
+) {
+    let Some((el, fx, fy, fz)) = add_state.pending.take() else { return };
+
+    let label = format!("new_{}", add_state.next_id);
+    add_state.next_id += 1;
+
+    // Append to CrystalData
+    crystal.data.atoms.push(crystal::AtomData {
+        element: el.clone(), x: fx, y: fy, z: fz, label,
+    });
+    crystal.data.modified = true;
+
+    let parent = crystal.data.atoms.len() - 1;
+    let frac = Vec3::new(fx, fy, fz);
+    let (positions, image_offsets) = crystal.data.expand_single_atom(frac);
+
+    // Spawn entities for each image
+    let color = resources::element_color(&el);
+    let mat_handle = materials.add(StandardMaterial {
+        base_color: color, metallic: 0.2, perceptual_roughness: 0.5, ..default()
+    });
+    let mut handles = Vec::new();
+    let mut entities = Vec::new();
+    for pos in &positions {
+        let entity = commands.spawn((
+            Mesh3d(sphere.0.clone()),
+            MeshMaterial3d(mat_handle.clone()),
+            Transform::from_translation(*pos),
+            AtomMarker,
+        )).id();
+        handles.push(mat_handle.clone());
+        entities.push(entity);
+    }
+
+    // Update PickingState
+    picking.add_images(positions, handles, entities, parent);
+
+    // Update ImageOffsets
+    for off in image_offsets {
+        offsets.0.push(off);
+    }
+
+    // Update AtomInfo
+    atom_info.elements.push(el.clone());
+    atom_info.radii.push(resources::covalent_radius(&el));
+
+    // Auto-save
+    crystal.data.modified = true;
+    let _ = crystal.data.write_to_file(&crystal.json_path);
+}
+
+fn sync_atom_radii(
+    atom_info: Res<ui::AtomInfo>,
+    picking: Res<PickingState>,
+    mut atoms: Query<&mut Transform, (With<AtomMarker>, Without<BondMarker>)>,
+    display: Res<DisplayMode>,
+    mut initialized: Local<bool>,
+) {
+    // Skip first-frame change detection (resource insertion triggers is_changed)
+    if !*initialized { *initialized = true; return; }
+    if display.mode != 1 || !atom_info.is_changed() { return; }
+    for (i, mut t) in atoms.iter_mut().enumerate() {
+        if i < picking.parent_indices.len() {
+            let p = picking.parent_indices[i];
+            if p < atom_info.elements.len() && p < atom_info.radii.len() {
+                let default_r = resources::covalent_radius(&atom_info.elements[p]);
+                t.scale = Vec3::splat(atom_info.radii[p] / default_r);
+            }
+        }
+    }
+}
+
+fn delete_atom_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut picking: ResMut<PickingState>,
+    mut crystal: ResMut<CrystalStore>,
+    mut offsets: ResMut<ImageOffsets>,
+    mut atom_info: ResMut<ui::AtomInfo>,
+    mut commands: Commands,
+) {
+    if !keys.just_pressed(KeyCode::KeyD) || picking.selected < 0 { return; }
+    let i = picking.selected as usize;
+    if i >= picking.parent_indices.len() { return; }
+    let parent = picking.parent_indices[i];
+    if parent >= crystal.data.atoms.len() { return; }
+
+    // Collect entities and image-offset indices before mutation
+    let to_despawn: Vec<Entity> = (0..picking.parent_indices.len())
+        .filter(|&j| picking.parent_indices[j] == parent)
+        .map(|j| picking.atom_entities[j])
+        .collect();
+    let off_indices: Vec<usize> = (0..picking.parent_indices.len())
+        .filter(|&j| picking.parent_indices[j] == parent)
+        .collect();
+
+    // Despawn entities
+    for entity in &to_despawn {
+        commands.entity(*entity).despawn();
+    }
+
+    // Remove from ImageOffsets (descending)
+    let mut sorted = off_indices.clone();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    for j in &sorted {
+        offsets.0.remove(*j);
+    }
+
+    // Remove from PickingState (handles renumbering)
+    picking.remove_images(parent);
+
+    // Remove from canonical data
+    crystal.data.atoms.remove(parent);
+    if parent < atom_info.elements.len() {
+        atom_info.elements.remove(parent);
+        atom_info.labels.remove(parent);
+        atom_info.radii.remove(parent);
+    }
+
+    picking.selected = -1;
+    picking.modified = true;
+    crystal.data.modified = true;
+    let _ = crystal.data.write_to_file(&crystal.json_path);
+}
+
 // ── Geometry ──
 
 fn uv_sphere(radius: f32, sec: u32, stk: u32) -> Mesh {
@@ -333,6 +478,7 @@ fn setup(
     });
 
     let sphere = meshes.add(uv_sphere(0.5, 32, 32));
+    commands.insert_resource(CachedSphere(sphere.clone()));
     let mut handles = Vec::with_capacity(n);
     let mut entities = Vec::with_capacity(n);
 
@@ -392,22 +538,25 @@ fn setup(
         json_path: crystal_path.0.clone(),
     });
     commands.insert_resource(MoveState { step: 0.1 });
+    commands.insert_resource(AddAtomState::default());
 
     // Atom metadata for UI
     let elements: Vec<String> = data.atoms.iter().map(|a| a.element.clone()).collect();
     let labels: Vec<String> = data.atoms.iter().enumerate()
         .map(|(_i, a)| if a.label.is_empty() { a.element.clone() } else { a.label.clone() })
         .collect();
-    commands.insert_resource(AtomInfo::new(elements, labels));
+    let radii: Vec<f32> = elements.iter().map(|el| resources::covalent_radius(el)).collect();
+    commands.insert_resource(AtomInfo::new(elements, labels, radii));
     commands.insert_resource(DisplayMode { mode: 1, show_bonds: false, show_cell: true });
 
-    // Crystal metadata for UI
+    // Crystal metadata for UI (strip .json extension from filename)
     let fname = if crystal_path.0.is_empty() {
         "Cu FCC (demo)".to_string()
     } else {
-        std::path::Path::new(&crystal_path.0)
+        let raw = std::path::Path::new(&crystal_path.0)
             .file_name().map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| crystal_path.0.clone())
+            .unwrap_or_else(|| crystal_path.0.clone());
+        raw.strip_suffix(".json").map(|s| s.to_string()).unwrap_or(raw)
     };
     commands.insert_resource(CrystalMeta {
         filename: fname,
@@ -471,30 +620,48 @@ fn display_mode_system(
     keys: Res<ButtonInput<KeyCode>>,
     mut display: ResMut<DisplayMode>,
     mut atoms: Query<&mut Transform, (With<AtomMarker>, Without<BondMarker>)>,
+    picking: Res<PickingState>,
+    atom_info: Res<ui::AtomInfo>,
     bonds: Query<Entity, With<BondMarker>>,
     cells: Query<Entity, With<CellMarker>>,
     mut commands: Commands,
 ) {
-    if keys.just_pressed(KeyCode::Digit1) {
-        display.mode = 1; display.show_bonds = true;
-        // Scale atoms back to normal, show bonds & cell
-        for mut t in atoms.iter_mut() { t.scale = Vec3::ONE; }
-        for e in bonds.iter() { commands.entity(e).insert(Visibility::Visible); }
-        for e in cells.iter() { commands.entity(e).insert(Visibility::Visible); }
-    }
-    if keys.just_pressed(KeyCode::Digit2) {
-        display.mode = 2; display.show_bonds = false;
-        // Space-filling: larger atoms, hide bonds
-        for mut t in atoms.iter_mut() { t.scale = Vec3::splat(2.0); }
-        for e in bonds.iter() { commands.entity(e).insert(Visibility::Hidden); }
-        for e in cells.iter() { commands.entity(e).insert(Visibility::Visible); }
-    }
-    if keys.just_pressed(KeyCode::Digit3) {
-        display.mode = 3;
-        // Wireframe: tiny atoms, show bonds & cell
-        for mut t in atoms.iter_mut() { t.scale = Vec3::splat(0.3); }
-        for e in bonds.iter() { commands.entity(e).insert(Visibility::Visible); }
-        for e in cells.iter() { commands.entity(e).insert(Visibility::Visible); }
+    let update_scales = |mode: &mut u8| -> bool {
+        let changed = matches!(
+            (keys.just_pressed(KeyCode::Digit1), keys.just_pressed(KeyCode::Digit2), keys.just_pressed(KeyCode::Digit3)),
+            (true, _, _) | (_, true, _) | (_, _, true)
+        );
+        if !changed { return false; }
+        if keys.just_pressed(KeyCode::Digit1) { *mode = 1; }
+        if keys.just_pressed(KeyCode::Digit2) { *mode = 2; }
+        if keys.just_pressed(KeyCode::Digit3) { *mode = 3; }
+        true
+    };
+
+    if update_scales(&mut display.mode) {
+        // Collect parent atom scales
+        let n = atom_info.elements.len();
+        let mut scales: Vec<f32> = vec![1.0; n];
+        for i in 0..n {
+            scales[i] = match display.mode {
+                1 => 1.0,   // ball-stick: uniform viewing size
+                2 => resources::ionic_radius(&atom_info.elements[i]) / 0.5,
+                3 => resources::atomic_radius(&atom_info.elements[i]) / 0.5,
+                _ => 1.0,
+            };
+        }
+        for (i, mut t) in atoms.iter_mut().enumerate() {
+            if i < picking.parent_indices.len() {
+                let p = picking.parent_indices[i];
+                if p < scales.len() {
+                    t.scale = Vec3::splat(scales[p]);
+                }
+            }
+        }
+        // Show/hide bonds per mode
+        display.show_bonds = display.mode != 2;
+        let vis = if display.show_bonds { Visibility::Visible } else { Visibility::Hidden };
+        for e in bonds.iter() { commands.entity(e).insert(vis); }
     }
     if keys.just_pressed(KeyCode::KeyB) {
         display.show_bonds = !display.show_bonds;
