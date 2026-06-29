@@ -39,6 +39,7 @@ module poscastep_menu
     ! Module-level storage for PreCASTEP handoff (option 2: no file on disk)
     type(cif_data_t), save, public :: precastep_cif_data
     character(len=MAX_LINE_LEN), save, public :: precastep_source_file = ''
+    character(len=MAX_LINE_LEN), save :: precastep_viewer_file = ''
     logical, save, public :: has_precastep_data = .false.
 
 contains
@@ -1931,6 +1932,7 @@ contains
     subroutine launch_viewer(json_path)
         character(len=*), intent(in) :: json_path
         character(len=MAX_LINE_LEN) :: viewer_cmd
+        integer :: cmdstat
         viewer_cmd = find_viewer()
         if (len_trim(viewer_cmd) == 0) then
             write(*, '(a)') '  crystal-viewer not found.'
@@ -1938,8 +1940,8 @@ contains
             write(*, '(a)') '  Or download from: https://github.com/Kiwi-ucas/CASTEP_Suite/releases'
         else
             write(*, '(a)') '  Launching Crystal Viewer...'
-            call execute_command_line(trim(viewer_cmd) // ' ' // trim(json_path) // ' > /dev/null 2>&1', wait=.true.)
-            ! JSON cleanup is handled by handle_view_structure after reading modifications
+            call execute_command_line(trim(viewer_cmd) // ' "' // trim(json_path) // '" > /dev/null 2> /dev/null', &
+                wait=.true., cmdstat=cmdstat)
         end if
     end subroutine launch_viewer
 
@@ -1949,23 +1951,34 @@ contains
         character(len=MAX_LINE_LEN) :: cmd
         character(len=MAX_LINE_LEN) :: exe_path, exe_dir
         integer :: slash_pos
-        logical :: exists
+        logical :: exists, is_dir
 
         call get_command_argument(0, exe_path)
         slash_pos = index(trim(exe_path), '/', back=.true.)
         if (slash_pos > 0) then
             exe_dir = exe_path(1:slash_pos)
         else
-            exe_dir = ''
+            exe_dir = './'
         end if
         ! 1) Dev layout: crystal-viewer/target/release/crystal-viewer
         cmd = trim(exe_dir) // 'crystal-viewer/target/release/crystal-viewer'
         inquire(file=trim(cmd), exist=exists)
         if (exists) return
-        ! 2) Release layout: crystal-viewer in same directory
+        ! 2) Release layout: crystal-viewer in same directory (skip if dir)
         cmd = trim(exe_dir) // 'crystal-viewer'
         inquire(file=trim(cmd), exist=exists)
-        if (.not. exists) cmd = ''
+        if (exists) then
+            inquire(file=trim(cmd) // '/.', exist=is_dir)
+            if (.not. is_dir) return
+        end if
+        ! 3) Current directory fallback (skip if dir)
+        cmd = './crystal-viewer'
+        inquire(file=trim(cmd), exist=exists)
+        if (exists) then
+            inquire(file=trim(cmd) // '/.', exist=is_dir)
+            if (.not. is_dir) return
+        end if
+        cmd = ''
     end function find_viewer
 
 
@@ -2019,8 +2032,9 @@ contains
 
         write(*, '(a,i0,a)') '  Parsed ', cif%n_atoms, ' atoms.'
 
-        ! Remember source file stem for PreCASTEP handoff
+        ! Remember source file for PreCASTEP handoff and re-edit
         precastep_source_file = get_file_stem(file_path)
+        precastep_viewer_file = trim(file_path)
 
         ! ── Write JSON ──
         json_path = trim(file_path) // '.json'
@@ -2062,12 +2076,15 @@ contains
         !! Sub-menu shown when viewer modified atom positions.
         !! Option 1: save to file (CIF/PDB/cell)
         !! Option 2: hand cif_data_t directly to PreCASTEP (no file on disk)
+        !! Option 3: continue editing current structure
+        !! Option 4: re-edit from original structure file
         type(cif_data_t), intent(inout) :: cif
         character(len=*), intent(in) :: json_path
         integer, intent(out) :: iostat
 
-        character(len=MAX_LINE_LEN) :: input, out_path, fmt_label
+        character(len=MAX_LINE_LEN) :: input, out_path, fmt_label, ext_str
         integer :: ios, choice, fmt_choice, menu_choice, unit
+        logical :: modified
 
         iostat = 0
 
@@ -2077,7 +2094,9 @@ contains
             write(*, '(a)') '    Structure has been modified'
             write(*, '(a)') '  ================================'
             write(*, '(a)') '  1. Save new structure'
-            write(*, '(a)') '  2. Save new structure and PreCASTEP'
+            write(*, '(a)') '  2. Use new structure to PreCASTEP'
+            write(*, '(a)') '  3. Continue to edit structure'
+            write(*, '(a)') '  4. Re-edit from original structure'
             write(*, '(a)') '  Q. Back'
             write(*, '(a)', advance='no') '  Select option: '
 
@@ -2093,7 +2112,7 @@ contains
 
             read(input, '(I6)', iostat=ios) choice
             if (ios /= 0) then
-                write(*, '(a)') '  Invalid input. Enter 1, 2, or Q.'
+                write(*, '(a)') '  Invalid input. Enter 1-4, or Q.'
                 cycle
             end if
 
@@ -2160,12 +2179,69 @@ contains
 
                 iostat = 0
                 exit
+            else if (choice == 3) then
+                ! Option 3: Continue editing — re-launch viewer with current cif
+                call write_crystal_json_cif(cif, json_path, ios)
+                if (ios /= 0) then
+                    write(*, '(a)') '  Error writing JSON file.'; cycle
+                end if
+                call launch_viewer(json_path)
+                call read_crystal_json_to_cif(json_path, cif, modified, ios, input)
+                if (ios /= 0) then
+                    write(*, '(a,a)') '  Error reading modified structure: ', trim(input)
+                    cycle
+                end if
+                if (.not. modified) then
+                    write(*, '(a)') '  No changes made in viewer.'
+                    open(newunit=unit, file=trim(json_path), status='old', iostat=ios)
+                    if (ios == 0) close(unit, status='delete')
+                    call free_cif_data(cif)
+                    iostat = 0
+                    exit
+                end if
+                write(*, '(a)') '  Structure was modified in viewer.'
+                ! Loop back to menu with updated cif
+            else if (choice == 4) then
+                ! Option 4: Re-edit from original — re-parse original file
+                call free_cif_data(cif)
+                ext_str = get_ext_lower(precastep_viewer_file)
+                select case (trim(ext_str))
+                case ('cif');  call parse_cif_inline(trim(precastep_viewer_file), cif, ios)
+                case ('pdb');  call parse_pdb_inline(trim(precastep_viewer_file), cif, ios)
+                case ('cell'); call parse_cell_inline(trim(precastep_viewer_file), cif, ios)
+                case default
+                    write(*, '(a)') '  Unknown original file format.'; cycle
+                end select
+                if (ios /= 0 .or. cif%n_atoms == 0) then
+                    write(*, '(a)') '  Error re-reading original file.'; exit
+                end if
+                write(*, '(a,i0,a)') '  Re-loaded ', cif%n_atoms, ' atoms from original.'
+                call write_crystal_json_cif(cif, json_path, ios)
+                if (ios /= 0) then
+                    write(*, '(a)') '  Error writing JSON file.'; cycle
+                end if
+                call launch_viewer(json_path)
+                call read_crystal_json_to_cif(json_path, cif, modified, ios, input)
+                if (ios /= 0) then
+                    write(*, '(a,a)') '  Error reading modified structure: ', trim(input)
+                    cycle
+                end if
+                if (.not. modified) then
+                    write(*, '(a)') '  No changes made in viewer.'
+                    open(newunit=unit, file=trim(json_path), status='old', iostat=ios)
+                    if (ios == 0) close(unit, status='delete')
+                    call free_cif_data(cif)
+                    iostat = 0
+                    exit
+                end if
+                write(*, '(a)') '  Structure was modified in viewer.'
+                ! Loop back to menu with updated cif
             else
-                write(*, '(a)') '  Invalid option. Enter 1, 2, or Q.'
+                write(*, '(a)') '  Invalid option. Enter 1-4, or Q.'
             end if
         end do
 
-        ! Clean up JSON
+        ! Clean up JSON (only if we're exiting the loop)
         open(newunit=unit, file=trim(json_path), status='old', iostat=ios)
         if (ios == 0) close(unit, status='delete')
 
