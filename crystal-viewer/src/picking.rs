@@ -2,6 +2,7 @@
 
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
+use bevy_egui::EguiContexts;
 
 #[derive(Resource)]
 pub struct PickingState {
@@ -127,7 +128,15 @@ pub fn click_pick(
     mouse_btn: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform, &Projection), With<crate::MainCamera>>,
+    mut contexts: EguiContexts,
 ) {
+    // Ignore 3D picks when cursor is over an egui panel
+    if contexts.ctx_mut().is_pointer_over_area() {
+        if mouse_btn.just_pressed(MouseButton::Left) || mouse_btn.just_released(MouseButton::Left) {
+            picking.click_start = None;
+        }
+        return;
+    }
     let Ok(window) = windows.get_single() else { return };
     let Ok((camera, cam_gt, proj)) = camera_q.get_single() else { return };
 
@@ -157,7 +166,13 @@ pub fn hover_pick(
     mut picking: ResMut<PickingState>,
     windows: Query<&Window, With<PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform, &Projection), With<crate::MainCamera>>,
+    mut contexts: EguiContexts,
 ) {
+    // Clear hover when cursor is over an egui panel
+    if contexts.ctx_mut().is_pointer_over_area() {
+        picking.hovered = -1;
+        return;
+    }
     if picking.click_start.is_some() { return; }
     let Ok(window) = windows.get_single() else { return };
     let Ok((camera, cam_gt, proj)) = camera_q.get_single() else { return };

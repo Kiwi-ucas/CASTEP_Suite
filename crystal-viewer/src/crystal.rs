@@ -10,6 +10,8 @@ pub struct CrystalData {
     pub positions_fractional: bool,
     #[serde(default)]
     pub modified: bool,
+    #[serde(default)]
+    pub phonon_modes: Option<PhononModesData>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -104,6 +106,25 @@ pub struct AtomData {
     pub z: f32,
     #[serde(default)]
     pub label: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct PhononModesData {
+    pub mode_index: u32,
+    pub frequency: f32,
+    pub ir_intensity: f32,
+    pub raman_activity: f32,
+    pub mode_charge_norm: f32,
+    #[serde(default)]
+    pub atom_displacements: Vec<DisplacementData>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct DisplacementData {
+    pub dx: f32,
+    pub dy: f32,
+    pub dz: f32,
+    pub contribution: f32,
 }
 
 impl CrystalData {

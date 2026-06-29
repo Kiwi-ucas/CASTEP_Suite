@@ -6,6 +6,7 @@ module crystal_json
     private
 
     public :: write_crystal_json, write_crystal_json_cif, read_crystal_json_to_cif
+    public :: write_crystal_json_modes
 
 contains
 
@@ -271,5 +272,95 @@ contains
         if (quote_end == 0) return
         str = line(quote_start+1:quote_start+quote_end-1)
     end subroutine extract_json_string
+
+    ! ====================================================================
+    ! Write crystal structure + phonon mode displacement data for viewer
+    ! ====================================================================
+    subroutine write_crystal_json_modes(modes_data, mode_index, json_path, scale_factor, iostat)
+        use phonon_modes, only: phonon_modes_data_t
+        type(phonon_modes_data_t), intent(in) :: modes_data
+        integer, intent(in) :: mode_index
+        character(len=*), intent(in) :: json_path
+        real(dp), intent(in) :: scale_factor
+        integer, intent(out) :: iostat
+
+        real(dp) :: va(3), vb(3), vc(3), x, y, z, dx, dy, dz, contrib
+        integer :: unit, i, m
+
+        iostat = 0
+        m = mode_index
+        if (m < 1 .or. m > modes_data%n_branches) then
+            iostat = 1; return
+        end if
+
+        open(newunit=unit, file=trim(json_path), status='replace', action='write', iostat=iostat)
+        if (iostat /= 0) return
+
+        ! Compute lattice vectors for Cartesian conversion
+        call lattice_vectors(modes_data%cell_a, modes_data%cell_b, modes_data%cell_c, &
+            modes_data%cell_alpha, modes_data%cell_beta, modes_data%cell_gamma, va, vb, vc)
+
+        write(unit, '(a)') '{'
+        write(unit, '(a)') '  "lattice": {'
+        write(unit, '(a,f10.4,a)') '    "a": ', modes_data%cell_a, ','
+        write(unit, '(a,f10.4,a)') '    "b": ', modes_data%cell_b, ','
+        write(unit, '(a,f10.4,a)') '    "c": ', modes_data%cell_c, ','
+        write(unit, '(a,f10.4,a)') '    "alpha": ', modes_data%cell_alpha, ','
+        write(unit, '(a,f10.4,a)') '    "beta": ', modes_data%cell_beta, ','
+        write(unit, '(a,f10.4)') '    "gamma": ', modes_data%cell_gamma
+        write(unit, '(a)') '  },'
+        write(unit, '(a)') '  "positions_fractional": false,'
+        write(unit, '(a)') '  "atoms": ['
+
+        ! Write atoms in Cartesian coordinates
+        do i = 1, modes_data%n_ions
+            x = modes_data%ion_positions_frac(1,i) * va(1) &
+              + modes_data%ion_positions_frac(2,i) * vb(1) &
+              + modes_data%ion_positions_frac(3,i) * vc(1)
+            y = modes_data%ion_positions_frac(1,i) * va(2) &
+              + modes_data%ion_positions_frac(2,i) * vb(2) &
+              + modes_data%ion_positions_frac(3,i) * vc(2)
+            z = modes_data%ion_positions_frac(1,i) * va(3) &
+              + modes_data%ion_positions_frac(2,i) * vb(3) &
+              + modes_data%ion_positions_frac(3,i) * vc(3)
+            write(unit, '(a,a,a,a,f10.6,a,f10.6,a,f10.6,a)', advance='no') &
+                '    { "element": "', trim(modes_data%ion_species(i)), '", ', &
+                '"x": ', x, ', "y": ', y, ', "z": ', z, ' }'
+            if (i < modes_data%n_ions) then
+                write(unit, '(a)') ','
+            else
+                write(unit, '(a)') ''
+            end if
+        end do
+
+        write(unit, '(a)') '  ],'
+        write(unit, '(a)') '  "phonon_modes": {'
+        write(unit, '(a,i0,a)') '    "mode_index": ', mode_index, ','
+        write(unit, '(a,f12.4,a)') '    "frequency": ', modes_data%modes(m)%frequency, ','
+        write(unit, '(a,f12.4,a)') '    "ir_intensity": ', modes_data%modes(m)%ir_intensity, ','
+        write(unit, '(a,f12.4,a)') '    "raman_activity": ', modes_data%modes(m)%raman_activity, ','
+        write(unit, '(a,f12.6,a)') '    "mode_charge_norm": ', modes_data%modes(m)%mode_charge_norm, ','
+        write(unit, '(a)') '    "atom_displacements": ['
+
+        do i = 1, modes_data%n_ions
+            dx = modes_data%modes(m)%displacements(i,1) * scale_factor
+            dy = modes_data%modes(m)%displacements(i,2) * scale_factor
+            dz = modes_data%modes(m)%displacements(i,3) * scale_factor
+            contrib = modes_data%modes(m)%atom_contributions(i)
+            write(unit, '(a,f10.6,a,f10.6,a,f10.6,a,f10.6,a)', advance='no') &
+                '      { "dx": ', dx, ', "dy": ', dy, ', "dz": ', dz, &
+                ', "contribution": ', contrib, ' }'
+            if (i < modes_data%n_ions) then
+                write(unit, '(a)') ','
+            else
+                write(unit, '(a)') ''
+            end if
+        end do
+
+        write(unit, '(a)') '    ]'
+        write(unit, '(a)') '  }'
+        write(unit, '(a)') '}'
+        close(unit)
+    end subroutine write_crystal_json_modes
 
 end module crystal_json

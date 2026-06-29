@@ -7,6 +7,7 @@ use crate::MoveState;
 use crate::AddAtomState;
 use crate::CrystalStore;
 use crate::Lattice;
+use crate::PhononState;
 use crate::resources;
 
 #[derive(Resource)]
@@ -37,6 +38,7 @@ pub fn ui_system(
     move_state: Option<Res<MoveState>>,
     mut add_state: ResMut<AddAtomState>,
     crystal: Option<Res<CrystalStore>>,
+    mut phonon_state: Option<ResMut<PhononState>>,
 ) {
     let ctx = contexts.ctx_mut();
 
@@ -80,6 +82,10 @@ pub fn ui_system(
         .show(ctx, |ui| {
             ui.heading("Atoms");
             ui.separator();
+            if ui.button("\u{2795} Add Atom").clicked() {
+                add_state.show_table = true;
+            }
+            ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for i in 0..count {
                     let label = format!("{:2}. {:3}", i, atom_info.elements[i]);
@@ -121,10 +127,6 @@ pub fn ui_system(
                     });
                 }
             });
-            ui.separator();
-            if ui.button("\u{2795} Add Atom").clicked() {
-                add_state.show_table = true;
-            }
         });
 
     // ── Right panel ──
@@ -177,7 +179,6 @@ pub fn ui_system(
                         }
                     }
                 }
-                if ui.button("Deselect").clicked() { picking.selected = -1; }
             } else {
                 ui.label("Click an atom\nto see details");
             }
@@ -288,5 +289,31 @@ pub fn ui_system(
                     }
                 });
             });
+
+        // ── Phonon mode info panel ──
+        if let Some(ref mut ps) = phonon_state {
+            egui::SidePanel::right("phonon_panel")
+                .resizable(false).default_width(200.0)
+                .show(ctx, |ui| {
+                    ui.heading("Phonon Mode");
+                    ui.separator();
+                    ui.label(format!("Mode: {}", ps.mode_index));
+                    ui.label(format!("Freq: {:.2} cm⁻¹", ps.frequency));
+                    ui.label(format!("IR: {:.4} (D/A)²/amu", ps.ir_intensity));
+                    ui.label(format!("|p_m|: {:.4}", ps.mode_charge_norm));
+                    ui.separator();
+                    ui.label("Arrow scale:");
+                    let mut sf = ps.scale_factor;
+                    if ui.add(egui::Slider::new(&mut sf, 0.1..=10.0)).changed() {
+                        ps.scale_factor = sf;
+                        // Note: scale change requires re-spawning arrows;
+                        // For now, the scale applies on next viewer relaunch
+                    }
+                    let mut show = ps.show_arrows;
+                    if ui.checkbox(&mut show, "Show Arrows").changed() {
+                        ps.show_arrows = show;
+                    }
+                });
+        }
     }
 }

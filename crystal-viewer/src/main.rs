@@ -5,7 +5,8 @@ mod crystal; mod resources; mod picking; mod ui;
 use bevy::prelude::*;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::render::mesh::{Mesh, Indices, PrimitiveTopology};
-use crystal::{CrystalData, Lattice};
+use bevy_egui::EguiContexts;
+use crystal::{CrystalData, Lattice, PhononModesData};
 use picking::{PickingState, click_pick, hover_pick, highlight_atoms};
 use ui::{AtomInfo, CrystalMeta, ui_system};
 use std::f32::consts::PI;
@@ -22,12 +23,12 @@ fn main() {
         .add_systems(Startup, setup)
         .add_systems(Update, orbit_camera)
         .add_systems(Update, (click_pick, hover_pick).chain())
-        .add_systems(Update, highlight_atoms)
+        .add_systems(Update, ui_system)
+        .add_systems(Update, highlight_atoms.after(ui_system))
         .add_systems(Update, move_selected_atom.after(highlight_atoms))
         .add_systems(Update, (add_atom_system, delete_atom_system))
-        .add_systems(Update, ui_system.after(highlight_atoms))
         .add_systems(Update, (display_mode_system, sync_atom_radii))
-        .add_systems(Update, toggle_projection)
+        .add_systems(Update, (toggle_projection, sync_arrow_visibility))
         .run();
 }
 
@@ -58,6 +59,17 @@ struct CachedSphere(Handle<Mesh>);
 #[derive(Component)] struct AtomMarker;
 #[derive(Component)] struct BondMarker;
 #[derive(Component)] struct CellMarker;
+#[derive(Component)] struct DisplacementArrow;
+
+#[derive(Resource, Clone)]
+pub struct PhononState {
+    pub frequency: f32,
+    pub ir_intensity: f32,
+    pub mode_charge_norm: f32,
+    pub mode_index: u32,
+    pub scale_factor: f32,
+    pub show_arrows: bool,
+}
 
 #[derive(Resource)]
 struct DisplayMode {
@@ -130,6 +142,7 @@ fn orbit_camera(
     proj_mode: Res<ProjMode>,
     mut ortho_scale: ResMut<OrthoScale>,
     scene: Option<Res<CrystalScene>>,
+    mut contexts: EguiContexts,
     mut input: Local<InputState>,
     mouse_btn: Res<ButtonInput<MouseButton>>,
     mut mouse_motion: EventReader<MouseMotion>,
@@ -150,7 +163,9 @@ fn orbit_camera(
         }
     }
 
+    let egui_wants = contexts.ctx_mut().is_pointer_over_area();
     for ev in mouse_wheel.read() {
+        if egui_wants { continue; }
         let dy = match ev.unit {
             MouseScrollUnit::Line => ev.y * 0.1,
             MouseScrollUnit::Pixel => ev.y * 0.001,
@@ -529,7 +544,7 @@ fn setup(
         ));
     }
 
-    commands.insert_resource(PickingState::new(positions, handles, entities, parent_indices));
+    commands.insert_resource(PickingState::new(positions.clone(), handles, entities, parent_indices.clone()));
     commands.insert_resource(ImageOffsets(image_offsets));
 
     // Store crystal data + path for auto-save on modification
@@ -583,6 +598,29 @@ fn setup(
     commands.insert_resource(ProjMode::Orthographic);
     commands.insert_resource(OrthoScale(ortho_scale));
 
+    // ── Phonon mode data: store state and spawn displacement arrows ──
+    let phonon_state = if let Some(ref pm) = data.phonon_modes {
+        println!("Phonon mode {}: freq={:.2} cm⁻¹, IR={:.4}, |p_m|={:.4}",
+            pm.mode_index, pm.frequency, pm.ir_intensity, pm.mode_charge_norm);
+        let state = PhononState {
+            frequency: pm.frequency,
+            ir_intensity: pm.ir_intensity,
+            mode_charge_norm: pm.mode_charge_norm,
+            mode_index: pm.mode_index,
+            scale_factor: 1.0,
+            show_arrows: true,
+        };
+        // Spawn displacement arrows
+        spawn_phonon_arrows(&mut commands, &mut meshes, &mut materials, &data, pm, &positions, &parent_indices);
+        Some(state)
+    } else {
+        None
+    };
+    // Always insert the resource (None if no phonon data)
+    if let Some(ps) = phonon_state {
+        commands.insert_resource(ps);
+    }
+
     commands.spawn((
         DirectionalLight { illuminance: 8000.0, shadows_enabled: false, ..default() },
         Transform::default(), FollowCamera,
@@ -600,6 +638,127 @@ fn setup(
     ));
 
     println!("Loaded {} atoms. Right-drag to rotate, scroll to zoom, click to select.", n);
+}
+
+/// Build a cone mesh pointing along +Y (apex at top, base at origin)
+fn cone_mesh(base_radius: f32, height: f32, segments: usize) -> Mesh {
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut indices = Vec::new();
+    let apex = [0.0, height, 0.0];
+    let base_y = 0.0;
+
+    // Base center + ring vertices
+    let base_center_idx = positions.len();
+    positions.push([0.0, base_y, 0.0]);
+    normals.push([0.0, -1.0, 0.0]);
+
+    for s in 0..=segments {
+        let angle = (s as f32 / segments as f32) * 2.0 * std::f32::consts::PI;
+        let x = base_radius * angle.cos();
+        let z = base_radius * angle.sin();
+        positions.push([x, base_y, z]);
+        // Side normal: outward perpendicular to cone surface
+        let slant = base_radius.atan2(height);
+        normals.push([angle.cos() * slant.cos(), slant.sin(), angle.sin() * slant.cos()]);
+    }
+
+    let apex_idx = positions.len();
+    positions.push(apex);
+    normals.push([0.0, 1.0, 0.0]);
+
+    // Base disc (fan)
+    for s in 0..segments {
+        indices.push((base_center_idx + 1 + s) as u32);
+        indices.push((base_center_idx + 1 + (s + 1) % segments) as u32);
+        indices.push(base_center_idx as u32);
+    }
+
+    // Side triangles
+    for s in 0..segments {
+        indices.push((base_center_idx + 1 + s) as u32);
+        indices.push((base_center_idx + 1 + (s + 1) % segments) as u32);
+        indices.push(apex_idx as u32);
+    }
+
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, bevy::asset::RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_indices(Indices::U32(indices));
+    mesh
+}
+
+fn spawn_phonon_arrows(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    data: &CrystalData,
+    pm: &PhononModesData,
+    positions: &[Vec3],
+    parent_indices: &[usize],
+) {
+    let shaft_r = 0.06;
+    let head_r = 0.14;       // cone base radius
+    let head_h = 0.35;       // cone height
+
+    // Map each asymmetric atom to its first cell-image position
+    let n_asym = data.atoms.len();
+    let first_pos: Vec<Vec3> = (0..n_asym)
+        .map(|p| parent_indices.iter().position(|&x| x == p)
+            .map(|idx| positions[idx]).unwrap_or(Vec3::ZERO))
+        .collect();
+
+    let cone = meshes.add(cone_mesh(head_r, head_h, 16));
+
+    for (i, disp) in pm.atom_displacements.iter().enumerate() {
+        if i >= n_asym { break; }
+        let mag = (disp.dx * disp.dx + disp.dy * disp.dy + disp.dz * disp.dz).sqrt();
+        if mag < 1e-8 { continue; }
+
+        let base_pos = first_pos[i];
+        let dir = Vec3::new(disp.dx, disp.dy, disp.dz) / mag;
+        // Shaft extends from atom to (displacement - cone_height)
+        let shaft_len = (mag - head_h).max(0.02);
+        let rot = Quat::from_rotation_arc(Vec3::Y, dir);
+
+        // Color: green (low contribution) → red (high contribution)
+        let contrib = disp.contribution.clamp(0.0, 1.0);
+        let color = if pm.mode_charge_norm > 1e-8 {
+            Color::srgb(0.3 + 0.7 * contrib, 0.8 * (1.0 - contrib), 0.2)
+        } else {
+            Color::srgb(0.8, 0.8, 0.8)
+        };
+
+        let mat = materials.add(StandardMaterial {
+            base_color: color,
+            emissive: LinearRgba::rgb(
+                color.to_linear().red * 1.5,
+                color.to_linear().green * 1.5,
+                color.to_linear().blue * 0.8,
+            ),
+            unlit: true, ..default()
+        });
+
+        if shaft_len > 0.02 {
+            let shaft = meshes.add(Cylinder::new(shaft_r, shaft_len));
+            let shaft_mid = base_pos + dir * shaft_len * 0.5;
+            commands.spawn((
+                Mesh3d(shaft),
+                MeshMaterial3d(mat.clone()),
+                Transform::from_translation(shaft_mid).with_rotation(rot),
+                DisplacementArrow,
+            ));
+        }
+
+        // Cone head: base at end of shaft, pointing outward
+        let head_base = base_pos + dir * shaft_len;
+        commands.spawn((
+            Mesh3d(cone.clone()),
+            MeshMaterial3d(mat.clone()),
+            Transform::from_translation(head_base).with_rotation(rot),
+            DisplacementArrow,
+        ));
+    }
 }
 
 fn spawn_bond(
@@ -686,5 +845,19 @@ fn default_cu_fcc() -> CrystalData {
         ],
         positions_fractional: false,
         modified: false,
+        phonon_modes: None,
+    }
+}
+
+/// Toggle arrow visibility based on PhononState
+fn sync_arrow_visibility(
+    phonon_state: Option<Res<PhononState>>,
+    mut arrow_q: Query<&mut Visibility, With<DisplacementArrow>>,
+) {
+    let Some(state) = phonon_state else { return };
+    if !state.is_changed() { return; }
+    let vis = if state.show_arrows { Visibility::Inherited } else { Visibility::Hidden };
+    for mut v in arrow_q.iter_mut() {
+        *v = vis;
     }
 }

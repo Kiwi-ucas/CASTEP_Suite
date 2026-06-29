@@ -167,6 +167,7 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
   5. Plot IR Spectrum
   6. Plot Raman Spectrum
   7. Static Polarizability
+  8. Phonon Mode Visualization
   Q. Back
 ```
 
@@ -247,6 +248,16 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
 - Outputs: ε_ion, ε_static, α_static (tensors + isotropic scalars)
 - Input: CASTEP `.castep` file, CP2K dipole directory, temperature, MD time step
 
+### 8. Phonon Mode Visualization
+
+- Parses phonon eigenvectors from `.phonon` files and Born effective charges from `.castep` files
+- Decomposes each phonon mode to per-atom contributions using the Born charge formalism: p_m = Σ Z*(κ)·u(κ,m)
+- Launches the 3D crystal viewer with colored displacement arrows showing vibration patterns
+- **Displacement arrows**: cone-tipped cylinders colored by atom contribution (green=low → red=high)
+- **Mode selector**: choose mode by index or jump to the highest-IR-intensity mode
+- Supports `.phonon` files with or without Raman activity column
+- Born charge decomposition is optional — arrows still render without it (in white)
+
 ## Project structure
 
 ```
@@ -264,6 +275,7 @@ CASTEP_Suite/
 │   ├── bands_plotter.f90    # Band structure ASCII + SVG plotter
 │   ├── pdos_parser.f90      # Binary .pdos_bin / .pdos_weights parser
 │   ├── phonon_dos.f90       # .phonon parser, phonon DOS, IR & Raman spectra
+│   ├── phonon_modes.f90     # Eigenvector/Born charge parser, mode decomposition
 │   ├── dos_compute.f90      # Gaussian smearing DOS + PDOS computation
 │   ├── dos_plotter.f90      # DOS / PDOS ASCII + SVG + CSV plotter
 │   ├── cli_menu.f90         # PreCASTEP configuration menu

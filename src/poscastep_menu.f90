@@ -8,6 +8,9 @@ module poscastep_menu
     use parser, only: parse_cif_inline, parse_pdb_inline, parse_cell_inline
     use phonon_dos, only: phonon_dos_data_t, parse_phonon_file, compute_phonon_dos, &
         compute_ir_spectrum, compute_raman_spectrum, free_phonon_dos_data
+    use phonon_modes, only: phonon_modes_data_t, parse_phonon_eigenvectors, &
+        parse_castep_born_charges, compute_mode_decomposition, free_phonon_modes_data
+    use crystal_json, only: write_crystal_json_modes
     use polarizability, only: pol_data_t, parse_castep_file, &
         parse_cp2k_dipoles, unwrap_dipoles, &
         compute_static_dielectric_windowed, &
@@ -34,6 +37,7 @@ module poscastep_menu
     integer, parameter :: POS_IR_SPEC    = 5
     integer, parameter :: POS_RAMAN_SPEC = 6
     integer, parameter :: POS_POLARIZABILITY = 7
+    integer, parameter :: POS_PHONON_MODES  = 8
     integer, parameter :: POS_VIEW_STRUCTURE = -1
 
     ! Module-level storage for PreCASTEP handoff (option 2: no file on disk)
@@ -68,6 +72,7 @@ contains
             write(*, '(a)') '  5. Plot IR Spectrum'
             write(*, '(a)') '  6. Plot Raman Spectrum'
             write(*, '(a)') '  7. Static Polarizability'
+            write(*, '(a)') '  8. Phonon Mode Visualization'
             write(*, '(a)') '  Q. Back'
             write(*, '(a)', advance='no') '  Select option: '
 
@@ -116,12 +121,15 @@ contains
             case (POS_POLARIZABILITY)
                 call handle_polarizability_menu(iostat)
                 if (iostat == IO_USER_QUIT) return
+            case (POS_PHONON_MODES)
+                call handle_phonon_modes_menu(iostat)
+                if (iostat == IO_USER_QUIT) return
             case (POS_VIEW_STRUCTURE)
                 call handle_view_structure(iostat)
                 if (iostat == IO_USER_QUIT) return
                 if (iostat == IO_PRECASTEP_LAUNCH) return
             case default
-                write(*, '(a)') '  Invalid option. Enter 0-7, -1, or Q.'
+                write(*, '(a)') '  Invalid option. Enter 0-8, -1, or Q.'
             end select
         end do
     end subroutine run_poscastep_menu
@@ -1947,13 +1955,33 @@ contains
 
 
     function find_viewer() result(cmd)
-        !! Auto-detect crystal-viewer relative to CASTEP_Suite executable
+        !! Auto-detect crystal-viewer relative to CASTEP_Suite executable.
+        !! Resolves the real executable path so it works regardless of
+        !! which directory the program was launched from.
         character(len=MAX_LINE_LEN) :: cmd
         character(len=MAX_LINE_LEN) :: exe_path, exe_dir
-        integer :: slash_pos
+        integer :: slash_pos, unit, ios
         logical :: exists, is_dir
 
+        ! Resolve real absolute path:
+        ! 1) Use readlink on /proc/self/exe from a subshell where $PPID is our PID
+        call execute_command_line( &
+            'readlink -f /proc/$PPID/exe > /tmp/_fv_tmp 2>/dev/null', exitstat=ios)
+        if (ios == 0) then
+            open(newunit=unit, file='/tmp/_fv_tmp', status='old', action='read', iostat=ios)
+            if (ios == 0) then
+                read(unit, '(a)', iostat=ios) exe_path
+                close(unit, status='delete')
+                if (ios == 0 .and. len_trim(exe_path) > 0) goto 10
+            end if
+        end if
+        ! 2) Fallback: command argument → make absolute with PWD
         call get_command_argument(0, exe_path)
+        if (exe_path(1:1) /= '/') then
+            call get_environment_variable('PWD', cmd, ios)
+            if (ios == 0) exe_path = trim(cmd) // '/' // adjustl(exe_path)
+        end if
+10      continue
         slash_pos = index(trim(exe_path), '/', back=.true.)
         if (slash_pos > 0) then
             exe_dir = exe_path(1:slash_pos)
@@ -1971,7 +1999,11 @@ contains
             inquire(file=trim(cmd) // '/.', exist=is_dir)
             if (.not. is_dir) return
         end if
-        ! 3) Current directory fallback (skip if dir)
+        ! 3) Current directory — dev layout
+        cmd = './crystal-viewer/target/release/crystal-viewer'
+        inquire(file=trim(cmd), exist=exists)
+        if (exists) return
+        ! 4) Current directory — bare binary (skip if dir)
         cmd = './crystal-viewer'
         inquire(file=trim(cmd), exist=exists)
         if (exists) then
@@ -2193,11 +2225,7 @@ contains
                 end if
                 if (.not. modified) then
                     write(*, '(a)') '  No changes made in viewer.'
-                    open(newunit=unit, file=trim(json_path), status='old', iostat=ios)
-                    if (ios == 0) close(unit, status='delete')
-                    call free_cif_data(cif)
-                    iostat = 0
-                    exit
+                    cycle
                 end if
                 write(*, '(a)') '  Structure was modified in viewer.'
                 ! Loop back to menu with updated cif
@@ -2228,11 +2256,7 @@ contains
                 end if
                 if (.not. modified) then
                     write(*, '(a)') '  No changes made in viewer.'
-                    open(newunit=unit, file=trim(json_path), status='old', iostat=ios)
-                    if (ios == 0) close(unit, status='delete')
-                    call free_cif_data(cif)
-                    iostat = 0
-                    exit
+                    cycle
                 end if
                 write(*, '(a)') '  Structure was modified in viewer.'
                 ! Loop back to menu with updated cif
@@ -2270,6 +2294,145 @@ contains
             if (istat == 0) dst%atoms(1:n) = src%atoms(1:n)
         end if
     end subroutine copy_cif_data
+
+
+    ! ====================================================================
+    ! Option 8: Phonon Mode Visualization
+    ! ====================================================================
+    subroutine handle_phonon_modes_menu(iostat)
+        integer, intent(out) :: iostat
+        type(phonon_modes_data_t) :: modes_data
+        character(len=MAX_LINE_LEN) :: fname, castep_path, input, json_path, msg
+        integer :: ios, mode_idx, best_mode
+        real(dp) :: max_ir
+
+        iostat = 0
+
+        ! ── Prompt for .phonon file ──
+        write(*, '(a)', advance='no') '  Enter .phonon file path: '
+        read(*, '(a)', iostat=ios) fname
+        if (ios /= 0) return
+        fname = adjustl(fname); call strip_quotes(fname)
+        if (fname == 'q' .or. fname == 'Q') then
+            iostat = IO_USER_QUIT; return
+        end if
+        if (len_trim(fname) == 0) then
+            write(*, '(a)') '  No file specified.'; return
+        end if
+
+        ! ── Prompt for .castep file ──
+        write(*, '(a)', advance='no') '  Enter companion .castep file path: '
+        read(*, '(a)', iostat=ios) castep_path
+        if (ios /= 0) return
+        castep_path = adjustl(castep_path); call strip_quotes(castep_path)
+        if (castep_path == 'q' .or. castep_path == 'Q') then
+            iostat = IO_USER_QUIT; return
+        end if
+
+        ! ── Parse phonon eigenvectors ──
+        call parse_phonon_eigenvectors(trim(fname), modes_data, ios, msg)
+        if (ios /= 0) then
+            write(*, '(a,a)') '  Error parsing .phonon: ', trim(msg); return
+        end if
+        write(*, '(a,i0,a,i0)') '  Parsed ', modes_data%n_ions, ' ions, ', &
+            modes_data%n_branches, ' branches.'
+
+        ! ── Parse Born charges from .castep ──
+        call parse_castep_born_charges(trim(castep_path), modes_data, ios, msg)
+        if (ios /= 0) then
+            write(*, '(a,a)') '  Warning: ', trim(msg)
+            write(*, '(a)') '  Displacements will be shown without IR decomposition.'
+        end if
+
+        ! ── Compute mode decomposition ──
+        call compute_mode_decomposition(modes_data, ios, msg)
+        if (ios /= 0) then
+            write(*, '(a,a)') '  Error in decomposition: ', trim(msg)
+            call free_phonon_modes_data(modes_data); return
+        end if
+
+        ! ── Find mode with highest IR intensity ──
+        best_mode = 1
+        max_ir = 0.0_dp
+        do ios = 1, modes_data%n_branches
+            if (modes_data%modes(ios)%ir_intensity > max_ir) then
+                max_ir = modes_data%modes(ios)%ir_intensity
+                best_mode = ios
+            end if
+        end do
+
+        ! ── Print mode list summary ──
+        write(*, '(a)') ''
+        write(*, '(a)') '  ============================================================'
+        write(*, '(a)') '         Phonon Mode Summary'
+        write(*, '(a,i0,a,i0,a)') '         ', modes_data%n_ions, ' ions, ', &
+            modes_data%n_branches, ' branches'
+        write(*, '(a)') '  ============================================================'
+        write(*, '(a)') ''
+        write(*, '(a)') '  Mode     Freq/cm⁻¹      IR Int.      |p_mode|'
+        write(*, '(a)') '  ────     ─────────      ───────      ────────'
+        do ios = 1, min(20, modes_data%n_branches)
+            if (ios == best_mode) then
+                write(*, '(a,i4,a,f13.2,a,f11.4,a,f11.4,a)') &
+                    ' ▶', ios, '   ', modes_data%modes(ios)%frequency, '   ', &
+                    modes_data%modes(ios)%ir_intensity, '   ', &
+                    modes_data%modes(ios)%mode_charge_norm, &
+                    '  ◀ highest IR'
+            else
+                write(*, '(a,i4,a,f13.2,a,f11.4,a,f11.4)') &
+                    '  ', ios, '   ', modes_data%modes(ios)%frequency, '   ', &
+                    modes_data%modes(ios)%ir_intensity, '   ', &
+                    modes_data%modes(ios)%mode_charge_norm
+            end if
+        end do
+        if (modes_data%n_branches > 20) then
+            write(*, '(a,i0,a)') '   ... (', modes_data%n_branches - 20, ' more modes)'
+        end if
+        write(*, '(a)') ''
+        write(*, '(a,i0,a,f12.4,a)') '  ▶ Mode ', best_mode, &
+            ' has highest IR intensity (', max_ir, ')'
+        write(*, '(a)') ''
+
+        ! ── Mode selection loop ──
+        json_path = '_crystal_viewer_temp.json'
+        do
+            write(*, '(a,i0,a)') '  Enter mode number (1-', modes_data%n_branches, &
+                ', H=highest, Q=return): '
+            write(*, '(a)', advance='no') '  > '
+            read(*, '(a)', iostat=ios) input
+            if (ios /= 0) exit
+            input = adjustl(input)
+
+            if (input(1:1) == 'q' .or. input(1:1) == 'Q') then
+                iostat = 0; exit
+            end if
+            if (input(1:1) == 'h' .or. input(1:1) == 'H') then
+                mode_idx = best_mode
+            else
+                read(input, *, iostat=ios) mode_idx
+            end if
+
+            if (ios /= 0 .or. mode_idx < 1 .or. mode_idx > modes_data%n_branches) then
+                write(*, '(a,i0,a)') '  Invalid. Enter 1-', modes_data%n_branches, &
+                    ', H, or Q.'
+                cycle
+            end if
+
+            write(*, '(a,i0,a,f10.4,a,f10.4)') '  Mode ', mode_idx, &
+                ': freq=', modes_data%modes(mode_idx)%frequency, ' cm-1, IR=', &
+                modes_data%modes(mode_idx)%ir_intensity
+
+            ! Write JSON and launch viewer
+            call write_crystal_json_modes(modes_data, mode_idx, json_path, 2.0_dp, ios)
+            if (ios /= 0) then
+                write(*, '(a)') '  Error writing JSON file.'; cycle
+            end if
+            call launch_viewer(json_path)
+        end do
+
+        ! Cleanup
+        call free_phonon_modes_data(modes_data)
+    end subroutine handle_phonon_modes_menu
 
 
     subroutine free_cif_data(data)

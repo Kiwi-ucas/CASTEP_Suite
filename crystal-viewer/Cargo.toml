@@ -17,6 +17,8 @@ bevy = { version = "0.15", default-features = false, features = [
     "tonemapping_luts",    # required for default Camera3d tonemapping
     "multi_threaded",
     "png",
+    "x11",                 # X11 display support
+    "wayland",             # Wayland display support
 ] }
 bevy_egui = "0.32"
 serde = { version = "1", features = ["derive"] }
