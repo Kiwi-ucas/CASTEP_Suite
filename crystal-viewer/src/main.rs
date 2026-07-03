@@ -33,7 +33,6 @@ fn main() {
 }
 
 #[derive(Resource)] struct CrystalPath(String);
-#[derive(Resource)] struct CrystalScene { center: Vec3 }
 #[derive(Resource, Clone)] struct CrystalStore { data: CrystalData, json_path: String }
 #[derive(Resource)] struct LatticeData { vecs: [Vec3; 3], inv: [Vec3; 3] }
 #[derive(Resource)] struct ImageOffsets(pub Vec<Vec3>);  // fractional offset for each expanded atom
@@ -83,7 +82,7 @@ struct DisplayMode {
 struct CameraInit(CameraState);
 
 #[derive(Resource, Clone)]
-pub struct CameraState { pub focus: Vec3, pub radius: f32, pub yaw: f32, pub pitch: f32 }
+pub struct CameraState { pub focus: Vec3, pub radius: f32, pub rot: Quat }
 
 #[derive(Default)] struct InputState { rotating: bool }
 
@@ -141,7 +140,6 @@ fn orbit_camera(
     cam_init: Res<CameraInit>,
     proj_mode: Res<ProjMode>,
     mut ortho_scale: ResMut<OrthoScale>,
-    scene: Option<Res<CrystalScene>>,
     mut contexts: EguiContexts,
     mut input: Local<InputState>,
     mouse_btn: Res<ButtonInput<MouseButton>>,
@@ -151,19 +149,23 @@ fn orbit_camera(
 ) {
     let Ok(mut cam) = camera_q.get_single_mut() else { return };
 
-    // Right mouse → rotate (no limit on pitch for infinite rotation)
+    // Right mouse → rotate using local axes (no gimbal lock)
     if mouse_btn.just_pressed(MouseButton::Right) { input.rotating = true; }
     if mouse_btn.just_released(MouseButton::Right) { input.rotating = false; }
 
     for motion in mouse_motion.read() {
         let d = motion.delta;
         if input.rotating {
-            cam_state.yaw -= d.x * 0.005;
-            cam_state.pitch += d.y * 0.005;   // no clamp — infinite rotation
+            let right = cam_state.rot * Vec3::X;
+            let up    = cam_state.rot * Vec3::Y;
+            let delta = Quat::from_axis_angle(right, -d.y * 0.005)
+                      * Quat::from_axis_angle(up,    -d.x * 0.005);
+            cam_state.rot = (delta * cam_state.rot).normalize();
         }
     }
 
-    let egui_wants = contexts.ctx_mut().is_pointer_over_area();
+    let ctx = contexts.ctx_mut();
+    let egui_wants = ctx.is_pointer_over_area() || ctx.wants_pointer_input();
     for ev in mouse_wheel.read() {
         if egui_wants { continue; }
         let dy = match ev.unit {
@@ -183,23 +185,21 @@ fn orbit_camera(
         }
     }
 
-    if keys.just_pressed(KeyCode::KeyF) {
-        if let Some(s) = scene.as_ref() { cam_state.focus = s.center; cam_state.radius = 10.0; }
-    }
     if keys.just_pressed(KeyCode::KeyR) {
         *cam_state = cam_init.0.clone();
         ortho_scale.0 = cam_init.0.radius * 1.09;
+        if let Ok(mut proj) = proj_q.get_single_mut() {
+            if *proj_mode == ProjMode::Orthographic {
+                *proj = ortho_projection(ortho_scale.0);
+            }
+        }
     }
 
-    let pos = cam_state.focus + spherical(cam_state.radius, cam_state.yaw, cam_state.pitch);
+    // Camera position: from focus, step back radius units along forward (-Z) direction
+    let forward = cam_state.rot * Vec3::NEG_Z;
+    let pos = cam_state.focus - forward * cam_state.radius;
     cam.translation = pos;
-    // Build rotation quaternion directly from yaw/pitch orbit angles.
-    // spherical() maps (yaw,pitch) to offset; camera looks from offset toward focus.
-    // q_pitch rotates -Z (default look) to the pitched direction;
-    // q_yaw then yaws that result around world Y.
-    let q_pitch = Quat::from_rotation_x(-cam_state.pitch);
-    let q_yaw = Quat::from_rotation_y(cam_state.yaw);
-    cam.rotation = q_yaw * q_pitch;
+    cam.rotation = cam_state.rot;
 
     for mut lt in light_q.iter_mut() {
         let cam_right = cam.rotation * Vec3::X;
@@ -208,10 +208,6 @@ fn orbit_camera(
         lt.translation = lp;
         lt.look_at(cam_state.focus, Vec3::Y);
     }
-}
-
-fn spherical(r: f32, yaw: f32, pitch: f32) -> Vec3 {
-    Vec3::new(r * pitch.cos() * yaw.sin(), r * pitch.sin(), r * pitch.cos() * yaw.cos())
 }
 
 // ── Atom movement ──
@@ -591,10 +587,10 @@ fn setup(
     let ortho_scale = (cell_diag * 1.3).max(5.0);
 
     // Init camera (orthographic by default, looking down Z at XY plane)
-    let radius = ortho_scale; let yaw = 0.0; let pitch = 0.0;
-    commands.insert_resource(CameraState { focus: center, radius, yaw, pitch });
-    commands.insert_resource(CameraInit(CameraState { focus: center, radius, yaw, pitch }));
-    commands.insert_resource(CrystalScene { center });
+    let radius = ortho_scale;
+    let initial_rot = Quat::IDENTITY;  // camera looks along -Z (top-down XY view)
+    commands.insert_resource(CameraState { focus: center, radius, rot: initial_rot });
+    commands.insert_resource(CameraInit(CameraState { focus: center, radius, rot: initial_rot }));
     commands.insert_resource(ProjMode::Orthographic);
     commands.insert_resource(OrthoScale(ortho_scale));
 

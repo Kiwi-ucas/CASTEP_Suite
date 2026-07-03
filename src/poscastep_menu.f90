@@ -2371,7 +2371,7 @@ contains
         write(*, '(a)') ''
         write(*, '(a)') '  Mode     Freq/cm⁻¹      IR Int.      |p_mode|'
         write(*, '(a)') '  ────     ─────────      ───────      ────────'
-        do ios = 1, min(20, modes_data%n_branches)
+        do ios = 1, modes_data%n_branches
             if (ios == best_mode) then
                 write(*, '(a,i4,a,f13.2,a,f11.4,a,f11.4,a)') &
                     ' ▶', ios, '   ', modes_data%modes(ios)%frequency, '   ', &
@@ -2385,9 +2385,6 @@ contains
                     modes_data%modes(ios)%mode_charge_norm
             end if
         end do
-        if (modes_data%n_branches > 20) then
-            write(*, '(a,i0,a)') '   ... (', modes_data%n_branches - 20, ' more modes)'
-        end if
         write(*, '(a)') ''
         write(*, '(a,i0,a,f12.4,a)') '  ▶ Mode ', best_mode, &
             ' has highest IR intensity (', max_ir, ')'
