@@ -133,7 +133,6 @@ pub fn element_color(element: &str) -> Color {
     }
 }
 
-/// Atom display radius (scaled for visibility, not physical)
 /// Category background color for periodic table (muted, white text readable)
 pub fn category_color(element: &str) -> egui::Color32 {
     match element {

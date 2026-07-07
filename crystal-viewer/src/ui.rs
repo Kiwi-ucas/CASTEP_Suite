@@ -8,6 +8,7 @@ use crate::AddAtomState;
 use crate::CrystalStore;
 use crate::Lattice;
 use crate::PhononState;
+use crate::PanelRects;
 use crate::resources;
 
 #[derive(Resource)]
@@ -39,6 +40,7 @@ pub fn ui_system(
     mut add_state: ResMut<AddAtomState>,
     crystal: Option<Res<CrystalStore>>,
     mut phonon_state: Option<ResMut<PhononState>>,
+    mut panel_rects: ResMut<PanelRects>,
 ) {
     let ctx = contexts.ctx_mut();
 
@@ -57,7 +59,7 @@ pub fn ui_system(
         .collect();
 
     // ── Bottom toolbar ──
-    egui::TopBottomPanel::bottom("toolbar").show(ctx, |ui| {
+    let bottom_resp = egui::TopBottomPanel::bottom("toolbar").show(ctx, |ui| {
         ui.horizontal(|ui| {
             if let Some(p) = sel_parent {
                 let step = move_state.as_ref().map(|m| m.step).unwrap_or(0.1);
@@ -75,9 +77,10 @@ pub fn ui_system(
             }
         });
     });
+    panel_rects.bottom = Some(bottom_resp.response.rect);
 
     // ── Left panel: atom list (asymmetric unit only) ──
-    egui::SidePanel::left("atom_list")
+    let left_resp = egui::SidePanel::left("atom_list")
         .resizable(true).default_width(180.0)
         .show(ctx, |ui| {
             ui.heading("Atoms");
@@ -128,9 +131,10 @@ pub fn ui_system(
                 }
             });
         });
+    panel_rects.left = Some(left_resp.response.rect);
 
     // ── Right panel ──
-    egui::SidePanel::right("info_panel")
+    let right_resp = egui::SidePanel::right("info_panel")
         .resizable(true).default_width(220.0)
         .show(ctx, |ui| {
             // Crystal info header
@@ -183,6 +187,7 @@ pub fn ui_system(
                 ui.label("Click an atom\nto see details");
             }
         });
+    panel_rects.right = Some(right_resp.response.rect);
 
     // ── Add Atom popup: periodic table ──
     if add_state.show_table {

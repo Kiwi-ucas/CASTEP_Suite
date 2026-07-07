@@ -3,6 +3,7 @@
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 use bevy_egui::EguiContexts;
+use crate::PanelRects;
 
 #[derive(Resource)]
 pub struct PickingState {
@@ -129,9 +130,11 @@ pub fn click_pick(
     windows: Query<&Window, With<PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform, &Projection), With<crate::MainCamera>>,
     mut contexts: EguiContexts,
+    panel_rects: Res<PanelRects>,
 ) {
     // Ignore 3D picks when cursor is over an egui panel
-    if contexts.ctx_mut().is_pointer_over_area() {
+    let ctx = contexts.ctx_mut();
+    if over_egui_panel(ctx, &panel_rects) {
         if mouse_btn.just_pressed(MouseButton::Left) || mouse_btn.just_released(MouseButton::Left) {
             picking.click_start = None;
         }
@@ -167,10 +170,11 @@ pub fn hover_pick(
     windows: Query<&Window, With<PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform, &Projection), With<crate::MainCamera>>,
     mut contexts: EguiContexts,
+    panel_rects: Res<PanelRects>,
 ) {
-    // Clear hover when cursor is over an egui panel
-    if contexts.ctx_mut().is_pointer_over_area() {
-        picking.hovered = -1;
+    // Don't update 3D hover when cursor is over an egui panel
+    let ctx = contexts.ctx_mut();
+    if over_egui_panel(ctx, &panel_rects) {
         return;
     }
     if picking.click_start.is_some() { return; }
@@ -213,4 +217,14 @@ pub fn highlight_atoms(
             mat.emissive = LinearRgba::BLACK;
         }
     }
+}
+
+fn over_egui_panel(ctx: &bevy_egui::egui::Context, panels: &PanelRects) -> bool {
+    let pos = match ctx.input(|i| i.pointer.interact_pos()) {
+        Some(p) => p,
+        None => return false,
+    };
+    panels.left.map_or(false, |r| r.contains(pos))
+        || panels.right.map_or(false, |r| r.contains(pos))
+        || panels.bottom.map_or(false, |r| r.contains(pos))
 }

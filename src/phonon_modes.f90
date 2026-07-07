@@ -1,7 +1,6 @@
 ! phonon_modes.f90 — Phonon eigenvector parsing, Born charge parsing, mode decomposition
 module phonon_modes
     use castep_config, only: dp, MAX_LINE_LEN, IO_FILE_NOT_FOUND, IO_USER_QUIT
-    use iso_fortran_env, only: iostat_end
     implicit none
     private
 
@@ -139,6 +138,8 @@ contains
                 data%ion_positions_frac(3,i) = frac(3)
                 data%ion_masses(i) = amass
             end do
+        else
+            iostat_out = 3; iomsg = 'Fractional Co-ordinates section not found in .phonon'; close(unit); return
         end if
 
         ! ── Skip to frequency block ──
@@ -198,6 +199,9 @@ contains
                     eig(1), eig(2), eig(3), eig(4), eig(5), eig(6)
                 if (ios /= 0) then
                     iostat_out = 5; iomsg = 'Error reading eigenvectors'; close(unit); return
+                end if
+                if (ion_idx < 1 .or. ion_idx > ni) then
+                    iostat_out = 6; iomsg = 'Ion index out of bounds in eigenvectors'; close(unit); return
                 end if
                 data%modes(i)%eigenvectors(ion_idx, 1) = eig(1)  ! X_real
                 data%modes(i)%eigenvectors(ion_idx, 2) = eig(2)  ! X_imag

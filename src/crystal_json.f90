@@ -1,52 +1,14 @@
 module crystal_json
     !! Generate crystal_data.json for the Rust Crystal Viewer
-    use castep_config, only: dp, pi, castep_config_t, cif_data_t, IO_PARSE_ERROR
+    use castep_config, only: dp, pi, cif_data_t, IO_PARSE_ERROR
     use parser, only: clean_element_symbol
     implicit none
     private
 
-    public :: write_crystal_json, write_crystal_json_cif, read_crystal_json_to_cif
+    public :: write_crystal_json_cif, read_crystal_json_to_cif
     public :: write_crystal_json_modes
 
 contains
-
-    subroutine write_crystal_json(cfg, json_path, iostat)
-        !! Write crystal structure data from castep_config_t
-        type(castep_config_t), intent(in) :: cfg
-        character(len=*), intent(in) :: json_path
-        integer, intent(out) :: iostat
-        integer :: unit, i
-
-        iostat = 0
-        open(newunit=unit, file=trim(json_path), status='replace', action='write', iostat=iostat)
-        if (iostat /= 0) return
-
-        write(unit, '(a)') '{'
-        write(unit, '(a)') '  "lattice": {'
-        write(unit, '(a,f10.4,a)') '    "a": ', cfg%cell_length(1), ','
-        write(unit, '(a,f10.4,a)') '    "b": ', cfg%cell_length(2), ','
-        write(unit, '(a,f10.4,a)') '    "c": ', cfg%cell_length(3), ','
-        write(unit, '(a,f10.4,a)') '    "alpha": ', cfg%cell_angle(1), ','
-        write(unit, '(a,f10.4,a)') '    "beta": ', cfg%cell_angle(2), ','
-        write(unit, '(a,f10.4)') '    "gamma": ', cfg%cell_angle(3)
-        write(unit, '(a)') '  },'
-        write(unit, '(a)') '  "atoms": ['
-
-        do i = 1, cfg%num_atoms
-            write(unit, '(a,a,a,a,f10.6,a,a,f10.6,a,a,f10.6,a)', advance='no') &
-                '    { "element": "', trim(clean_element_symbol(cfg%atom_type(i))), '", ', &
-                '"x": ', cfg%atom_x(i), ', ', &
-                '"y": ', cfg%atom_y(i), ', ', &
-                '"z": ', cfg%atom_z(i), ' }'
-            if (i < cfg%num_atoms) write(unit, '(a)') ','
-            if (i == cfg%num_atoms) write(unit, '(a)') ''
-        end do
-
-        write(unit, '(a)') '  ]'
-        write(unit, '(a)') '}'
-        close(unit)
-    end subroutine write_crystal_json
-
 
     subroutine write_crystal_json_cif(cif, json_path, iostat)
         !! Write crystal structure from cif_data_t (auto-converts fractional→Cartesian)
@@ -182,12 +144,12 @@ contains
             if (ios /= 0) exit
             line = adjustl(line)
 
-            ! Lattice parameters
-            if (index(line, '"a"') > 0 .and. index(line, '"alpha"') == 0) then
+            ! Lattice parameters (guard against element names like Ca/Ba/Na)
+            if (is_json_key(line, '"a"') .and. index(line, '"alpha"') == 0) then
                 call extract_json_real(line, cif%a, ios)
-            else if (index(line, '"b"') > 0 .and. index(line, '"beta"') == 0) then
+            else if (is_json_key(line, '"b"') .and. index(line, '"beta"') == 0) then
                 call extract_json_real(line, cif%b, ios)
-            else if (index(line, '"c"') > 0) then
+            else if (is_json_key(line, '"c"')) then
                 call extract_json_real(line, cif%c, ios)
             else if (index(line, '"alpha"') > 0) then
                 call extract_json_real(line, cif%alpha, ios)
@@ -224,6 +186,21 @@ contains
         cif%positions_fractional = .false.  ! viewer always outputs Cartesian
     end subroutine read_crystal_json_to_cif
 
+
+    pure logical function is_json_key(line, key)
+        !! True if key appears as a JSON key (not inside an element name like Ca/Ba)
+        character(len=*), intent(in) :: line, key
+        integer :: i
+        is_json_key = .false.
+        i = index(line, key)
+        if (i == 0) return
+        ! Character before key must not be a letter (a-z, A-Z)
+        if (i > 1) then
+            if ((line(i-1:i-1) >= 'A' .and. line(i-1:i-1) <= 'Z') .or. &
+                (line(i-1:i-1) >= 'a' .and. line(i-1:i-1) <= 'z')) return
+        end if
+        is_json_key = .true.
+    end function is_json_key
 
     subroutine extract_json_real(line, val, ios)
         !! Extract a real number from a JSON line like  "key": value,

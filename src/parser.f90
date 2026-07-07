@@ -92,7 +92,7 @@ contains
             end if
 
             ! Handle ATOM and HETATM records (fixed-width columns per PDB spec)
-            if (line(1:4) == 'ATOM' .or. line(1:7) == 'HETATM') then
+            if (line(1:4) == 'ATOM' .or. line(1:6) == 'HETATM') then
                 n_atoms = n_atoms + 1
                 if (n_atoms > MAX_ATOMS) exit
 
@@ -111,8 +111,11 @@ contains
 
                 ! Cartesian coordinates: columns 31-38, 39-46, 47-54
                 read(line(31:38), '(F8.3)', iostat=ios) data%atoms(n_atoms)%x
+                if (ios /= 0) then; n_atoms = n_atoms - 1; cycle; end if
                 read(line(39:46), '(F8.3)', iostat=ios) data%atoms(n_atoms)%y
+                if (ios /= 0) then; n_atoms = n_atoms - 1; cycle; end if
                 read(line(47:54), '(F8.3)', iostat=ios) data%atoms(n_atoms)%z
+                if (ios /= 0) then; n_atoms = n_atoms - 1; cycle; end if
             end if
         end do
 
@@ -292,9 +295,9 @@ contains
                 read(trimmed, *, iostat=ios_local) x, y, z
                 if (ios_local == 0) then
                     ! Transpose: file row i -> cart(:,i)
-                    lattice_cart(cart_line, 1) = x
-                    lattice_cart(cart_line, 2) = y
-                    lattice_cart(cart_line, 3) = z
+                    lattice_cart(1, cart_line) = x
+                    lattice_cart(2, cart_line) = y
+                    lattice_cart(3, cart_line) = z
                 end if
                 if (cart_line >= 3) then
                     abc = compute_abc_from_cartesian(lattice_cart)
@@ -440,6 +443,7 @@ contains
                         if (n_cols <= 50) row_vals(n_cols) = adjustl(line(start_pos:end_pos))
                     end do
                     if (n_cols >= 4 .and. idx_col(3) > 0 .and. idx_col(4) > 0 .and. idx_col(5) > 0) then
+                        if (n >= MAX_ATOMS) cycle  ! hard limit
                         n = n + 1
                         if (.not. allocated(data%atoms)) then
                             call grow_atoms(data%atoms, 0, 64)
@@ -449,18 +453,15 @@ contains
                         call copy_str_no_quotes(row_vals(idx_col(1)), data%atoms(n)%label)
                         call copy_str_no_quotes(row_vals(idx_col(2)), data%atoms(n)%element)
                         read(row_vals(idx_col(3)), *, iostat=ios) data%atoms(n)%x
+                        if (ios /= 0) then; n = n - 1; cycle; end if
                         read(row_vals(idx_col(4)), *, iostat=ios) data%atoms(n)%y
+                        if (ios /= 0) then; n = n - 1; cycle; end if
                         read(row_vals(idx_col(5)), *, iostat=ios) data%atoms(n)%z
+                        if (ios /= 0) then; n = n - 1; cycle; end if
                     end if
                     cycle
                 end if
-                ! Non-atom data row - parse as tag-value pair
-                tag = ''; val = ''
-                i = index(line, ' ')
-                if (i > 0) then
-                    tag = trim(adjustl(line(1:i-1)))
-                    val = clean_str_inline(line(i+1:))
-                end if
+                ! Non-atom data row - skip
                 cycle
             end if
 
@@ -573,7 +574,7 @@ contains
         character(len=*), intent(in)  :: src
         character(len=*), intent(out) :: tgt
         character(len=len(src)) :: tmp
-        integer :: i, j, n
+        integer :: i, n
 
         n = len_trim(src)
         if (n == 0) then
@@ -581,7 +582,6 @@ contains
             return
         end if
         tmp = adjustl(src)
-        j = 1
         if (tmp(1:1) == "'" .or. tmp(1:1) == '"') tmp = tmp(2:)
         if (n > 0 .and. tmp(len_trim(tmp):len_trim(tmp)) == "'") tmp = tmp(:len_trim(tmp)-1)
         if (n > 0 .and. tmp(len_trim(tmp):len_trim(tmp)) == '"') tmp = tmp(:len_trim(tmp)-1)

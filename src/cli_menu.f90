@@ -10,7 +10,6 @@ module cli_menu
          TASK_SOCKET_DRIVER, TASK_ELASTIC, TASK_AUTOSOLVATION, &
          FUNC_PBE, FUNC_HSE06, FUNC_PBEsol, &
          FUNC_PBE0, FUNC_r2scan, &
-         TOL_SUPERFINE, TOL_FINE, TOL_NORMAL, TOL_COARSE, &
          GEO_COARSE, GEO_MEDIUM, GEO_FINE, GEO_EXTREME, &
          CELL_ALL, CELL_INTE, &
          PHONON_FINE_NONE, PHONON_FINE_SUPERCELL, PHONON_FINE_INTERPOLATE, &
@@ -1680,9 +1679,9 @@ contains
         read(input, '(I6)', iostat=ios) choice
         if (ios /= 0) then; iostat = IO_INVALID_INPUT; return; end if
         select case (choice)
-        case (1); result_method = CINEB_METHOD_TPSD
+        case (1); result_method = CINEB_METHOD_ODE12R
         case (2); result_method = CINEB_METHOD_FIRE
-        case (3); result_method = CINEB_METHOD_ODE12R
+        case (3); result_method = CINEB_METHOD_TPSD
         case default; write(*, '(a)') '  Invalid choice.'; iostat = IO_INVALID_INPUT
         end select
     end subroutine ask_cineb_neb_method

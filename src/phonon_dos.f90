@@ -80,7 +80,10 @@ contains
         do j = 1, nq
             ! Read q-point header line
             read(unit, '(a)', iostat=ios) line
-            if (ios /= 0) exit
+            if (ios /= 0) then
+                iostat = 102; if (present(iomsg)) iomsg = 'Unexpected end of .phonon file'
+                close(unit); return
+            end if
 
             ! Determine if Gamma point (has direction vector → more fields)
             is_gamma = (j == 1)
@@ -88,6 +91,10 @@ contains
                 read(line, *, iostat=ios) key, key, qx, qy, qz, weight, dummy, dummy, dummy
             else
                 read(line, *, iostat=ios) key, key, qx, qy, qz, weight
+            end if
+            if (ios /= 0) then
+                iostat = 103; if (present(iomsg)) iomsg = 'Error reading q-point header'
+                close(unit); return
             end if
             data%weights(j) = weight
 
@@ -98,7 +105,10 @@ contains
                 else
                     read(unit, *, iostat=ios) n_read, freq
                 end if
-                if (ios /= 0) exit
+                if (ios /= 0) then
+                    iostat = 104; if (present(iomsg)) iomsg = 'Error reading phonon frequencies'
+                    close(unit); return
+                end if
                 data%freqs((j - 1) * nb + i) = freq
                 if (freq < data%freq_min) data%freq_min = freq
                 if (freq > data%freq_max) data%freq_max = freq
@@ -107,7 +117,10 @@ contains
             ! Skip eigenvector block: 2 header lines + nb * n_ions data lines
             do i = 1, 2 + nb * data%n_ions
                 read(unit, '(a)', iostat=ios) line
-                if (ios /= 0) exit
+                if (ios /= 0) then
+                    iostat = 105; if (present(iomsg)) iomsg = 'Error reading phonon eigenvectors'
+                    close(unit); return
+                end if
             end do
         end do
 

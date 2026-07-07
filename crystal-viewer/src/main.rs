@@ -20,10 +20,10 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_plugins(bevy_egui::EguiPlugin)
         .insert_resource(CrystalPath(json_path.to_string()))
+        .init_resource::<PanelRects>()
         .add_systems(Startup, setup)
-        .add_systems(Update, orbit_camera)
-        .add_systems(Update, (click_pick, hover_pick).chain())
-        .add_systems(Update, ui_system)
+        .add_systems(Update, (ui_system, orbit_camera).chain())
+        .add_systems(Update, (click_pick, hover_pick).chain().after(ui_system))
         .add_systems(Update, highlight_atoms.after(ui_system))
         .add_systems(Update, move_selected_atom.after(highlight_atoms))
         .add_systems(Update, (add_atom_system, delete_atom_system))
@@ -36,6 +36,14 @@ fn main() {
 #[derive(Resource, Clone)] struct CrystalStore { data: CrystalData, json_path: String }
 #[derive(Resource)] struct LatticeData { vecs: [Vec3; 3], inv: [Vec3; 3] }
 #[derive(Resource)] struct ImageOffsets(pub Vec<Vec3>);  // fractional offset for each expanded atom
+
+/// egui panel screen rects — used to block camera zoom/pick when mouse is over UI
+#[derive(Resource, Default)]
+pub struct PanelRects {
+    pub left:   Option<bevy_egui::egui::Rect>,
+    pub right:  Option<bevy_egui::egui::Rect>,
+    pub bottom: Option<bevy_egui::egui::Rect>,
+}
 
 /// State machine for Add Atom UI flow
 #[derive(Resource, Default)]
@@ -146,6 +154,7 @@ fn orbit_camera(
     mut mouse_motion: EventReader<MouseMotion>,
     mut mouse_wheel: EventReader<MouseWheel>,
     keys: Res<ButtonInput<KeyCode>>,
+    panel_rects: Res<PanelRects>,
 ) {
     let Ok(mut cam) = camera_q.get_single_mut() else { return };
 
@@ -165,9 +174,13 @@ fn orbit_camera(
     }
 
     let ctx = contexts.ctx_mut();
-    let egui_wants = ctx.is_pointer_over_area() || ctx.wants_pointer_input();
+    let over_panel = ctx.input(|i| i.pointer.interact_pos()).map_or(false, |pos| {
+        panel_rects.left.map_or(false, |r| r.contains(pos))
+            || panel_rects.right.map_or(false, |r| r.contains(pos))
+            || panel_rects.bottom.map_or(false, |r| r.contains(pos))
+    });
     for ev in mouse_wheel.read() {
-        if egui_wants { continue; }
+        if over_panel { continue; }
         let dy = match ev.unit {
             MouseScrollUnit::Line => ev.y * 0.1,
             MouseScrollUnit::Pixel => ev.y * 0.001,
@@ -206,7 +219,7 @@ fn orbit_camera(
         let cam_up = cam.rotation * Vec3::Y;
         let lp = pos + cam_right * cam_state.radius * 0.8 + cam_up * cam_state.radius * 0.6;
         lt.translation = lp;
-        lt.look_at(cam_state.focus, Vec3::Y);
+        *lt = lt.looking_at(cam_state.focus, Vec3::Y);
     }
 }
 
@@ -319,6 +332,7 @@ fn add_atom_system(
 
     let label = format!("new_{}", add_state.next_id);
     add_state.next_id += 1;
+    atom_info.labels.push(label.clone());
 
     // Append to CrystalData
     crystal.data.atoms.push(crystal::AtomData {
@@ -361,7 +375,6 @@ fn add_atom_system(
     atom_info.radii.push(resources::covalent_radius(&el));
 
     // Auto-save
-    crystal.data.modified = true;
     let _ = crystal.data.write_to_file(&crystal.json_path);
 }
 

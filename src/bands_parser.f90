@@ -136,7 +136,11 @@ contains
                     if (len_trim(line) == 0) cycle
                     ie = ie + 1
                     read(line, *, iostat=ios) bands%eigenvalues(ie, ik, is)
-                    if (ios /= 0) exit
+                    if (ios /= 0) then
+                        iostat = 103
+                        if (present(iomsg)) iomsg = 'Error parsing eigenvalue'
+                        close(unit); return
+                    end if
                     ne_read = ne_read + 1
                 end do
                 if (ne_read < bands%num_eigenvalues) then

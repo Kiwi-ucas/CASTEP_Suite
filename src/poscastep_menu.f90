@@ -4,7 +4,8 @@ module poscastep_menu
     !! Currently implements: Plot Band Structure
     use castep_config, only: dp, pi, HARTREE_TO_EV, bands_data_t, pdos_data_t, &
         cif_data_t, MAX_LINE_LEN, IO_INVALID_INPUT, IO_SUCCESS, IO_USER_QUIT, &
-        IO_FILE_NOT_FOUND, IO_PARSE_ERROR, IO_WRITE_ERROR, IO_PRECASTEP_LAUNCH, strip_quotes
+        IO_FILE_NOT_FOUND, IO_PARSE_ERROR, IO_WRITE_ERROR, IO_PRECASTEP_LAUNCH, strip_quotes, &
+        compute_cartesian_lattice
     use parser, only: parse_cif_inline, parse_pdb_inline, parse_cell_inline
     use phonon_dos, only: phonon_dos_data_t, parse_phonon_file, compute_phonon_dos, &
         compute_ir_spectrum, compute_raman_spectrum, free_phonon_dos_data
@@ -16,13 +17,12 @@ module poscastep_menu
         compute_static_dielectric_windowed, &
         compute_polarizability, free_pol_data
     use bands_parser, only: parse_bands_file, free_bands_data
-    use bands_plotter, only: BANDS_MODE_ASCII, BANDS_MODE_SVG, &
-        plot_bands_ascii, write_bands_svg
-    use term_utils, only: get_term_size, enter_raw_mode, leave_raw_mode, C_ALT_ON, C_ALT_OFF
+    use bands_plotter, only: BANDS_MODE_ASCII, plot_bands_ascii
+    use term_utils, only: get_term_size, enter_raw_mode, leave_raw_mode
     use pdos_parser, only: parse_pdos_file, free_pdos_data
     use dos_compute, only: compute_total_dos, compute_pdos, N_CHANNELS
-    use dos_plotter, only: DOS_MODE_ASCII, DOS_MODE_SVG, DOS_MODE_EXPORT, &
-        plot_dos_ascii, write_dos_svg, write_dos_csv, plot_pdos_ascii, write_pdos_csv
+    use dos_plotter, only: DOS_MODE_ASCII, DOS_MODE_EXPORT, &
+        plot_dos_ascii, write_dos_csv, plot_pdos_ascii, write_pdos_csv
     use crystal_json, only: write_crystal_json_cif, read_crystal_json_to_cif
     implicit none
     private
@@ -138,9 +138,9 @@ contains
     subroutine handle_bands_menu(iostat)
         integer, intent(out) :: iostat
         type(bands_data_t) :: bands
-        character(len=512)  :: bands_path, output_base, output_file
+        character(len=512)  :: bands_path, output_base
         character(len=256)  :: msg
-        integer  :: plot_mode, local_istat
+        integer  :: plot_mode
         real(dp) :: fermi_ev
 
         iostat = 0
@@ -177,15 +177,6 @@ contains
         case (BANDS_MODE_ASCII)
             call run_ascii_navigator(bands, fermi_ev)
 
-        case (BANDS_MODE_SVG)
-            output_file = trim(output_base) // '.svg'
-            call write_bands_svg(bands, output_file, &
-                1200, 800, local_istat, iomsg=msg)
-            if (local_istat == 0) then
-                write(*, '(a,a)') '  SVG saved: ', trim(output_file)
-            else
-                write(*, '(a,a)') '  Error: ', trim(msg)
-            end if
         end select
 
         call free_bands_data(bands)
@@ -300,7 +291,7 @@ contains
         integer, intent(out)          :: plot_mode
         character(len=*), intent(out) :: output_base
         integer, intent(out)          :: iostat
-        integer :: ios, choice
+        integer :: ios
         character(len=MAX_LINE_LEN) :: input
 
         iostat = 0
@@ -310,23 +301,11 @@ contains
         write(*, '(a)') ''
         write(*, '(a)') '  Output mode:'
         write(*, '(a)') '    1. Terminal ASCII plot (default)'
-        write(*, '(a)') '    2. SVG vector graphics file'
         write(*, '(a)', advance='no') '    Enter choice [1]: '
         read(*, '(a)', iostat=ios) input
         if (ios == 0 .and. len_trim(input) > 0) then
             if (adjustl(trim(input)) == 'q' .or. adjustl(trim(input)) == 'Q') then
                 iostat = IO_USER_QUIT; return
-            end if
-            read(input, '(I6)', iostat=ios) choice
-            if (ios == 0 .and. choice == 2) plot_mode = BANDS_MODE_SVG
-        end if
-
-        if (plot_mode == BANDS_MODE_SVG) then
-            write(*, '(a)') ''
-            write(*, '(a)', advance='no') '  Output base name [bands]: '
-            read(*, '(a)', iostat=ios) input
-            if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
-                output_base = adjustl(trim(input))
             end if
         end if
     end subroutine ask_bands_plot_options
@@ -383,8 +362,7 @@ contains
         write(*, '(a)') ''
         write(*, '(a)') '  Output mode:'
         write(*, '(a)') '    1. Terminal ASCII plot (default)'
-        write(*, '(a)') '    2. SVG vector graphics file'
-        write(*, '(a)') '    3. Export data (CSV)'
+        write(*, '(a)') '    2. Export data (CSV)'
         write(*, '(a)', advance='no') '    Enter choice [1]: '
         read(*, '(a)', iostat=ios) input
         plot_mode = DOS_MODE_ASCII
@@ -435,20 +413,6 @@ contains
         case (DOS_MODE_ASCII)
             call run_dos_navigator(energy_grid, dos_result, n_spin, &
                 fermi_ev, smearing_width)
-        case (DOS_MODE_SVG)
-            output_file = 'dos.svg'
-            write(*, '(a)', advance='no') '  Output file [dos.svg]: '
-            read(*, '(a)', iostat=ios) input
-            if (ios == 0 .and. len_trim(adjustl(input)) > 0) &
-                output_file = adjustl(trim(input))
-            call write_dos_svg(energy_grid, dos_result, n_spin, &
-                fermi_ev, smearing_width, output_file, 1200, 800, &
-                local_istat, iomsg=msg)
-            if (local_istat == 0) then
-                write(*, '(a,a)') '  SVG saved: ', trim(output_file)
-            else
-                write(*, '(a,a)') '  Error: ', trim(msg)
-            end if
         case (DOS_MODE_EXPORT)
             output_file = 'dos'
             write(*, '(a)', advance='no') '  Output file [dos]: '
@@ -669,8 +633,7 @@ contains
         ! ── Output mode menu (before smearing, matching DOS flow) ──
         write(*, '(a)') '  Output mode:'
         write(*, '(a)') '    1. Terminal ASCII plot (default)'
-        write(*, '(a)') '    2. SVG vector graphics file'
-        write(*, '(a)') '    3. Export data (CSV)'
+        write(*, '(a)') '    2. Export data (CSV)'
         write(*, '(a)', advance='no') '    Enter choice [1]: '
 
         read(*, '(a)', iostat=ios) input
@@ -705,8 +668,6 @@ contains
         select case (plot_mode)
         case (DOS_MODE_ASCII)
             call run_phonon_dos_navigator(phdos, freq_min_range, freq_max_range)
-        case (DOS_MODE_SVG)
-            write(*, '(a)') '  SVG export is not yet implemented for phonon DOS.'
         case (DOS_MODE_EXPORT)
             call write_phonon_dos_csv(phdos)
         end select
@@ -754,8 +715,7 @@ contains
         ! ── Output mode menu ──
         write(*, '(a)') '  Output mode:'
         write(*, '(a)') '    1. Terminal ASCII plot (default)'
-        write(*, '(a)') '    2. SVG vector graphics file'
-        write(*, '(a)') '    3. Export data (CSV)'
+        write(*, '(a)') '    2. Export data (CSV)'
         write(*, '(a)', advance='no') '    Enter choice [1]: '
         read(*, '(a)', iostat=ios) input
         plot_mode = DOS_MODE_ASCII
@@ -787,8 +747,6 @@ contains
         select case (plot_mode)
         case (DOS_MODE_ASCII)
             call run_ir_navigator(phdos, freq_min_range, freq_max_range)
-        case (DOS_MODE_SVG)
-            write(*, '(a)') '  SVG export is not yet implemented for IR spectrum.'
         case (DOS_MODE_EXPORT)
             call write_ir_csv(phdos)
         end select
@@ -925,8 +883,7 @@ contains
         ! ── Output mode menu ──
         write(*, '(a)') '  Output mode:'
         write(*, '(a)') '    1. Terminal ASCII plot (default)'
-        write(*, '(a)') '    2. SVG vector graphics file'
-        write(*, '(a)') '    3. Export data (CSV)'
+        write(*, '(a)') '    2. Export data (CSV)'
         write(*, '(a)', advance='no') '    Enter choice [1]: '
         read(*, '(a)', iostat=ios) input
         plot_mode = DOS_MODE_ASCII
@@ -958,8 +915,6 @@ contains
         select case (plot_mode)
         case (DOS_MODE_ASCII)
             call run_raman_navigator(phdos, freq_min_range, freq_max_range)
-        case (DOS_MODE_SVG)
-            write(*, '(a)') '  SVG export is not yet implemented for Raman spectrum.'
         case (DOS_MODE_EXPORT)
             call write_raman_csv(phdos)
         end select
@@ -1624,7 +1579,7 @@ contains
         integer :: i
 
         iostat = 0
-        lattice = compute_lattice_private(cif%a, cif%b, cif%c, &
+        lattice = compute_cartesian_lattice(cif%a, cif%b, cif%c, &
             cif%alpha, cif%beta, cif%gamma)
         inv_lattice = invert_lattice_3x3(lattice)
 
@@ -1710,44 +1665,6 @@ contains
     end subroutine write_cif_file
 
 
-    pure function compute_lattice_private(a, b, c, alpha_deg, beta_deg, gamma_deg) &
-        result(lattice)
-        !! Compute Cartesian lattice vectors from cell parameters.
-        !! Column-major: lattice(:,1)=a_vec, lattice(:,2)=b_vec, lattice(:,3)=c_vec
-        real(dp), intent(in) :: a, b, c, alpha_deg, beta_deg, gamma_deg
-        real(dp) :: lattice(3, 3)
-        real(dp) :: alpha, beta, gamma
-        real(dp) :: cos_alpha, cos_beta, cos_gamma, sin_gamma
-        real(dp) :: vol_factor
-
-        alpha  = alpha_deg * pi / 180.0_dp
-        beta   = beta_deg  * pi / 180.0_dp
-        gamma  = gamma_deg * pi / 180.0_dp
-
-        cos_alpha = dcos(alpha)
-        cos_beta  = dcos(beta)
-        cos_gamma = dcos(gamma)
-        sin_gamma = dsin(gamma)
-
-        lattice(1,1) = a
-        lattice(2,1) = 0.0_dp
-        lattice(3,1) = 0.0_dp
-
-        lattice(1,2) = b * cos_gamma
-        lattice(2,2) = b * sin_gamma
-        lattice(3,2) = 0.0_dp
-
-        lattice(1,3) = c * cos_beta
-        lattice(2,3) = c * (cos_alpha - cos_beta * cos_gamma) / sin_gamma
-
-        vol_factor = 1.0_dp - cos_alpha**2 - cos_beta**2 - cos_gamma**2 &
-                     + 2.0_dp * cos_alpha * cos_beta * cos_gamma
-        if (vol_factor > 0.0_dp) then
-            lattice(3,3) = c * dsqrt(vol_factor) / sin_gamma
-        else
-            lattice(3,3) = 0.0_dp
-        end if
-    end function compute_lattice_private
 
 
     pure function invert_lattice_3x3(m) result(inv)
@@ -1795,7 +1712,7 @@ contains
         integer :: i
 
         iostat = 0
-        lattice = compute_lattice_private(cif%a, cif%b, cif%c, &
+        lattice = compute_cartesian_lattice(cif%a, cif%b, cif%c, &
             cif%alpha, cif%beta, cif%gamma)
 
         do i = 1, cif%n_atoms
@@ -2114,7 +2031,7 @@ contains
         character(len=*), intent(in) :: json_path
         integer, intent(out) :: iostat
 
-        character(len=MAX_LINE_LEN) :: input, out_path, fmt_label, ext_str
+        character(len=MAX_LINE_LEN) :: input, out_path, ext_str
         integer :: ios, choice, fmt_choice, menu_choice, unit
         logical :: modified
 
@@ -2189,17 +2106,14 @@ contains
                 case (1)  ! .cell (Cartesian)
                     if (cif%positions_fractional) call convert_to_cartesian(cif, ios)
                     call ensure_ext(out_path, '.cell')
-                    fmt_label = '.cell (CASTEP)'
                     call write_cell_simple(cif, trim(out_path), ios, input)
                 case (2)  ! .cif (fractional)
                     if (.not. cif%positions_fractional) call convert_to_fractional(cif, ios)
                     call ensure_ext(out_path, '.cif')
-                    fmt_label = '.cif'
                     call write_cif_file(cif, trim(out_path), ios, input)
                 case (3)  ! .pdb (Cartesian)
                     if (cif%positions_fractional) call convert_to_cartesian(cif, ios)
                     call ensure_ext(out_path, '.pdb')
-                    fmt_label = '.pdb'
                     call write_pdb_file(cif, trim(out_path), ios, input)
                 end select
 
@@ -2314,7 +2228,7 @@ contains
         if (ios /= 0) return
         fname = adjustl(fname); call strip_quotes(fname)
         if (fname == 'q' .or. fname == 'Q') then
-            iostat = IO_USER_QUIT; return
+            iostat = 0; return
         end if
         if (len_trim(fname) == 0) then
             write(*, '(a)') '  No file specified.'; return
@@ -2326,13 +2240,14 @@ contains
         if (ios /= 0) return
         castep_path = adjustl(castep_path); call strip_quotes(castep_path)
         if (castep_path == 'q' .or. castep_path == 'Q') then
-            iostat = IO_USER_QUIT; return
+            iostat = 0; return
         end if
 
         ! ── Parse phonon eigenvectors ──
         call parse_phonon_eigenvectors(trim(fname), modes_data, ios, msg)
         if (ios /= 0) then
-            write(*, '(a,a)') '  Error parsing .phonon: ', trim(msg); return
+            write(*, '(a,a)') '  Error parsing .phonon: ', trim(msg)
+            call free_phonon_modes_data(modes_data); return
         end if
         write(*, '(a,i0,a,i0)') '  Parsed ', modes_data%n_ions, ' ions, ', &
             modes_data%n_branches, ' branches.'
@@ -2429,6 +2344,11 @@ contains
 
         ! Cleanup
         call free_phonon_modes_data(modes_data)
+        block
+            integer :: tmp_unit, tmp_ios
+            open(newunit=tmp_unit, file=trim(json_path), status='old', iostat=tmp_ios)
+            if (tmp_ios == 0) close(tmp_unit, status='delete')
+        end block
     end subroutine handle_phonon_modes_menu
 
 

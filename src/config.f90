@@ -9,11 +9,7 @@ module castep_config
     ! Maximum sizes
     integer, parameter, public :: &
         MAX_ATOMS      = 10000, &
-        MAX_LINE_LEN   = 1024, &
-        MAX_TAGS       = 5000, &
-        MAX_LOOP_ROWS  = 50000, &
-        MAX_LOOP_COLS  = 50, &
-        MAX_SYM_OPS    = 400
+        MAX_LINE_LEN   = 1024
 
     ! PI constant
     real(dp), parameter, public :: pi = 3.14159265358979323846_dp
@@ -31,15 +27,11 @@ module castep_config
         TAG_SYM_IT       = '_symmetry_Int_Tables_number', &
         TAG_SYM_POS_XYZ  = '_symmetry_equiv_pos_as_xyz', &
         TAG_SPACEGROUP   = '_space_group_IT_number', &
-        TAG_FORMULA_SUM  = '_chemical_formula_sum', &
         TAG_ATOM_LABEL   = '_atom_site_label', &
         TAG_ATOM_TYPE    = '_atom_site_type_symbol', &
         TAG_ATOM_FRAC_X  = '_atom_site_fract_x', &
         TAG_ATOM_FRAC_Y  = '_atom_site_fract_y', &
-        TAG_ATOM_FRAC_Z  = '_atom_site_fract_z', &
-        TAG_ATOM_OCC     = '_atom_site_occupancy', &
-        TAG_ATOM_B       = '_atom_site_b_iso_or_equiv', &
-        TAG_CELL_VOL     = '_cell_volume'
+        TAG_ATOM_FRAC_Z  = '_atom_site_fract_z'
 
     ! Task type constants (16 types)
     character(len=*), parameter, public :: &
@@ -93,12 +85,7 @@ module castep_config
         OPT_LBFGS  = 'LBFGS', &
         OPT_CG     = 'CG'
 
-    ! Tolerance level constants
-    character(len=*), parameter, public :: &
-        TOL_SUPERFINE  = 'SUPERFINE', &
-        TOL_FINE       = 'FINETOLERANT', &
-        TOL_NORMAL     = 'NORMAL', &
-        TOL_COARSE     = 'COARSE'
+    ! Tolerance level constants — see GEO_* below for geo/TS tolerances
 
     ! Geo tolerance constants
     character(len=*), parameter, public :: &
@@ -650,5 +637,44 @@ end function new_castep_config
         if (allocated(this%interm_atom_y))    deallocate(this%interm_atom_y)
         if (allocated(this%interm_atom_z))    deallocate(this%interm_atom_z)
     end subroutine finalize_castep_config
+
+    pure function compute_cartesian_lattice(a, b, c, alpha_deg, beta_deg, gamma_deg) &
+        result(lattice)
+        !! Compute Cartesian lattice vectors from cell parameters.
+        !! Column-major: lattice(:,1)=a_vec, lattice(:,2)=b_vec, lattice(:,3)=c_vec
+        real(dp), intent(in) :: a, b, c, alpha_deg, beta_deg, gamma_deg
+        real(dp) :: lattice(3, 3)
+        real(dp) :: alpha, beta, gamma
+        real(dp) :: cos_alpha, cos_beta, cos_gamma, sin_gamma
+        real(dp) :: vol_factor
+
+        alpha  = alpha_deg * pi / 180.0_dp
+        beta   = beta_deg  * pi / 180.0_dp
+        gamma  = gamma_deg * pi / 180.0_dp
+
+        cos_alpha = dcos(alpha)
+        cos_beta  = dcos(beta)
+        cos_gamma = dcos(gamma)
+        sin_gamma = dsin(gamma)
+
+        lattice(1,1) = a
+        lattice(2,1) = 0.0_dp
+        lattice(3,1) = 0.0_dp
+
+        lattice(1,2) = b * cos_gamma
+        lattice(2,2) = b * sin_gamma
+        lattice(3,2) = 0.0_dp
+
+        lattice(1,3) = c * cos_beta
+        lattice(2,3) = c * (cos_alpha - cos_beta * cos_gamma) / sin_gamma
+
+        vol_factor = 1.0_dp - cos_alpha**2 - cos_beta**2 - cos_gamma**2 &
+                     + 2.0_dp * cos_alpha * cos_beta * cos_gamma
+        if (vol_factor > 0.0_dp) then
+            lattice(3,3) = c * dsqrt(vol_factor) / sin_gamma
+        else
+            lattice(3,3) = 0.0_dp
+        end if
+    end function compute_cartesian_lattice
 
 end module castep_config

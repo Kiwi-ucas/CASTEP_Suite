@@ -2,7 +2,8 @@ program CASTEP_Suite
     !! CASTEP Suite: CIF-to-CASTEP converter + post-processing tools
     !! Top-level menu dispatches to PreCASTEP (input generation) or PosCASTEP (post-processing)
     use castep_config, only: dp, castep_config_t, cif_data_t, atom_t, &
-        IO_USER_QUIT, IO_PRECASTEP_LAUNCH, MAX_LINE_LEN, default_config, pi
+        IO_USER_QUIT, IO_PRECASTEP_LAUNCH, MAX_LINE_LEN, default_config, &
+        compute_cartesian_lattice
     use cell_writer, only: write_cell_file
     use param_writer, only: write_param_file
     use cli_menu, only: run_main_menu
@@ -431,45 +432,8 @@ contains
         real(dp), intent(in) :: val
         character(20) :: s
         write(s, '(F12.7)') val
+        s = adjustl(s)
     end function real2str_dp
-
-    pure function compute_cartesian_lattice(a, b, c, alpha_deg, beta_deg, gamma_deg) &
-        result(lattice)
-        real(dp), intent(in) :: a, b, c, alpha_deg, beta_deg, gamma_deg
-        real(dp) :: lattice(3, 3)
-        real(dp) :: alpha, beta, gamma
-        real(dp) :: cos_alpha, cos_beta, cos_gamma, sin_gamma
-        real(dp) :: volume_factor
-
-        alpha  = alpha_deg * pi / 180.0_dp
-        beta   = beta_deg  * pi / 180.0_dp
-        gamma  = gamma_deg * pi / 180.0_dp
-
-        cos_alpha = dcos(alpha)
-        cos_beta  = dcos(beta)
-        cos_gamma = dcos(gamma)
-        sin_gamma = dsin(gamma)
-
-        lattice(1,1) = a
-        lattice(2,1) = 0.0_dp
-        lattice(3,1) = 0.0_dp
-
-        lattice(1,2) = b * cos_gamma
-        lattice(2,2) = b * sin_gamma
-        lattice(3,2) = 0.0_dp
-
-        lattice(1,3) = c * cos_beta
-        lattice(2,3) = c * (cos_alpha - cos_beta * cos_gamma) / sin_gamma
-
-        volume_factor = 1.0_dp - cos_alpha**2 - cos_beta**2 - cos_gamma**2 &
-                        + 2.0_dp * cos_alpha * cos_beta * cos_gamma
-
-        if (volume_factor > 0.0_dp) then
-            lattice(3,3) = c * dsqrt(volume_factor) / sin_gamma
-        else
-            lattice(3,3) = 0.0_dp
-        end if
-    end function compute_cartesian_lattice
 
     function get_file_extension(filename) result(ext)
         character(len=*), intent(in) :: filename

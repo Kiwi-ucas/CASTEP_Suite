@@ -1,7 +1,7 @@
 module dos_plotter
-    !! DOS visualization: interactive ASCII terminal plot + SVG + CSV export
+    !! DOS visualization: interactive ASCII terminal plot + CSV export
     !! Interactive controls: ↑↓ scroll, +/- zoom, ← → pan, R reset, Q quit
-    use castep_config, only: dp, HARTREE_TO_EV
+    use castep_config, only: dp
     use term_utils, only: C_RED, C_GREEN, C_YELLOW, C_CYAN, C_BOLD, C_DIM, C_RESET, C_AXIS, &
         get_term_size, draw_line
     implicit none
@@ -9,10 +9,9 @@ module dos_plotter
 
     integer, parameter, public :: &
         DOS_MODE_ASCII  = 1, &
-        DOS_MODE_SVG    = 2, &
         DOS_MODE_EXPORT = 3
 
-    public :: plot_dos_ascii, write_dos_svg, write_dos_csv
+    public :: plot_dos_ascii, write_dos_csv
     public :: plot_pdos_ascii, write_pdos_csv
 
 contains
@@ -347,7 +346,10 @@ contains
         logical, intent(in) :: is_fermi
         character(len=16) :: clr
         select case (ct)
-        case (1);  clr = C_AXIS
+        case (1)
+            if (is_fermi) then; clr = C_RED
+            else;               clr = C_AXIS
+            end if
         case (2);  clr = C_AXIS
         case (3);  clr = C_CYAN
         case (4);  clr = C_YELLOW
@@ -441,120 +443,6 @@ contains
 
         close(unit)
     end subroutine write_dos_csv
-
-    ! ----------------------------------------------------------------
-    !  SVG output
-    ! ----------------------------------------------------------------
-    subroutine write_dos_svg(energy_grid, dos_data, nspin, e_fermi, smearing, &
-            svg_file, w_px, h_px, iostat, iomsg)
-        real(dp), intent(in) :: energy_grid(:)
-        real(dp), intent(in) :: dos_data(:,:)
-        integer,  intent(in) :: nspin
-        real(dp), intent(in) :: e_fermi, smearing
-        character(len=*), intent(in) :: svg_file
-        integer,  intent(in) :: w_px, h_px
-        integer,  intent(out) :: iostat
-        character(len=*), optional, intent(out) :: iomsg
-
-        integer, parameter :: ML = 80, MR = 20, MT = 40, MB = 60
-        real(dp) :: e_min, e_max, e_range, y_max, x_scale, y_scale
-        integer  :: unit, ios, ie, ne, plot_w, plot_h, x, y, is
-        integer  :: fermi_x
-        character(len=32) :: rgb
-
-        iostat = 0
-        if (present(iomsg)) iomsg = ''
-        ne = size(energy_grid)
-        if (ne < 2) then
-            iostat = 1; return
-        end if
-
-        open(newunit=unit, file=trim(svg_file), status='replace', &
-             action='write', iostat=ios)
-        if (ios /= 0) then
-            iostat = ios
-            if (present(iomsg)) iomsg = 'Cannot write: ' // trim(svg_file)
-            return
-        end if
-
-        plot_w = w_px - ML - MR
-        plot_h = h_px - MT - MB
-
-        e_min = energy_grid(1)
-        e_max = energy_grid(ne)
-        e_range = e_max - e_min
-        if (e_range < 1.0e-12_dp) e_range = 1.0_dp
-
-        y_max = 0.0_dp
-        do is = 1, nspin
-            do ie = 1, ne
-                if (dos_data(ie, is) > y_max) y_max = dos_data(ie, is)
-            end do
-        end do
-        y_max = y_max * 1.15_dp
-        if (y_max < 1.0e-12_dp) y_max = 1.0_dp
-
-        x_scale = real(plot_w, dp) / e_range
-        y_scale = real(plot_h, dp) / y_max
-        fermi_x = ML + nint((0.0_dp - e_min) * x_scale)
-
-        write(unit, '(a)') '<?xml version="1.0" encoding="UTF-8"?>'
-        write(unit, '(a,i0,a,i0,a,i0,a,i0,a)') &
-            '<svg xmlns="http://www.w3.org/2000/svg" width="', w_px, &
-            '" height="', h_px, '" viewBox="0 0 ', w_px, ' ', h_px, '">'
-        write(unit, '(a)') '  <rect width="100%" height="100%" fill="white"/>'
-        write(unit, '(a,i0,a,i0,a,i0,a,i0,a)') &
-            '  <rect x="', ML, '" y="', MT, &
-            '" width="', plot_w, '" height="', plot_h, &
-            '" fill="none" stroke="black" stroke-width="1"/>'
-
-        write(unit, '(a,i0,a,i0,a,i0,a,i0,a)') &
-            '  <line x1="', fermi_x, '" y1="', MT, &
-            '" x2="', fermi_x, '" y2="', MT + plot_h, &
-            '" stroke="red" stroke-width="1.5" stroke-dasharray="6,4"/>'
-        write(unit, '(a,i0,a,i0,a)') &
-            '  <text x="', fermi_x + 5, '" y="', MT + 15, &
-            '" fill="red" font-size="12">E_F</text>'
-
-        do is = 1, nspin
-            if (is == 1) then
-                rgb = 'rgb(114,135,253)'
-            else
-                rgb = 'rgb(221,120,120)'
-            end if
-            write(unit, '(a,a,a)') &
-                '  <polyline fill="none" stroke="', trim(rgb), '" stroke-width="1.5" points="'
-            do ie = 1, ne
-                x = ML + nint((energy_grid(ie) - e_min) * x_scale)
-                y = MT + plot_h - nint(dos_data(ie, is) * y_scale)
-                x = max(ML, min(ML + plot_w, x))
-                y = max(MT, min(MT + plot_h, y))
-                if (ie > 1) write(unit, '(1x)', advance='no')
-                write(unit, '(i0,a,i0)', advance='no') x, ',', y
-            end do
-            write(unit, '(a)') '"/>'
-        end do
-
-        write(unit, '(a,i0,a,i0,a)') &
-            '  <text x="15" y="', h_px/2, &
-            '" transform="rotate(-90,15,', h_px/2, &
-            ')" text-anchor="middle" font-size="14">DOS (electrons/eV)</text>'
-        write(unit, '(a,i0,a,i0,a)') &
-            '  <text x="', w_px/2, '" y="', h_px - 15, &
-            '" text-anchor="middle" font-size="14">Energy (eV) rel. to E_F</text>'
-        write(unit, '(a,i0,a,i0,a,a,a)') &
-            '  <text x="', w_px/2, '" y="', MT - 10, &
-            '" text-anchor="middle" font-size="16" font-weight="bold">', &
-            'Density of States</text>'
-        write(unit, '(a,i0,a,i0,a,f5.2,a)') &
-            '  <text x="', w_px/2, '" y="', h_px - 35, &
-            '" text-anchor="middle" font-size="11" fill="gray">smearing = ', &
-            smearing, ' eV</text>'
-
-        write(unit, '(a)') '</svg>'
-        close(unit)
-    end subroutine write_dos_svg
-
     ! ----------------------------------------------------------------
     !  PDOS multi-channel ASCII plot (s, p, d, f)
     ! ----------------------------------------------------------------
@@ -704,7 +592,7 @@ contains
         do iy = 1, nh
             fmt_label = ''
             if (mod(iy - 1, y_label_interval) == 0 .or. iy == 1 .or. iy == nh) then
-                dos_val = (real(nh - iy, dp) / real(nh - 1, dp)) * y_max
+                dos_val = y_max - real(iy - 1, dp) / real(nh - 1, dp) * (y_max - y_min)
                 write(fmt_label, '(f10.4)') dos_val
                 fmt_label = adjustl(fmt_label)
             end if

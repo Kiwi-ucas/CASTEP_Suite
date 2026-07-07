@@ -11,7 +11,7 @@ module pdos_parser
 
     public :: parse_pdos_file, free_pdos_data
 
-    integer, parameter :: MAX_PAYLOAD = 8192
+    integer, parameter :: MAX_PAYLOAD = 65536
 
 contains
 

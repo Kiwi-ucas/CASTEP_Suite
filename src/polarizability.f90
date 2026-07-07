@@ -129,7 +129,7 @@ contains
                     if (i == 3) idx = index(line, 'gamma =')
                     if (idx > 0) read(line(idx+7:), *, iostat=ios) angles(i)
                 end do
-                if (any(cell_abc > 0.0_dp)) found_cell = .true.
+                if (all(cell_abc > 0.0_dp)) found_cell = .true.
                 cycle
             end if
         end do
@@ -269,7 +269,6 @@ contains
             ! Parse X= Y= Z= values
             call parse_dipole_line(line, dx, dy, dz, ios)
             if (ios /= 0) then
-                close(dip_unit)
                 close(list_unit, status='delete')
                 iostat = IO_DIPOLE_ERROR
                 if (present(iomsg)) iomsg = 'Cannot parse dipole values in: ' // trim(fname)
@@ -385,6 +384,16 @@ contains
         if (data%n_frames < 2) then
             iostat = IO_DIPOLE_ERROR
             if (present(iomsg)) iomsg = 'Need at least 2 frames'
+            return
+        end if
+        if (data%temperature <= 0.0_dp) then
+            iostat = IO_DIPOLE_ERROR
+            if (present(iomsg)) iomsg = 'Temperature must be > 0'
+            return
+        end if
+        if (data%volume_ang3 <= 0.0_dp) then
+            iostat = IO_DIPOLE_ERROR
+            if (present(iomsg)) iomsg = 'Cell volume must be > 0'
             return
         end if
 

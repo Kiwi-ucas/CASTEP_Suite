@@ -9,8 +9,8 @@ module cell_writer
          PHONON_FINE_NONE, PHONON_QPOINT_MP_GRID, PHONON_QPOINT_PATH, &
          PHONON_METHOD_FD, PHONON_FINE_SUPERCELL, &
          KPOINT_GAMMA, KPOINT_MONKHORST_PACK, &
-         PSEUDO_NCP19, compare_tags, IO_WRITE_FAIL, &
-         castep_config_t, MAX_ATOMS
+         compare_tags, IO_WRITE_FAIL, &
+         castep_config_t
     implicit none
     private
 
@@ -30,18 +30,18 @@ contains
         write(unit, '(a)') ''
     end subroutine write_block_lattice_abc
 
-    ! ! subroutine write_block_lattice_cart(unit, cfg)
-    ! !     !! Write %BLOCK LATTICE_CART with Cartesian lattice vectors
-    ! !     integer, intent(in) :: unit
-    ! !     type(castep_config_t), intent(in) :: cfg
-    ! !
-    ! !     write(unit, '(a)') '%BLOCK LATTICE_CART'
-    ! !     write(unit, '(3(f12.7, 1x))') cfg%cell_basis(1, 1), cfg%cell_basis(1, 2), cfg%cell_basis(1, 3)
-    ! !     write(unit, '(3(f12.7, 1x))') cfg%cell_basis(2, 1), cfg%cell_basis(2, 2), cfg%cell_basis(2, 3)
-    ! !     write(unit, '(3(f12.7, 1x))') cfg%cell_basis(3, 1), cfg%cell_basis(3, 2), cfg%cell_basis(3, 3)
-    ! !     write(unit, '(a)') '%ENDBLOCK LATTICE_CART'
-    ! !     write(unit, '(a)') ''
-    ! ! end subroutine write_block_lattice_cart
+    subroutine write_block_lattice_cart(unit, cfg)
+        !! Write %BLOCK LATTICE_CART (commented out with # for comparison with LATTICE_ABC)
+        integer, intent(in) :: unit
+        type(castep_config_t), intent(in) :: cfg
+
+        write(unit, '(a)') '#%BLOCK LATTICE_CART'
+        write(unit, '(a,3(f12.7,1x))') '#', cfg%cell_basis(1,1), cfg%cell_basis(1,2), cfg%cell_basis(1,3)
+        write(unit, '(a,3(f12.7,1x))') '#', cfg%cell_basis(2,1), cfg%cell_basis(2,2), cfg%cell_basis(2,3)
+        write(unit, '(a,3(f12.7,1x))') '#', cfg%cell_basis(3,1), cfg%cell_basis(3,2), cfg%cell_basis(3,3)
+        write(unit, '(a)') '#%ENDBLOCK LATTICE_CART'
+        write(unit, '(a)') ''
+    end subroutine write_block_lattice_cart
 
     subroutine write_block_species_pot(unit, cfg)
         !! Write %BLOCK SPECIES_POT with unique atom kinds
@@ -299,6 +299,7 @@ contains
         write(unit, '(a)') ''
 
         call write_block_lattice_abc(unit, cfg)
+        call write_block_lattice_cart(unit, cfg)
 
         call write_block_positions_abs(unit, cfg)
         if (trim(cfg%task_type) == TASK_GEOMETRY_OPT) then
