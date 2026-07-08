@@ -8,6 +8,7 @@ use crate::AddAtomState;
 use crate::CrystalStore;
 use crate::Lattice;
 use crate::PhononState;
+use crate::RotateState;
 use crate::PanelRects;
 use crate::resources;
 
@@ -36,10 +37,11 @@ pub fn ui_system(
     mut picking: ResMut<PickingState>,
     mut atom_info: ResMut<AtomInfo>,
     meta: Option<Res<CrystalMeta>>,
-    move_state: Option<Res<MoveState>>,
+    mut move_state: ResMut<MoveState>,
     mut add_state: ResMut<AddAtomState>,
     crystal: Option<Res<CrystalStore>>,
     mut phonon_state: Option<ResMut<PhononState>>,
+    mut rotate_state: ResMut<RotateState>,
     mut panel_rects: ResMut<PanelRects>,
 ) {
     let ctx = contexts.ctx_mut();
@@ -62,18 +64,16 @@ pub fn ui_system(
     let bottom_resp = egui::TopBottomPanel::bottom("toolbar").show(ctx, |ui| {
         ui.horizontal(|ui| {
             if let Some(p) = sel_parent {
-                let step = move_state.as_ref().map(|m| m.step).unwrap_or(0.1);
                 let el = if p < atom_info.elements.len() {
                     atom_info.elements[p].as_str()
                 } else { "?" };
-                // Count images for this parent
                 let img_count = picking.parent_indices.iter().filter(|&&x| x == p).count();
                 ui.label(egui::RichText::new(
-                    format!("[Atom {} ({}) selected, {} images]  I/K:\u{b1}Z  J/L:\u{b1}X  U/O:\u{b1}Y  Step:{:.2}\u{c5}  [/]:adjust  D:delete",
-                        p, el, img_count, step)
+                    format!("Atom {} ({}) selected, {} images   H/K:\u{b1}X  U/M:\u{b1}Y  I/N:\u{b1}Z   D: delete",
+                        p, el, img_count)
                 ).strong());
             } else {
-                ui.label("\u{1f5b0} Right-drag: rotate | Scroll: zoom | Click: select | 1/2/3: mode | P: proj | B: bonds | C: cell | R: reset");
+                ui.label("\u{1f5b0} Right-drag: rotate | Scroll: zoom | Click: select | 1/2/3: mode | P: proj | A: axes | B: bonds | C: cell | R: reset");
             }
         });
     });
@@ -81,7 +81,7 @@ pub fn ui_system(
 
     // ── Left panel: atom list (asymmetric unit only) ──
     let left_resp = egui::SidePanel::left("atom_list")
-        .resizable(true).default_width(180.0)
+        .resizable(false).default_width(180.0)
         .show(ctx, |ui| {
             ui.heading("Atoms");
             ui.separator();
@@ -89,7 +89,7 @@ pub fn ui_system(
                 add_state.show_table = true;
             }
             ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                 for i in 0..count {
                     let label = format!("{:2}. {:3}", i, atom_info.elements[i]);
                     let selected = sel_parent == Some(i);
@@ -135,7 +135,7 @@ pub fn ui_system(
 
     // ── Right panel ──
     let right_resp = egui::SidePanel::right("info_panel")
-        .resizable(true).default_width(220.0)
+        .resizable(false).default_width(220.0)
         .show(ctx, |ui| {
             // Crystal info header
             if let Some(m) = meta.as_ref() {
@@ -186,6 +186,21 @@ pub fn ui_system(
             } else {
                 ui.label("Click an atom\nto see details");
             }
+
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Move Step");
+                    ui.add(egui::DragValue::new(&mut move_state.step)
+                        .speed(0.05)
+                        .suffix(" \u{c5}"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Rotation Angle");
+                    ui.add(egui::DragValue::new(&mut rotate_state.angle_deg)
+                        .suffix("\u{b0}"));
+                });
+                ui.separator();
+            });
         });
     panel_rects.right = Some(right_resp.response.rect);
 

@@ -7,7 +7,7 @@ A Fortran 2018 CLI toolkit for [CASTEP] DFT calculations — generate input file
 | Mode | What it does |
 |------|-------------|
 | **PreCASTEP** | Converts `.cif` / `.pdb` / `.cell` structure files into CASTEP `.cell` + `.param` input files via an interactive menu |
-| **PosCASTEP** | Post-processes CASTEP output: band structure plots with gap analysis, total DOS, projected DOS (s/p/d/f), phonon DOS, IR spectrum, Raman spectrum, and static polarizability — all as interactive ASCII terminal plots, SVG, or CSV |
+| **PosCASTEP** | Post-processes CASTEP output: band structure plots with gap analysis, total DOS, projected DOS (s/p/d/f), phonon DOS, IR spectrum, Raman spectrum, and static polarizability — all as interactive ASCII terminal plots or CSV export |
 
 ## Requirements
 
@@ -180,7 +180,6 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
 - Unicode box frame, multi-symbol bands (● ○ □ △ ▽)
 - k-point path labels auto-detected from direction changes
 - Controls: `↑↓` scroll energy, `← →` scroll k-path, `+/-` zoom both axes, `R` reset, `Q` quit
-- SVG vector output available
 
 ### 2. Plot DOS (total density of states)
 
@@ -188,7 +187,7 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
 - Smearing width configurable (default 0.1 eV)
 - Interactive ASCII plot with y=0 reference line
 - Controls: `↑↓` y-axis pan, `← →` x-axis pan, `+/-` overall zoom (both axes), `R` reset
-- Output modes: **ASCII** (terminal), **SVG**, **CSV** (for Origin etc.)
+- Output modes: **ASCII** (terminal), **CSV** (for Origin etc.)
 - Path memory: Enter to reuse last `.bands` path
 
 ### 3. Plot pDOS (partial density of states)
@@ -229,10 +228,11 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
 
 - Auto-parses CIF, PDB, or CASTEP .cell files
 - **Full unit cell display**: automatic expansion from asymmetric unit (applies ±1 fractional translations)
-- **Interactive 3D**: right-drag to rotate, scroll to zoom, click/hover to select atoms
-- **Atom editing**: select an atom → use IJKLUO keys (±X/±Y/±Z) to move; all symmetry-equivalent copies move in sync
-- **Display modes**: 1=ball-stick, 2=space-filling, 3=wireframe; B=toggle bonds, C=toggle cell frame, P=toggle ortho/perspective
-- **Step size**: `[`/`]` cycles through 0.01/0.05/0.1/0.5/1.0 Å
+- **Interactive 3D**: right-drag or arrow keys (←↓↑→) to rotate, scroll to zoom, click/hover to select atoms
+- **Atom editing**: select an atom → use HKUMIN keys (±X/±Y/±Z) to move; all symmetry-equivalent copies move in sync
+- **Display modes**: 1=ball-stick, 2=space-filling, 3=wireframe; A=toggle cell axes, B=toggle bonds, C=toggle cell frame, P=toggle ortho/perspective, R=reset camera
+- **Right panel controls**: Rotation Angle DragValue (1°–90°, default 45°), Move Step DragValue (0.01–10 Å, default 0.5 Å)
+- **Cell axes**: A toggles red X/green Y/blue Z arrows from cell origin along lattice vectors (1.5× length)
 - **Modified structure**: on close, if atoms were moved, prompts to (1) save as CIF/PDB/cell or (2) pass directly to PreCASTEP for input generation
 - JSON auto-cleaned after viewing; output files follow original input name
 
@@ -272,12 +272,12 @@ CASTEP_Suite/
 │   ├── cell_writer.f90      # CASTEP .cell file generator (%BLOCK format)
 │   ├── param_writer.f90     # CASTEP .param file generator (key-value)
 │   ├── bands_parser.f90     # CASTEP .bands file parser
-│   ├── bands_plotter.f90    # Band structure ASCII + SVG plotter
+│   ├── bands_plotter.f90    # Band structure ASCII plotter
 │   ├── pdos_parser.f90      # Binary .pdos_bin / .pdos_weights parser
 │   ├── phonon_dos.f90       # .phonon parser, phonon DOS, IR & Raman spectra
 │   ├── phonon_modes.f90     # Eigenvector/Born charge parser, mode decomposition
 │   ├── dos_compute.f90      # Gaussian smearing DOS + PDOS computation
-│   ├── dos_plotter.f90      # DOS / PDOS ASCII + SVG + CSV plotter
+│   ├── dos_plotter.f90      # DOS / PDOS ASCII + CSV plotter
 │   ├── cli_menu.f90         # PreCASTEP configuration menu
 │   ├── poscastep_menu.f90   # PosCASTEP post-processing + viewer integration
 │   ├── crystal_json.f90     # JSON bridge for Rust crystal-viewer

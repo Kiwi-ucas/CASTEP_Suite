@@ -22,12 +22,15 @@ fn main() {
         .insert_resource(CrystalPath(json_path.to_string()))
         .init_resource::<PanelRects>()
         .add_systems(Startup, setup)
+        .insert_resource(RotateState { angle_deg: 45.0 })
         .add_systems(Update, (ui_system, orbit_camera).chain())
+        .add_systems(Update, rotate_camera_keys.after(ui_system))
         .add_systems(Update, (click_pick, hover_pick).chain().after(ui_system))
         .add_systems(Update, highlight_atoms.after(ui_system))
         .add_systems(Update, move_selected_atom.after(highlight_atoms))
         .add_systems(Update, (add_atom_system, delete_atom_system))
-        .add_systems(Update, (display_mode_system, sync_atom_radii))
+        .add_systems(Update, (display_mode_system, sync_atom_radii).chain())
+        .add_systems(Update, sync_axes_visibility.after(display_mode_system))
         .add_systems(Update, (toggle_projection, sync_arrow_visibility))
         .run();
 }
@@ -61,7 +64,8 @@ struct AddAtomState {
 #[derive(Resource)]
 struct CachedSphere(Handle<Mesh>);
 #[derive(Resource)] struct MoveState { step: f32 }
-#[derive(Component)] struct MainCamera;
+#[derive(Resource)] pub struct RotateState { pub angle_deg: f32 }
+#[derive(Component)] pub struct MainCamera;
 #[derive(Component)] struct FollowCamera;
 #[derive(Component)] struct AtomMarker;
 #[derive(Component)] struct BondMarker;
@@ -79,10 +83,15 @@ pub struct PhononState {
 }
 
 #[derive(Resource)]
+#[derive(Component)]
+struct CellAxes;
+
+#[derive(Resource)]
 struct DisplayMode {
     mode: u8,          // 1=ball-stick, 2=space-filling, 3=wireframe
     show_bonds: bool,
     show_cell: bool,
+    show_axes: bool,
 }
 
 /// Saved initial camera state for R-key reset
@@ -95,7 +104,7 @@ pub struct CameraState { pub focus: Vec3, pub radius: f32, pub rot: Quat }
 #[derive(Default)] struct InputState { rotating: bool }
 
 #[derive(Resource, PartialEq)]
-enum ProjMode { Perspective, Orthographic }
+pub enum ProjMode { Perspective, Orthographic }
 
 fn ortho_projection(scale: f32) -> Projection {
     Projection::Orthographic(OrthographicProjection {
@@ -113,7 +122,9 @@ fn toggle_projection(
     mut ortho_scale: ResMut<OrthoScale>,
     mut cam_state: ResMut<CameraState>,
     mut camera_q: Query<&mut Projection, With<MainCamera>>,
+    mut contexts: EguiContexts,
 ) {
+    if contexts.ctx_mut().wants_keyboard_input() { return; }
     if keys.just_pressed(KeyCode::KeyP) {
         *proj_mode = match *proj_mode {
             ProjMode::Perspective => {
@@ -138,7 +149,7 @@ fn toggle_projection(
 }
 
 #[derive(Resource)]
-struct OrthoScale(f32);  // vertical world units visible in ortho mode
+pub struct OrthoScale(pub f32);  // vertical world units visible in ortho mode
 
 fn orbit_camera(
     mut camera_q: Query<&mut Transform, (With<MainCamera>, Without<FollowCamera>)>,
@@ -223,43 +234,70 @@ fn orbit_camera(
     }
 }
 
+// ── Arrow key camera rotation ──
+
+fn rotate_camera_keys(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut cam_state: ResMut<CameraState>,
+    rotate_state: Res<RotateState>,
+    mut contexts: EguiContexts,
+) {
+    if contexts.ctx_mut().wants_keyboard_input() { return; }
+
+    let angle_rad = rotate_state.angle_deg.clamp(1.0, 90.0).to_radians();
+    let mut delta = Quat::IDENTITY;
+
+    // ← → : yaw around world Y axis
+    if keys.just_pressed(KeyCode::ArrowRight) {
+        delta = Quat::from_axis_angle(Vec3::Y, -angle_rad);
+    }
+    if keys.just_pressed(KeyCode::ArrowLeft) {
+        delta = Quat::from_axis_angle(Vec3::Y, angle_rad);
+    }
+
+    // ↑ ↓ : pitch around camera's right axis
+    if keys.just_pressed(KeyCode::ArrowUp) {
+        let right = cam_state.rot * Vec3::X;
+        delta = Quat::from_axis_angle(right, angle_rad);
+    }
+    if keys.just_pressed(KeyCode::ArrowDown) {
+        let right = cam_state.rot * Vec3::X;
+        delta = Quat::from_axis_angle(right, -angle_rad);
+    }
+
+    if delta != Quat::IDENTITY {
+        cam_state.rot = (delta * cam_state.rot).normalize();
+    }
+}
+
 // ── Atom movement ──
 
 fn move_selected_atom(
     keys: Res<ButtonInput<KeyCode>>,
     mut picking: ResMut<PickingState>,
     mut atoms: Query<&mut Transform, With<AtomMarker>>,
-    mut move_state: ResMut<MoveState>,
+    mut contexts: EguiContexts,
+    move_state: Res<MoveState>,
     mut crystal: ResMut<CrystalStore>,
     lattice: Res<LatticeData>,
     offsets: Res<ImageOffsets>,
 ) {
+    if contexts.ctx_mut().wants_keyboard_input() { return; }
     if picking.selected < 0 { return; }
     let i = picking.selected as usize;
     if i >= picking.parent_indices.len() { return; }
 
-    let step = move_state.step;
+    let step = move_state.step.clamp(0.01, 10.0);
     let mut dx = 0.0_f32;
     let mut dy = 0.0_f32;
     let mut dz = 0.0_f32;
 
-    if keys.just_pressed(KeyCode::KeyL) { dx = step; }
-    if keys.just_pressed(KeyCode::KeyJ) { dx = -step; }
+    if keys.just_pressed(KeyCode::KeyH) { dx = step; }
+    if keys.just_pressed(KeyCode::KeyK) { dx = -step; }
     if keys.just_pressed(KeyCode::KeyU) { dy = step; }
-    if keys.just_pressed(KeyCode::KeyO) { dy = -step; }
+    if keys.just_pressed(KeyCode::KeyM) { dy = -step; }
     if keys.just_pressed(KeyCode::KeyI) { dz = step; }
-    if keys.just_pressed(KeyCode::KeyK) { dz = -step; }
-
-    if keys.just_pressed(KeyCode::BracketRight) {
-        move_state.step = match move_state.step {
-            0.01 => 0.05, 0.05 => 0.1, 0.1 => 0.5, 0.5 => 1.0, _ => 0.01,
-        };
-    }
-    if keys.just_pressed(KeyCode::BracketLeft) {
-        move_state.step = match move_state.step {
-            1.0 => 0.5, 0.5 => 0.1, 0.1 => 0.05, 0.05 => 0.01, _ => 1.0,
-        };
-    }
+    if keys.just_pressed(KeyCode::KeyN) { dz = -step; }
 
     if dx != 0.0 || dy != 0.0 || dz != 0.0 {
         let parent = picking.parent_indices[i];
@@ -406,7 +444,9 @@ fn delete_atom_system(
     mut offsets: ResMut<ImageOffsets>,
     mut atom_info: ResMut<ui::AtomInfo>,
     mut commands: Commands,
+    mut contexts: EguiContexts,
 ) {
+    if contexts.ctx_mut().wants_keyboard_input() { return; }
     if !keys.just_pressed(KeyCode::KeyD) || picking.selected < 0 { return; }
     let i = picking.selected as usize;
     if i >= picking.parent_indices.len() { return; }
@@ -496,10 +536,12 @@ fn setup(
     let edges = CrystalData::cell_edges();
     let n = positions.len();
 
-    commands.insert_resource(LatticeData {
+    let lattice = LatticeData {
         vecs: data.lattice.to_vectors(),
         inv: data.lattice.inverse_vectors(),
-    });
+    };
+    spawn_cell_axes(&mut commands, &mut meshes, &mut materials, &lattice);
+    commands.insert_resource(lattice);
 
     let sphere = meshes.add(uv_sphere(0.5, 32, 32));
     commands.insert_resource(CachedSphere(sphere.clone()));
@@ -561,7 +603,7 @@ fn setup(
         data: data.clone(),
         json_path: crystal_path.0.clone(),
     });
-    commands.insert_resource(MoveState { step: 0.1 });
+    commands.insert_resource(MoveState { step: 0.5 });
     commands.insert_resource(AddAtomState::default());
 
     // Atom metadata for UI
@@ -571,7 +613,7 @@ fn setup(
         .collect();
     let radii: Vec<f32> = elements.iter().map(|el| resources::covalent_radius(el)).collect();
     commands.insert_resource(AtomInfo::new(elements, labels, radii));
-    commands.insert_resource(DisplayMode { mode: 1, show_bonds: false, show_cell: true });
+    commands.insert_resource(DisplayMode { mode: 1, show_bonds: false, show_cell: true, show_axes: false });
 
     // Crystal metadata for UI (strip .json extension from filename)
     let fname = if crystal_path.0.is_empty() {
@@ -770,6 +812,59 @@ fn spawn_phonon_arrows(
     }
 }
 
+fn spawn_cell_axes(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    lattice: &LatticeData,
+) {
+    let shaft_r = 0.04;
+    let head_r = 0.12;
+    let head_h = 0.3;
+    let cone = meshes.add(cone_mesh(head_r, head_h, 16));
+
+    let colors = [
+        Color::srgb(0.9, 0.2, 0.2), // X red
+        Color::srgb(0.2, 0.9, 0.2), // Y green
+        Color::srgb(0.2, 0.4, 1.0), // Z blue
+    ];
+
+    for axis in 0..3 {
+        let dir = lattice.vecs[axis].normalize();
+        let total_len = lattice.vecs[axis].length() * 1.5;
+        let shaft_len = (total_len - head_h).max(0.02);
+        let rot = Quat::from_rotation_arc(Vec3::Y, dir);
+
+        let mat = materials.add(StandardMaterial {
+            base_color: colors[axis],
+            unlit: true,
+            depth_bias: -10.0,
+            ..default()
+        });
+
+        let shaft_mid = dir * shaft_len * 0.5;
+        if shaft_len > 0.02 {
+            let shaft = meshes.add(Cylinder::new(shaft_r, shaft_len));
+            commands.spawn((
+                Mesh3d(shaft),
+                MeshMaterial3d(mat.clone()),
+                Transform::from_translation(shaft_mid).with_rotation(rot),
+                CellAxes,
+                Visibility::Hidden,
+            ));
+        }
+
+        let head_pos = dir * shaft_len;
+        commands.spawn((
+            Mesh3d(cone.clone()),
+            MeshMaterial3d(mat.clone()),
+            Transform::from_translation(head_pos).with_rotation(rot),
+            CellAxes,
+            Visibility::Hidden,
+        ));
+    }
+}
+
 fn spawn_bond(
     commands: &mut Commands, meshes: &mut ResMut<Assets<Mesh>>,
     material: &Handle<StandardMaterial>, a: Vec3, b: Vec3, marker: BondMarker,
@@ -793,7 +888,9 @@ fn display_mode_system(
     bonds: Query<Entity, With<BondMarker>>,
     cells: Query<Entity, With<CellMarker>>,
     mut commands: Commands,
+    mut contexts: EguiContexts,
 ) {
+    if contexts.ctx_mut().wants_keyboard_input() { return; }
     let update_scales = |mode: &mut u8| -> bool {
         let changed = matches!(
             (keys.just_pressed(KeyCode::Digit1), keys.just_pressed(KeyCode::Digit2), keys.just_pressed(KeyCode::Digit3)),
@@ -841,6 +938,9 @@ fn display_mode_system(
         let vis = if display.show_cell { Visibility::Visible } else { Visibility::Hidden };
         for e in cells.iter() { commands.entity(e).insert(vis); }
     }
+    if keys.just_pressed(KeyCode::KeyA) {
+        display.show_axes = !display.show_axes;
+    }
 }
 
 fn default_cu_fcc() -> CrystalData {
@@ -867,6 +967,18 @@ fn sync_arrow_visibility(
     if !state.is_changed() { return; }
     let vis = if state.show_arrows { Visibility::Inherited } else { Visibility::Hidden };
     for mut v in arrow_q.iter_mut() {
+        *v = vis;
+    }
+}
+
+/// Toggle cell axes visibility based on DisplayMode.show_axes
+fn sync_axes_visibility(
+    display: Res<DisplayMode>,
+    mut axes_q: Query<&mut Visibility, With<CellAxes>>,
+) {
+    if !display.is_changed() { return; }
+    let vis = if display.show_axes { Visibility::Inherited } else { Visibility::Hidden };
+    for mut v in axes_q.iter_mut() {
         *v = vis;
     }
 }
