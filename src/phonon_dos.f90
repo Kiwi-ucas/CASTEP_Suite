@@ -1,11 +1,13 @@
 module phonon_dos
-    !! Parse CASTEP .phonon files and compute phonon DOS via Gaussian smearing
+    !! Parse CASTEP .phonon files and compute phonon DOS via Gaussian smearing.
+    !! Handles only frequencies, q-point weights, and eigenvectors.
+    !! IR and Raman data are parsed from .castep via the castep_vib module.
     use castep_config, only: dp, pi
     implicit none
     private
 
-    public :: phonon_dos_data_t, parse_phonon_file, compute_phonon_dos, compute_ir_spectrum, &
-        compute_raman_spectrum, free_phonon_dos_data
+    public :: phonon_dos_data_t, parse_phonon_file, compute_phonon_dos, &
+        free_phonon_dos_data
 
     integer, parameter :: MAX_LINE = 1024
 
@@ -17,15 +19,14 @@ module phonon_dos
         real(dp), allocatable :: phdos(:)    ! PHDOS on grid
         real(dp), allocatable :: freqs(:)    ! raw frequencies (n_branches * n_qpoints)
         real(dp), allocatable :: weights(:)  ! q-point weights (n_qpoints)
-        real(dp), allocatable :: ir_intensity(:)    ! IR intensity per mode (Gamma q-pt)
-        real(dp), allocatable :: ir_spectrum(:)    ! broadened IR spectrum
-        real(dp), allocatable :: raman_activity(:) ! Raman activity per mode (Gamma q-pt)
-        real(dp), allocatable :: raman_spectrum(:) ! broadened Raman spectrum
     end type phonon_dos_data_t
 
 contains
 
     subroutine parse_phonon_file(filename, data, iostat, iomsg)
+        !! Parse .phonon file: header metadata, q-point frequencies + weights.
+        !! Eigenvector blocks are skipped. No IR/Raman data is read —
+        !! use the castep_vib module to parse those from .castep instead.
         character(len=*), intent(in) :: filename
         type(phonon_dos_data_t), intent(out) :: data
         integer, intent(out) :: iostat
@@ -33,9 +34,8 @@ contains
         integer :: unit, ios, i, j, nb, nq
         character(len=MAX_LINE) :: line
         character(len=20) :: key
-        real(dp) :: qx, qy, qz, weight, freq, dummy
+        real(dp) :: qx, qy, qz, weight, freq
         integer :: n_read
-        logical :: is_gamma
 
         iostat = 0
 
@@ -69,44 +69,35 @@ contains
         nq = data%n_qpoints
         nb = data%n_branches
         allocate(data%freqs(nb * nq), data%weights(nq))
-        allocate(data%ir_intensity(nb), data%raman_activity(nb))  ! Gamma q-pt only
-        data%ir_intensity = 0.0_dp
-        data%raman_activity = 0.0_dp
 
         ! ── Parse q-point blocks ──
         data%freq_min = huge(1.0_dp)
         data%freq_max = -huge(1.0_dp)
 
         do j = 1, nq
-            ! Read q-point header line
+            ! Read q-point header: "q-pt= N qx qy qz weight"
             read(unit, '(a)', iostat=ios) line
             if (ios /= 0) then
                 iostat = 102; if (present(iomsg)) iomsg = 'Unexpected end of .phonon file'
                 close(unit); return
             end if
-
-            ! Determine if Gamma point (has direction vector → more fields)
-            is_gamma = (j == 1)
-            if (is_gamma) then
-                read(line, *, iostat=ios) key, key, qx, qy, qz, weight, dummy, dummy, dummy
-            else
-                read(line, *, iostat=ios) key, key, qx, qy, qz, weight
-            end if
+            read(line, *, iostat=ios) key, key, qx, qy, qz, weight
             if (ios /= 0) then
                 iostat = 103; if (present(iomsg)) iomsg = 'Error reading q-point header'
                 close(unit); return
             end if
             data%weights(j) = weight
 
-            ! Read frequency lines
+            ! Read frequency lines: "N  freq" (2 fields, same for all q-points)
             do i = 1, nb
-                if (is_gamma) then
-                    read(unit, *, iostat=ios) n_read, freq, data%ir_intensity(i), data%raman_activity(i)
-                else
-                    read(unit, *, iostat=ios) n_read, freq
-                end if
+                read(unit, '(a)', iostat=ios) line
                 if (ios /= 0) then
                     iostat = 104; if (present(iomsg)) iomsg = 'Error reading phonon frequencies'
+                    close(unit); return
+                end if
+                read(line, *, iostat=ios) n_read, freq
+                if (ios /= 0) then
+                    iostat = 105; if (present(iomsg)) iomsg = 'Error parsing phonon frequency line'
                     close(unit); return
                 end if
                 data%freqs((j - 1) * nb + i) = freq
@@ -114,12 +105,13 @@ contains
                 if (freq > data%freq_max) data%freq_max = freq
             end do
 
-            ! Skip eigenvector block: 2 header lines + nb * n_ions data lines
-            do i = 1, 2 + nb * data%n_ions
+            ! Skip eigenvector block — read until next "q-pt=" line or EOF
+            do
                 read(unit, '(a)', iostat=ios) line
-                if (ios /= 0) then
-                    iostat = 105; if (present(iomsg)) iomsg = 'Error reading phonon eigenvectors'
-                    close(unit); return
+                if (ios /= 0) exit  ! EOF — last q-point
+                if (index(line, 'q-pt=') > 0) then
+                    backspace(unit)
+                    exit
                 end if
             end do
         end do
@@ -127,7 +119,10 @@ contains
         close(unit)
     end subroutine parse_phonon_file
 
-    subroutine compute_phonon_dos(data, freq_range_min, freq_range_max, n_points, smearing, iostat, iomsg)
+
+    subroutine compute_phonon_dos(data, freq_range_min, freq_range_max, n_points, &
+                                   smearing, iostat, iomsg)
+        !! Compute phonon DOS via Gaussian smearing of mode frequencies.
         type(phonon_dos_data_t), intent(inout) :: data
         real(dp), intent(in) :: freq_range_min, freq_range_max
         integer, intent(in) :: n_points
@@ -157,7 +152,8 @@ contains
 
         ! Build frequency grid
         do i = 1, n_alloc
-            data%freq_grid(i) = freq_range_min + (freq_range_max - freq_range_min) * real(i - 1, dp) / real(n_alloc - 1, dp)
+            data%freq_grid(i) = freq_range_min + &
+                (freq_range_max - freq_range_min) * real(i - 1, dp) / real(n_alloc - 1, dp)
         end do
 
         sigma = smearing
@@ -175,109 +171,12 @@ contains
         end do
     end subroutine compute_phonon_dos
 
-    subroutine compute_ir_spectrum(data, freq_range_min, freq_range_max, n_points, smearing, iostat, iomsg)
-        type(phonon_dos_data_t), intent(inout) :: data
-        real(dp), intent(in) :: freq_range_min, freq_range_max
-        integer, intent(in) :: n_points
-        real(dp), intent(in) :: smearing
-        integer, intent(out) :: iostat
-        character(len=*), optional, intent(out) :: iomsg
-
-        real(dp) :: freq, sigma, norm, dE, gauss, ir_val
-        integer :: i, j, n_alloc
-        real(dp), parameter :: GAUSS_CUTOFF = 5.0_dp
-
-        iostat = 0
-
-        if (.not. allocated(data%ir_intensity)) then
-            iostat = 102
-            if (present(iomsg)) iomsg = 'No IR intensity data loaded'
-            return
-        end if
-
-        n_alloc = min(n_points, 4001)
-
-        if (allocated(data%ir_spectrum)) deallocate(data%ir_spectrum)
-        allocate(data%ir_spectrum(n_alloc))
-        data%ir_spectrum = 0.0_dp
-        data%smearing = smearing
-
-        do i = 1, n_alloc
-            data%freq_grid(i) = freq_range_min + (freq_range_max - freq_range_min) * real(i - 1, dp) / real(n_alloc - 1, dp)
-        end do
-
-        sigma = smearing
-        norm = 1.0_dp / (sigma * sqrt(2.0_dp * pi))
-
-        do i = 1, n_alloc
-            freq = data%freq_grid(i)
-            do j = 1, data%n_branches
-                ir_val = data%ir_intensity(j)
-                if (ir_val <= 0.0_dp) cycle
-                dE = freq - data%freqs(j)  ! Gamma = first n_branches entries
-                if (abs(dE) > GAUSS_CUTOFF * sigma) cycle
-                gauss = norm * exp(-0.5_dp * (dE / sigma)**2)
-                data%ir_spectrum(i) = data%ir_spectrum(i) + gauss * ir_val
-            end do
-        end do
-    end subroutine compute_ir_spectrum
-
-    subroutine compute_raman_spectrum(data, freq_range_min, freq_range_max, n_points, smearing, iostat, iomsg)
-        type(phonon_dos_data_t), intent(inout) :: data
-        real(dp), intent(in) :: freq_range_min, freq_range_max
-        integer, intent(in) :: n_points
-        real(dp), intent(in) :: smearing
-        integer, intent(out) :: iostat
-        character(len=*), optional, intent(out) :: iomsg
-
-        real(dp) :: freq, sigma, norm, dE, gauss, ram_val
-        integer :: i, j, n_alloc
-        real(dp), parameter :: GAUSS_CUTOFF = 5.0_dp
-
-        iostat = 0
-
-        if (.not. allocated(data%raman_activity)) then
-            iostat = 102
-            if (present(iomsg)) iomsg = 'No Raman activity data loaded'
-            return
-        end if
-
-        n_alloc = min(n_points, 4001)
-
-        if (allocated(data%raman_spectrum)) deallocate(data%raman_spectrum)
-        allocate(data%raman_spectrum(n_alloc))
-        data%raman_spectrum = 0.0_dp
-        data%smearing = smearing
-
-        do i = 1, n_alloc
-            data%freq_grid(i) = freq_range_min + (freq_range_max - freq_range_min) * real(i - 1, dp) / real(n_alloc - 1, dp)
-        end do
-
-        sigma = smearing
-        norm = 1.0_dp / (sigma * sqrt(2.0_dp * pi))
-
-        do i = 1, n_alloc
-            freq = data%freq_grid(i)
-            do j = 1, data%n_branches
-                ram_val = data%raman_activity(j)
-                if (ram_val <= 0.0_dp) cycle
-                dE = freq - data%freqs(j)
-                if (abs(dE) > GAUSS_CUTOFF * sigma) cycle
-                gauss = norm * exp(-0.5_dp * (dE / sigma)**2)
-                data%raman_spectrum(i) = data%raman_spectrum(i) + gauss * ram_val
-            end do
-        end do
-    end subroutine compute_raman_spectrum
 
     subroutine free_phonon_dos_data(data)
         type(phonon_dos_data_t), intent(inout) :: data
-        if (allocated(data%freqs)) deallocate(data%freqs)
+        if (allocated(data%freqs))   deallocate(data%freqs)
         if (allocated(data%weights)) deallocate(data%weights)
-        if (allocated(data%phdos)) deallocate(data%phdos)
-        if (allocated(data%ir_intensity)) deallocate(data%ir_intensity)
-        if (allocated(data%ir_spectrum)) deallocate(data%ir_spectrum)
-        if (allocated(data%raman_activity)) deallocate(data%raman_activity)
-        if (allocated(data%raman_spectrum)) deallocate(data%raman_spectrum)
+        if (allocated(data%phdos))   deallocate(data%phdos)
         data%n_ions = 0; data%n_branches = 0; data%n_qpoints = 0
     end subroutine free_phonon_dos_data
 

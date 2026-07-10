@@ -8,7 +8,9 @@ module poscastep_menu
         compute_cartesian_lattice
     use parser, only: parse_cif_inline, parse_pdb_inline, parse_cell_inline
     use phonon_dos, only: phonon_dos_data_t, parse_phonon_file, compute_phonon_dos, &
-        compute_ir_spectrum, compute_raman_spectrum, free_phonon_dos_data
+        free_phonon_dos_data
+    use castep_vib, only: vib_data_t, parse_castep_vib, compute_ir_spectrum, &
+        compute_raman_spectrum, free_vib_data
     use phonon_modes, only: phonon_modes_data_t, parse_phonon_eigenvectors, &
         parse_castep_born_charges, compute_mode_decomposition, free_phonon_modes_data
     use crystal_json, only: write_crystal_json_modes
@@ -24,6 +26,7 @@ module poscastep_menu
     use dos_plotter, only: DOS_MODE_ASCII, DOS_MODE_EXPORT, &
         plot_dos_ascii, write_dos_csv, plot_pdos_ascii, write_pdos_csv
     use crystal_json, only: write_crystal_json_cif, read_crystal_json_to_cif
+    use thermodynamics, only: thermo_data_t, compute_thermodynamics, free_thermo_data
     implicit none
     private
 
@@ -38,6 +41,7 @@ module poscastep_menu
     integer, parameter :: POS_RAMAN_SPEC = 6
     integer, parameter :: POS_POLARIZABILITY = 7
     integer, parameter :: POS_PHONON_MODES  = 8
+    integer, parameter :: POS_THERMO        = 9
     integer, parameter :: POS_VIEW_STRUCTURE = -1
 
     ! Module-level storage for PreCASTEP handoff (option 2: no file on disk)
@@ -73,6 +77,7 @@ contains
             write(*, '(a)') '  6. Plot Raman Spectrum'
             write(*, '(a)') '  7. Static Polarizability'
             write(*, '(a)') '  8. Phonon Mode Visualization'
+            write(*, '(a)') '  9. Thermodynamics'
             write(*, '(a)') '  Q. Back'
             write(*, '(a)', advance='no') '  Select option: '
 
@@ -124,12 +129,15 @@ contains
             case (POS_PHONON_MODES)
                 call handle_phonon_modes_menu(iostat)
                 if (iostat == IO_USER_QUIT) return
+            case (POS_THERMO)
+                call handle_thermo_menu(iostat)
+                if (iostat == IO_USER_QUIT) return
             case (POS_VIEW_STRUCTURE)
                 call handle_view_structure(iostat)
                 if (iostat == IO_USER_QUIT) return
                 if (iostat == IO_PRECASTEP_LAUNCH) return
             case default
-                write(*, '(a)') '  Invalid option. Enter 0-8, -1, or Q.'
+                write(*, '(a)') '  Invalid option. Enter 0-9, -1, or Q.'
             end select
         end do
     end subroutine run_poscastep_menu
@@ -676,18 +684,19 @@ contains
     end subroutine handle_phonon_dos_menu
 
     subroutine handle_ir_menu(iostat)
+        !! IR spectrum from .castep file (explicit column headers for IR/Raman)
         integer, intent(out) :: iostat
-        type(phonon_dos_data_t) :: phdos
+        type(vib_data_t) :: vib
         character(len=MAX_LINE_LEN) :: fname, input, tmp_str
         integer :: ios, plot_mode
-        real(dp) :: freq_min_range, freq_max_range, smearing_width
-        character(len=MAX_LINE_LEN), save :: last_phonon_path = ''
+        real(dp) :: freq_min, freq_max, freq_min_range, freq_max_range, smearing_width
+        character(len=MAX_LINE_LEN), save :: last_castep_path = ''
 
         iostat = 0
 
-        write(*, '(a)', advance='no') '  Enter .phonon file path'
-        if (len_trim(last_phonon_path) > 0) &
-            write(*, '(a)', advance='no') ' [' // trim(last_phonon_path) // ']'
+        write(*, '(a)', advance='no') '  Enter .castep file path'
+        if (len_trim(last_castep_path) > 0) &
+            write(*, '(a)', advance='no') ' [' // trim(last_castep_path) // ']'
         write(*, '(a)') ': '
 
         read(*, '(a)', iostat=ios) fname
@@ -696,21 +705,22 @@ contains
         if (fname == 'q' .or. fname == 'Q') then
             iostat = 0; return
         end if
-        if (len_trim(fname) == 0 .and. len_trim(last_phonon_path) > 0) then
-            fname = last_phonon_path
+        if (len_trim(fname) == 0 .and. len_trim(last_castep_path) > 0) then
+            fname = last_castep_path
         end if
         if (len_trim(fname) == 0) then
             write(*, '(a)') '  No file specified.'; return
         end if
-        last_phonon_path = trim(fname)
+        last_castep_path = trim(fname)
 
-        call parse_phonon_file(trim(fname), phdos, ios)
+        call parse_castep_vib(trim(fname), vib, ios)
         if (ios /= 0) then
-            write(*, '(a)') '  Error parsing .phonon file.'; return
+            write(*, '(a,i0)') '  Error parsing .castep file, code=', ios
+            return
         end if
 
-        write(*, '(a,i0,a,i0,a)') '  Loaded ', phdos%n_branches, ' modes at Gamma, ', &
-            count(phdos%ir_intensity > 0.0_dp), ' IR-active.'
+        write(*, '(a,i0,a,i0,a)') '  Loaded ', vib%n_modes, ' Gamma modes, ', &
+            count(vib%ir_intensity > 0.0_dp .and. vib%ir_active), ' IR-active.'
 
         ! ── Output mode menu ──
         write(*, '(a)') '  Output mode:'
@@ -736,40 +746,42 @@ contains
         smearing_width = max(0.5_dp, min(50.0_dp, smearing_width))
 
         ! ── Compute IR spectrum ──
-        freq_min_range = max(0.0_dp, phdos%freq_min - 50.0_dp)
-        freq_max_range = phdos%freq_max + 50.0_dp
-        call compute_ir_spectrum(phdos, freq_min_range, freq_max_range, 4001, smearing_width, ios)
-        if (ios /= 0 .or. .not. allocated(phdos%ir_spectrum)) then
+        freq_min = minval(vib%freq)
+        freq_max = maxval(vib%freq)
+        freq_min_range = max(0.0_dp, freq_min - 50.0_dp)
+        freq_max_range = freq_max + 50.0_dp
+        call compute_ir_spectrum(vib, freq_min_range, freq_max_range, 4001, smearing_width, ios)
+        if (ios /= 0 .or. .not. allocated(vib%ir_spectrum)) then
             write(*, '(a)') '  Error computing IR spectrum.'
-            call free_phonon_dos_data(phdos); return
+            call free_vib_data(vib); return
         end if
 
         select case (plot_mode)
         case (DOS_MODE_ASCII)
-            call run_ir_navigator(phdos, freq_min_range, freq_max_range)
+            call run_ir_navigator(vib, freq_min_range, freq_max_range)
         case (DOS_MODE_EXPORT)
-            call write_ir_csv(phdos)
+            call write_ir_csv(vib)
         end select
 
-        call free_phonon_dos_data(phdos)
+        call free_vib_data(vib)
     end subroutine handle_ir_menu
 
-    subroutine run_ir_navigator(phdos, freq_min_range, freq_max_range)
-        type(phonon_dos_data_t), intent(in) :: phdos
+    subroutine run_ir_navigator(vib, freq_min_range, freq_max_range)
+        type(vib_data_t), intent(in) :: vib
         real(dp), intent(in) :: freq_min_range, freq_max_range
         real(dp) :: e_center, half_range, y_center, y_half, y_half0, y_max_val
         integer :: i, tw, th, ios
         character(len=1) :: ch
-        real(dp) :: dos_data(size(phdos%ir_spectrum), 1)
+        real(dp) :: dos_data(size(vib%ir_spectrum), 1)
         character(len=3) :: arrow
 
-        do i = 1, size(phdos%ir_spectrum)
-            dos_data(i, 1) = phdos%ir_spectrum(i)
+        do i = 1, size(vib%ir_spectrum)
+            dos_data(i, 1) = vib%ir_spectrum(i)
         end do
 
         half_range = (freq_max_range - freq_min_range) * 0.5_dp
         e_center = (freq_min_range + freq_max_range) * 0.5_dp
-        y_max_val = maxval(phdos%ir_spectrum) * 1.15_dp
+        y_max_val = maxval(vib%ir_spectrum) * 1.15_dp
         y_half = y_max_val * 0.5_dp
         y_center = y_half
         y_half0 = y_half
@@ -778,8 +790,8 @@ contains
         do
             call get_term_size(tw, th)
             write(*, '(a)', advance='no') achar(27) // '[2J' // achar(27) // '[H'
-            call plot_dos_ascii(phdos%freq_grid, dos_data, 1, 0.0_dp, &
-                phdos%smearing, tw, th, &
+            call plot_dos_ascii(vib%freq_grid, dos_data, 1, 0.0_dp, &
+                vib%smearing, tw, th, &
                 y_center_in=y_center, y_half_in=y_half, &
                 e_center_in=e_center, half_range_in=half_range, &
                 xlabel='Frequency', xunit='cm-1')
@@ -821,8 +833,8 @@ contains
         call leave_raw_mode
     end subroutine run_ir_navigator
 
-    subroutine write_ir_csv(phdos)
-        type(phonon_dos_data_t), intent(in) :: phdos
+    subroutine write_ir_csv(vib)
+        type(vib_data_t), intent(in) :: vib
         character(len=MAX_LINE_LEN) :: csv_file
         integer :: unit, ios, i
 
@@ -838,26 +850,27 @@ contains
             write(*, '(a)') '  Cannot write CSV file.'; return
         end if
         write(unit, '(a)') '# Frequency(cm-1),IR_Intensity'
-        do i = 1, size(phdos%ir_spectrum)
-            write(unit, '(f12.4,a,es14.6)') phdos%freq_grid(i), ',', phdos%ir_spectrum(i)
+        do i = 1, size(vib%ir_spectrum)
+            write(unit, '(f12.4,a,es14.6)') vib%freq_grid(i), ',', vib%ir_spectrum(i)
         end do
         close(unit)
         write(*, '(a)') '  Written ' // trim(csv_file)
     end subroutine write_ir_csv
 
     subroutine handle_raman_menu(iostat)
+        !! Raman spectrum from .castep file (explicit column headers for IR/Raman)
         integer, intent(out) :: iostat
-        type(phonon_dos_data_t) :: phdos
+        type(vib_data_t) :: vib
         character(len=MAX_LINE_LEN) :: fname, input, tmp_str
         integer :: ios, plot_mode
-        real(dp) :: freq_min_range, freq_max_range, smearing_width
-        character(len=MAX_LINE_LEN), save :: last_phonon_path = ''
+        real(dp) :: freq_min, freq_max, freq_min_range, freq_max_range, smearing_width
+        character(len=MAX_LINE_LEN), save :: last_castep_path = ''
 
         iostat = 0
 
-        write(*, '(a)', advance='no') '  Enter .phonon file path'
-        if (len_trim(last_phonon_path) > 0) &
-            write(*, '(a)', advance='no') ' [' // trim(last_phonon_path) // ']'
+        write(*, '(a)', advance='no') '  Enter .castep file path'
+        if (len_trim(last_castep_path) > 0) &
+            write(*, '(a)', advance='no') ' [' // trim(last_castep_path) // ']'
         write(*, '(a)') ': '
         read(*, '(a)', iostat=ios) fname
         if (ios /= 0) return
@@ -865,20 +878,28 @@ contains
         if (fname == 'q' .or. fname == 'Q') then
             iostat = 0; return
         end if
-        if (len_trim(fname) == 0 .and. len_trim(last_phonon_path) > 0) then
-            fname = last_phonon_path
+        if (len_trim(fname) == 0 .and. len_trim(last_castep_path) > 0) then
+            fname = last_castep_path
         end if
         if (len_trim(fname) == 0) then
             write(*, '(a)') '  No file specified.'; return
         end if
-        last_phonon_path = trim(fname)
+        last_castep_path = trim(fname)
 
-        call parse_phonon_file(trim(fname), phdos, ios)
+        call parse_castep_vib(trim(fname), vib, ios)
         if (ios /= 0) then
-            write(*, '(a)') '  Error parsing .phonon file.'; return
+            write(*, '(a,i0)') '  Error parsing .castep file, code=', ios
+            return
         end if
-        write(*, '(a,i0,a,i0,a)') '  Loaded ', phdos%n_branches, ' modes at Gamma, ', &
-            count(phdos%raman_activity > 0.0_dp), ' Raman-active.'
+
+        if (.not. vib%has_raman_numeric) then
+            write(*, '(a)') '  Warning: no numeric Raman activity column in .castep.'
+            write(*, '(a)') '  This calculation did not compute Raman activities.'
+            call free_vib_data(vib); return
+        end if
+
+        write(*, '(a,i0,a,i0,a)') '  Loaded ', vib%n_modes, ' Gamma modes, ', &
+            count(vib%raman_activity > 0.0_dp .and. vib%raman_active), ' Raman-active.'
 
         ! ── Output mode menu ──
         write(*, '(a)') '  Output mode:'
@@ -904,39 +925,41 @@ contains
         smearing_width = max(0.5_dp, min(50.0_dp, smearing_width))
 
         ! ── Compute Raman spectrum ──
-        freq_min_range = max(0.0_dp, phdos%freq_min - 50.0_dp)
-        freq_max_range = phdos%freq_max + 50.0_dp
-        call compute_raman_spectrum(phdos, freq_min_range, freq_max_range, 4001, smearing_width, ios)
-        if (ios /= 0 .or. .not. allocated(phdos%raman_spectrum)) then
+        freq_min = minval(vib%freq)
+        freq_max = maxval(vib%freq)
+        freq_min_range = max(0.0_dp, freq_min - 50.0_dp)
+        freq_max_range = freq_max + 50.0_dp
+        call compute_raman_spectrum(vib, freq_min_range, freq_max_range, 4001, smearing_width, ios)
+        if (ios /= 0 .or. .not. allocated(vib%raman_spectrum)) then
             write(*, '(a)') '  Error computing Raman spectrum.'
-            call free_phonon_dos_data(phdos); return
+            call free_vib_data(vib); return
         end if
 
         select case (plot_mode)
         case (DOS_MODE_ASCII)
-            call run_raman_navigator(phdos, freq_min_range, freq_max_range)
+            call run_raman_navigator(vib, freq_min_range, freq_max_range)
         case (DOS_MODE_EXPORT)
-            call write_raman_csv(phdos)
+            call write_raman_csv(vib)
         end select
-        call free_phonon_dos_data(phdos)
+        call free_vib_data(vib)
     end subroutine handle_raman_menu
 
-    subroutine run_raman_navigator(phdos, freq_min_range, freq_max_range)
-        type(phonon_dos_data_t), intent(in) :: phdos
+    subroutine run_raman_navigator(vib, freq_min_range, freq_max_range)
+        type(vib_data_t), intent(in) :: vib
         real(dp), intent(in) :: freq_min_range, freq_max_range
         real(dp) :: e_center, half_range, y_center, y_half, y_half0, y_max_val
         integer :: i, tw, th, ios
         character(len=1) :: ch
-        real(dp) :: dos_data(size(phdos%raman_spectrum), 1)
+        real(dp) :: dos_data(size(vib%raman_spectrum), 1)
         character(len=3) :: arrow
 
-        do i = 1, size(phdos%raman_spectrum)
-            dos_data(i, 1) = phdos%raman_spectrum(i)
+        do i = 1, size(vib%raman_spectrum)
+            dos_data(i, 1) = vib%raman_spectrum(i)
         end do
 
         half_range = (freq_max_range - freq_min_range) * 0.5_dp
         e_center = (freq_min_range + freq_max_range) * 0.5_dp
-        y_max_val = maxval(phdos%raman_spectrum) * 1.15_dp
+        y_max_val = maxval(vib%raman_spectrum) * 1.15_dp
         y_half = y_max_val * 0.5_dp
         y_center = y_half
         y_half0 = y_half
@@ -945,8 +968,8 @@ contains
         do
             call get_term_size(tw, th)
             write(*, '(a)', advance='no') achar(27) // '[2J' // achar(27) // '[H'
-            call plot_dos_ascii(phdos%freq_grid, dos_data, 1, 0.0_dp, &
-                phdos%smearing, tw, th, &
+            call plot_dos_ascii(vib%freq_grid, dos_data, 1, 0.0_dp, &
+                vib%smearing, tw, th, &
                 y_center_in=y_center, y_half_in=y_half, &
                 e_center_in=e_center, half_range_in=half_range, &
                 xlabel='Frequency', xunit='cm-1')
@@ -988,8 +1011,8 @@ contains
         call leave_raw_mode
     end subroutine run_raman_navigator
 
-    subroutine write_raman_csv(phdos)
-        type(phonon_dos_data_t), intent(in) :: phdos
+    subroutine write_raman_csv(vib)
+        type(vib_data_t), intent(in) :: vib
         character(len=MAX_LINE_LEN) :: csv_file
         integer :: unit, ios, i
 
@@ -1005,8 +1028,8 @@ contains
             write(*, '(a)') '  Cannot write CSV file.'; return
         end if
         write(unit, '(a)') '# Frequency(cm-1),Raman_Activity'
-        do i = 1, size(phdos%raman_spectrum)
-            write(unit, '(f12.4,a,es14.6)') phdos%freq_grid(i), ',', phdos%raman_spectrum(i)
+        do i = 1, size(vib%raman_spectrum)
+            write(unit, '(f12.4,a,es14.6)') vib%freq_grid(i), ',', vib%raman_spectrum(i)
         end do
         close(unit)
         write(*, '(a)') '  Written ' // trim(csv_file)
@@ -1892,11 +1915,23 @@ contains
                 if (ios == 0 .and. len_trim(exe_path) > 0) goto 10
             end if
         end if
-        ! 2) Fallback: command argument → make absolute with PWD
+        ! 2) macOS: use lsof to get real executable path
+        call execute_command_line( &
+            'lsof -p $PPID -a -d txt -Fn 2>/dev/null | grep ''^n'' | head -1 | cut -c2- > /tmp/_fv_tmp', &
+            exitstat=ios)
+        if (ios == 0) then
+            open(newunit=unit, file='/tmp/_fv_tmp', status='old', action='read', iostat=ios)
+            if (ios == 0) then
+                read(unit, '(a)', iostat=ios) exe_path
+                close(unit, status='delete')
+                if (ios == 0 .and. len_trim(exe_path) > 0) goto 10
+            end if
+        end if
+        ! 3) Fallback: command argument → make absolute with PWD
         call get_command_argument(0, exe_path)
         if (exe_path(1:1) /= '/') then
             call get_environment_variable('PWD', cmd, ios)
-            if (ios == 0) exe_path = trim(cmd) // '/' // adjustl(exe_path)
+            if (ios > 0) exe_path = trim(cmd) // '/' // adjustl(exe_path)
         end if
 10      continue
         slash_pos = index(trim(exe_path), '/', back=.true.)
@@ -2350,6 +2385,234 @@ contains
             if (tmp_ios == 0) close(tmp_unit, status='delete')
         end block
     end subroutine handle_phonon_modes_menu
+
+
+    subroutine handle_thermo_menu(iostat)
+        !! Thermodynamics: E(T), S(T), F(T), Cv(T) from .phonon file
+        integer, intent(out) :: iostat
+        type(phonon_dos_data_t) :: phdos
+        type(thermo_data_t) :: thermo
+        character(len=MAX_LINE_LEN) :: fname, input, tmp_str
+        character(len=512) :: csv_file
+        integer :: ios, n_pts, unit, i
+        real(dp) :: t_min, t_max
+        character(len=MAX_LINE_LEN), save :: last_phonon_path = ''
+
+        iostat = 0
+
+        ! ── File input ──
+        write(*, '(a)', advance='no') '  Enter .phonon file path'
+        if (len_trim(last_phonon_path) > 0) &
+            write(*, '(a)', advance='no') ' [' // trim(last_phonon_path) // ']'
+        write(*, '(a)') ': '
+        read(*, '(a)', iostat=ios) fname
+        if (ios /= 0) return
+        fname = adjustl(fname); call strip_quotes(fname)
+        if (fname == 'q' .or. fname == 'Q') then
+            iostat = 0; return
+        end if
+        if (len_trim(fname) == 0 .and. len_trim(last_phonon_path) > 0) then
+            fname = last_phonon_path
+        end if
+        if (len_trim(fname) == 0) then
+            write(*, '(a)') '  No file specified.'; return
+        end if
+        last_phonon_path = trim(fname)
+
+        call parse_phonon_file(trim(fname), phdos, ios)
+        if (ios /= 0) then
+            write(*, '(a)') '  Error parsing .phonon file.'; return
+        end if
+        write(*, '(a,i0,a,i0,a,i0,a)') '  Loaded ', phdos%n_ions, ' ions, ', &
+            phdos%n_branches, ' branches, ', phdos%n_qpoints, ' q-points.'
+
+        ! ── Temperature range ──
+        t_min = 10.0_dp
+        t_max = 500.0_dp
+        n_pts = 100
+
+        write(*, '(a,f8.1,a)', advance='no') '  T_min (K) [', t_min, ']: '
+        read(*, '(a)', iostat=ios) input
+        if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
+            if (adjustl(trim(input)) == 'q' .or. adjustl(trim(input)) == 'Q') then
+                call free_phonon_dos_data(phdos); iostat = 0; return
+            end if
+            read(input, *, iostat=ios) t_min
+        end if
+
+        write(*, '(a,f8.1,a)', advance='no') '  T_max (K) [', t_max, ']: '
+        read(*, '(a)', iostat=ios) input
+        if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
+            if (adjustl(trim(input)) == 'q' .or. adjustl(trim(input)) == 'Q') then
+                call free_phonon_dos_data(phdos); iostat = 0; return
+            end if
+            read(input, *, iostat=ios) t_max
+        end if
+        if (t_max <= t_min) t_max = t_min + 100.0_dp
+
+        write(*, '(a,i0,a)', advance='no') '  Number of points [', n_pts, ']: '
+        read(*, '(a)', iostat=ios) input
+        if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
+            if (adjustl(trim(input)) == 'q' .or. adjustl(trim(input)) == 'Q') then
+                call free_phonon_dos_data(phdos); iostat = 0; return
+            end if
+            read(input, *, iostat=ios) n_pts
+        end if
+        n_pts = max(2, min(1000, n_pts))
+
+        ! ── Compute ──
+        write(*, '(a)') '  Computing thermodynamics...'
+        call compute_thermodynamics(phdos, t_min, t_max, n_pts, thermo, ios, tmp_str)
+        if (ios /= 0) then
+            write(*, '(a,a)') '  Error: ', trim(tmp_str)
+            call free_phonon_dos_data(phdos); return
+        end if
+
+        write(*, '(a,f12.4,a)') '  Zero-point energy: ', thermo%zpe, ' meV'
+
+        ! ── Output mode ──
+        write(*, '(a)') '  Output mode:'
+        write(*, '(a)') '    1. Terminal ASCII plot'
+        write(*, '(a)') '    2. Export CSV'
+        write(*, '(a)', advance='no') '    Enter choice [1]: '
+        read(*, '(a)', iostat=ios) input
+        if (ios == 0 .and. len_trim(adjustl(input)) > 0) then
+            if (adjustl(trim(input)) == 'q' .or. adjustl(trim(input)) == 'Q') then
+                call free_phonon_dos_data(phdos); call free_thermo_data(thermo); iostat = 0; return
+            end if
+            read(input, *, iostat=ios) n_pts
+        else
+            n_pts = 1
+        end if
+
+        if (n_pts == 2) then
+            ! CSV export
+            write(*, '(a)', advance='no') '  Output CSV file (without .csv): '
+            read(*, '(a)', iostat=ios) csv_file
+            if (ios /= 0) then
+                call free_phonon_dos_data(phdos); call free_thermo_data(thermo); return
+            end if
+            csv_file = adjustl(csv_file); call strip_quotes(csv_file)
+            if (len_trim(csv_file) == 0) then
+                call free_phonon_dos_data(phdos); call free_thermo_data(thermo); return
+            end if
+            call ensure_ext(csv_file, '.csv')
+            open(newunit=unit, file=trim(csv_file), status='replace', action='write', iostat=ios)
+            if (ios /= 0) then
+                write(*, '(a)') '  Cannot write CSV file.'
+                call free_phonon_dos_data(phdos); call free_thermo_data(thermo); return
+            end if
+            write(unit, '(a)') '# T(K),E(meV),S(J/mol/K),F(meV),Cv(J/mol/K)'
+            do i = 1, thermo%n_temps
+                write(unit, '(f8.2,a,f12.4,a,f12.4,a,f12.4,a,f12.4)') &
+                    thermo%temps(i), ',', thermo%energy(i), ',', thermo%entropy(i), ',', &
+                    thermo%free_e(i), ',', thermo%heat_cap(i)
+            end do
+            close(unit)
+            write(*, '(a)') '  Written ' // trim(csv_file)
+        else
+            ! ASCII plot
+            call run_thermo_navigator(thermo)
+        end if
+
+        call free_phonon_dos_data(phdos)
+        call free_thermo_data(thermo)
+    end subroutine handle_thermo_menu
+
+
+    subroutine run_thermo_navigator(thermo)
+        !! Interactive ASCII plot: E, S, F, Cv vs T using unified plot_dos_ascii
+        type(thermo_data_t), intent(in) :: thermo
+        integer, parameter :: N_CURVES = 4
+        integer :: cur_plot, i, tw, th, ios
+        real(dp) :: x_center, half_range, x_center0, half_range0
+        real(dp) :: y_center(N_CURVES), y_half(N_CURVES)
+        real(dp) :: y_center0(N_CURVES), y_half0(N_CURVES)
+        real(dp), allocatable :: curve_data(:,:)
+        character(len=32) :: titles(N_CURVES)
+        character(len=1) :: ch
+        character(len=3) :: arrow
+
+        cur_plot = 1
+        titles(1) = 'Energy vs T'
+        titles(2) = 'Entropy vs T'
+        titles(3) = 'Free Energy vs T'
+        titles(4) = 'Heat Capacity vs T'
+
+        ! Build data: all 4 curves in one array
+        allocate(curve_data(thermo%n_temps, N_CURVES))
+        curve_data(:,1) = thermo%energy
+        curve_data(:,2) = thermo%entropy
+        curve_data(:,3) = thermo%free_e
+        curve_data(:,4) = thermo%heat_cap
+
+        ! Auto-range per curve
+        do i = 1, N_CURVES
+            y_half(i) = (maxval(curve_data(:,i)) - minval(curve_data(:,i))) * 0.575_dp
+            y_center(i) = (maxval(curve_data(:,i)) + minval(curve_data(:,i))) * 0.5_dp
+            if (y_half(i) < 1.0e-12_dp) y_half(i) = 1.0_dp
+            y_center0(i) = y_center(i)
+            y_half0(i) = y_half(i)
+        end do
+
+        x_center = (thermo%temps(1) + thermo%temps(thermo%n_temps)) * 0.5_dp
+        half_range = (thermo%temps(thermo%n_temps) - thermo%temps(1)) * 0.5_dp
+        x_center0 = x_center
+        half_range0 = half_range
+
+        call enter_raw_mode
+        do
+            call get_term_size(tw, th)
+            write(*, '(a)', advance='no') achar(27) // '[2J' // achar(27) // '[H'
+
+            call plot_dos_ascii(thermo%temps, curve_data(:,cur_plot:cur_plot), 1, &
+                0.0_dp, 0.0_dp, tw, th, &
+                y_center_in=y_center(cur_plot), y_half_in=y_half(cur_plot), &
+                e_center_in=x_center, half_range_in=half_range, &
+                xlabel='Temperature', xunit='K', hide_fermi=.true., &
+                title=titles(cur_plot))
+
+            write(*, '(a)') '  [1=E 2=S 3=F 4=Cv  arrows:pan  +/-:zoom  R:reset  Q:quit]'
+
+            read(*, '(a)', advance='no', iostat=ios) ch
+            if (ios /= 0) exit
+            if (iachar(ch) == 27) then
+                read(*, '(a)', advance='no', iostat=ios) arrow(1:1)
+                if (ios /= 0) exit
+                read(*, '(a)', advance='no', iostat=ios) arrow(2:2)
+                if (ios /= 0) exit
+                if (arrow(1:2) == '[A') then
+                    y_center(cur_plot) = y_center(cur_plot) + y_half(cur_plot) * 0.3_dp
+                else if (arrow(1:2) == '[B') then
+                    y_center(cur_plot) = y_center(cur_plot) - y_half(cur_plot) * 0.3_dp
+                else if (arrow(1:2) == '[C') then
+                    x_center = x_center + half_range * 0.3_dp
+                else if (arrow(1:2) == '[D') then
+                    x_center = x_center - half_range * 0.3_dp
+                end if
+                cycle
+            end if
+            select case (ch)
+            case ('1'); cur_plot = 1
+            case ('2'); cur_plot = 2
+            case ('3'); cur_plot = 3
+            case ('4'); cur_plot = 4
+            case ('+', '=')
+                half_range = half_range * 0.5_dp
+                y_half(cur_plot) = y_half(cur_plot) * 0.5_dp
+            case ('-')
+                half_range = half_range * 2.0_dp
+                y_half(cur_plot) = y_half(cur_plot) * 2.0_dp
+            case ('r', 'R')
+                x_center = x_center0; half_range = half_range0
+                y_center(cur_plot) = y_center0(cur_plot)
+                y_half(cur_plot) = y_half0(cur_plot)
+            case ('q', 'Q'); exit
+            end select
+        end do
+        call leave_raw_mode
+        deallocate(curve_data)
+    end subroutine run_thermo_navigator
 
 
     subroutine free_cif_data(data)

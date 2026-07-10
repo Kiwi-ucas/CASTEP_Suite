@@ -18,7 +18,7 @@ contains
 
     subroutine plot_dos_ascii(energy_grid, dos_data, nspin, e_fermi, smearing, &
             term_w_in, term_h_in, y_center_in, y_half_in, e_center_in, half_range_in, &
-            xlabel, xunit)
+            xlabel, xunit, hide_fermi, title)
         real(dp), intent(in) :: energy_grid(:)
         real(dp), intent(in) :: dos_data(:,:)
         integer,  intent(in) :: nspin
@@ -26,6 +26,8 @@ contains
         integer,  intent(in) :: term_w_in, term_h_in
         real(dp), intent(in), optional :: y_center_in, y_half_in, e_center_in, half_range_in
         character(len=*), intent(in), optional :: xlabel, xunit
+        logical, intent(in), optional :: hide_fermi
+        character(len=*), intent(in), optional :: title
 
         integer  :: ne, nw, nh, ix, iy, ie, is, nw_data
         integer  :: fermi_col, y_label_width, gap_width, y_label_interval
@@ -36,6 +38,10 @@ contains
         character(len=64)  :: fmt_label, tmp_str
         character(len=16)  :: xl, xu
         integer  :: last_ix, last_iy
+        logical  :: no_fermi
+
+        no_fermi = .false.
+        if (present(hide_fermi)) no_fermi = hide_fermi
 
         xl = 'Energy'; if (present(xlabel)) xl = trim(xlabel)
         xu = 'eV';     if (present(xunit))  xu = trim(xunit)
@@ -86,9 +92,9 @@ contains
         y_max = y_center + y_half
 
         y_label_width = 0
-        write(tmp_str, '(f10.4)') y_max
+        write(tmp_str, '(f12.4)') y_max
         y_label_width = max(y_label_width, len_trim(adjustl(tmp_str)))
-        write(tmp_str, '(f10.4)') y_min
+        write(tmp_str, '(f12.4)') y_min
         y_label_width = max(y_label_width, len_trim(adjustl(tmp_str)))
         y_label_width = max(y_label_width, 6)
         gap_width = 1
@@ -125,11 +131,13 @@ contains
         end do
 
         ! Fermi level vertical line
-        do iy = 1, nh
-            if (fermi_col >= 2 .and. fermi_col <= nw_data - 1) then
-                if (grid(fermi_col, iy) == ' ') grid(fermi_col, iy) = '|'
-            end if
-        end do
+        if (.not. no_fermi) then
+            do iy = 1, nh
+                if (fermi_col >= 2 .and. fermi_col <= nw_data - 1) then
+                    if (grid(fermi_col, iy) == ' ') grid(fermi_col, iy) = '|'
+                end if
+            end do
+        end if
 
         ! y=0 horizontal reference line
         iy = nh - nint((0.0_dp - y_min) * y_scale)
@@ -150,11 +158,18 @@ contains
         end do
         grid(1, nh) = 'B'
         grid(nw_data, nh) = 'R'
-        if (grid(fermi_col, nh) == '-') grid(fermi_col, nh) = 'T'
+        if (.not. no_fermi) then
+            if (grid(fermi_col, nh) == '-') grid(fermi_col, nh) = 'T'
+        end if
 
         ! header
         write(*, '(a)') ''
-        write(*, '(a,i0,a,i0,a,f5.2,a)') C_BOLD // '  Density of States  ' // &
+        if (present(title)) then
+            write(*, '(a)') C_BOLD // '  ' // trim(title) // '  ' // C_RESET
+        else
+            write(*, '(a)') C_BOLD // '  Density of States  ' // C_RESET
+        end if
+        write(*, '(a,i0,a,i0,a,f5.2,a)') &
             C_RESET // C_CYAN, ne_vis, C_RESET // ' pts, ' // C_CYAN, &
             nspin, C_RESET // ' spin(s),  smearing=' // C_CYAN, smearing, &
             ' ' // trim(xu) // C_RESET
@@ -162,11 +177,16 @@ contains
         write(*, '(a)', advance='no') '  ' // C_DIM // trim(xl) // ': [' // C_RESET // &
             trim(adjustl(tmp_str)) // C_DIM // ' to ' // C_RESET
         write(tmp_str, '(f8.4)') e_max
-        write(*, '(a,i0,1x,i0,a)') trim(adjustl(tmp_str)) // C_DIM // '] ' // trim(xu) // &
-            C_RESET // '  grid:' // C_RESET, nw_data, nh, &
-            '  ' // C_DIM // 'E_F=0 (dashed)' // C_RESET
+        if (no_fermi) then
+            write(*, '(a,i0,1x,i0)') trim(adjustl(tmp_str)) // C_DIM // '] ' // trim(xu) // &
+                C_RESET // '  grid:' // C_RESET, nw_data, nh
+        else
+            write(*, '(a,i0,1x,i0,a)') trim(adjustl(tmp_str)) // C_DIM // '] ' // trim(xu) // &
+                C_RESET // '  grid:' // C_RESET, nw_data, nh, &
+                '  ' // C_DIM // 'E_F=0 (dashed)' // C_RESET
+        end if
         write(tmp_str, '(f8.4)') y_max
-        write(*, '(a)') '  ' // C_DIM // 'DOS max: ' // C_RESET // trim(adjustl(tmp_str))
+        write(*, '(a)') '  ' // C_DIM // 'Y max: ' // C_RESET // trim(adjustl(tmp_str))
         write(*, '(a)') ''
 
         ! top border
@@ -178,7 +198,7 @@ contains
             fmt_label = ''
             if (mod(iy - 1, y_label_interval) == 0 .or. iy == 1 .or. iy == nh) then
                 dos_val = y_max - real(iy - 1, dp) / real(nh - 1, dp) * (y_max - y_min)
-                write(fmt_label, '(f10.4)') dos_val
+                write(fmt_label, '(f12.4)') dos_val
                 fmt_label = adjustl(fmt_label)
             end if
             call print_dos_row(grid, nw_data, iy, nh, fmt_label, y_label_width, gap_width)
@@ -198,8 +218,10 @@ contains
         end if
 
         ! E_F marker
-        write(*, '(a,a)') repeat(' ', y_label_width + gap_width) // C_DIM, &
-            repeat(' ', fermi_col - 2) // C_RED // 'E_F' // C_RESET
+        if (.not. no_fermi) then
+            write(*, '(a,a)') repeat(' ', y_label_width + gap_width) // C_DIM, &
+                repeat(' ', fermi_col - 2) // C_RED // 'E_F' // C_RESET
+        end if
 
         deallocate(grid)
     end subroutine plot_dos_ascii
@@ -508,9 +530,9 @@ contains
         y_max = y_center + y_half
 
         y_label_width = 0
-        write(tmp_str, '(f10.4)') y_max
+        write(tmp_str, '(f12.4)') y_max
         y_label_width = max(y_label_width, len_trim(adjustl(tmp_str)))
-        write(tmp_str, '(f10.4)') y_min
+        write(tmp_str, '(f12.4)') y_min
         y_label_width = max(y_label_width, len_trim(adjustl(tmp_str)))
         y_label_width = max(y_label_width, 6)
         gap_width = 1
@@ -593,7 +615,7 @@ contains
             fmt_label = ''
             if (mod(iy - 1, y_label_interval) == 0 .or. iy == 1 .or. iy == nh) then
                 dos_val = y_max - real(iy - 1, dp) / real(nh - 1, dp) * (y_max - y_min)
-                write(fmt_label, '(f10.4)') dos_val
+                write(fmt_label, '(f12.4)') dos_val
                 fmt_label = adjustl(fmt_label)
             end if
             call print_dos_row(grid, nw_data, iy, nh, fmt_label, y_label_width, gap_width)
