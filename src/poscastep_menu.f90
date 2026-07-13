@@ -3,7 +3,7 @@ module poscastep_menu
     !! Structure: top-level menu -> property-specific sub-menus
     !! Currently implements: Plot Band Structure
     use castep_config, only: dp, pi, HARTREE_TO_EV, bands_data_t, pdos_data_t, &
-        cif_data_t, MAX_LINE_LEN, IO_INVALID_INPUT, IO_SUCCESS, IO_USER_QUIT, &
+        cif_data_t, atom_t, MAX_LINE_LEN, IO_INVALID_INPUT, IO_SUCCESS, IO_USER_QUIT, &
         IO_FILE_NOT_FOUND, IO_PARSE_ERROR, IO_WRITE_ERROR, IO_PRECASTEP_LAUNCH, strip_quotes, &
         compute_cartesian_lattice
     use parser, only: parse_cif_inline, parse_pdb_inline, parse_cell_inline
@@ -27,6 +27,7 @@ module poscastep_menu
         plot_dos_ascii, write_dos_csv, plot_pdos_ascii, write_pdos_csv
     use crystal_json, only: write_crystal_json_cif, read_crystal_json_to_cif
     use thermodynamics, only: thermo_data_t, compute_thermodynamics, free_thermo_data
+    use symmetry, only: expand_cif_symmetry
     implicit none
     private
 
@@ -1515,6 +1516,9 @@ contains
             return
         end if
 
+        ! ── Symmetry expansion for format conversion ──
+        call expand_cif_symmetry(cif, istat)
+
         if (cif%n_atoms == 0) then
             write(*, '(a)') '  Warning: no atoms found.'
         end if
@@ -2014,7 +2018,14 @@ contains
             call free_cif_data(cif); return
         end if
 
-        write(*, '(a,i0,a)') '  Parsed ', cif%n_atoms, ' atoms.'
+        write(*, '(a,i0,a)') '  Parsed ', cif%n_atoms, ' atom(s) in asymmetric unit.'
+
+        ! ── Symmetry expansion for viewer display ──
+        if (cif%n_symops > 1) then
+            call expand_cif_symmetry(cif, ios)
+            if (ios == 0) &
+                write(*, '(a,i0,a)') '  Expanded to ', cif%n_atoms, ' atom(s) in full unit cell'
+        end if
 
         ! Remember source file for PreCASTEP handoff and re-edit
         precastep_source_file = get_file_stem(file_path)
@@ -2192,6 +2203,8 @@ contains
                 if (ios /= 0 .or. cif%n_atoms == 0) then
                     write(*, '(a)') '  Error re-reading original file.'; exit
                 end if
+                ! ── Symmetry expansion for re-edit ──
+                call expand_cif_symmetry(cif, ios)
                 write(*, '(a,i0,a)') '  Re-loaded ', cif%n_atoms, ' atoms from original.'
                 call write_crystal_json_cif(cif, json_path, ios)
                 if (ios /= 0) then

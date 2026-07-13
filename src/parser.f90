@@ -1,8 +1,9 @@
 module parser
     !! File format parsers for CIF, PDB, and CASTEP .cell files
     use castep_config, only: &
-         dp, MAX_ATOMS, IO_FILE_NOT_FOUND, IO_PARSE_ERROR, &
-         cif_data_t, atom_t, pi, compare_tags
+         dp, MAX_ATOMS, IO_FILE_NOT_FOUND, IO_PARSE_ERROR, IO_MISSING_ATOMS, &
+         cif_data_t, atom_t, pi, compare_tags, sym_op_t
+    use symmetry, only: parse_symop_xyz_string
     implicit none
     private
 
@@ -13,20 +14,139 @@ module parser
 
 contains
 
-    subroutine grow_atoms(atoms, current, new_size)
+    subroutine grow_atoms(atoms, current, new_size, iostat)
         !! Grow the atoms array to new_size, preserving all existing entries.
+        !! Returns iostat=0 on success, iostat=1 on allocation failure.
         type(atom_t), allocatable, intent(inout) :: atoms(:)
         integer, intent(in) :: current, new_size
+        integer, intent(out) :: iostat
         type(atom_t), allocatable :: tmp(:)
+        integer :: ios
 
         if (.not. allocated(atoms)) then
-            allocate(atoms(new_size))
+            allocate(atoms(new_size), stat=ios)
         else
-            allocate(tmp(new_size))
-            tmp(1:current) = atoms(1:current)
-            call move_alloc(tmp, atoms)
+            allocate(tmp(new_size), stat=ios)
+            if (ios == 0) then
+                tmp(1:current) = atoms(1:current)
+                call move_alloc(tmp, atoms)
+            end if
+        end if
+        if (ios /= 0) then
+            iostat = 1
+        else
+            iostat = 0
         end if
     end subroutine grow_atoms
+
+    subroutine grow_symops(symops, current, new_size, iostat)
+        !! Grow the sym_ops array to new_size, preserving all existing entries.
+        !! Returns iostat=0 on success, iostat=1 on allocation failure.
+        type(sym_op_t), allocatable, intent(inout) :: symops(:)
+        integer, intent(in) :: current, new_size
+        integer, intent(out) :: iostat
+        type(sym_op_t), allocatable :: tmp(:)
+        integer :: ios
+
+        if (.not. allocated(symops)) then
+            allocate(symops(new_size), stat=ios)
+        else
+            allocate(tmp(new_size), stat=ios)
+            if (ios == 0) then
+                tmp(1:current) = symops(1:current)
+                call move_alloc(tmp, symops)
+            end if
+        end if
+        if (ios /= 0) then
+            iostat = 1
+        else
+            iostat = 0
+        end if
+    end subroutine grow_symops
+
+    ! ── Private CIF helpers ──
+
+    subroutine strip_uncertainty(val_str, clean_str)
+        !! Strip parenthetical standard uncertainty from numeric string.
+        !! "8.6559(9)" → "8.6559", "0.71073" → "0.71073"
+        character(len=*), intent(in)  :: val_str
+        character(len=*), intent(out) :: clean_str
+        integer :: paren_pos
+        clean_str = trim(adjustl(val_str))
+        paren_pos = index(clean_str, '(')
+        if (paren_pos > 0) then
+            clean_str = trim(clean_str(1:paren_pos-1))
+        end if
+    end subroutine strip_uncertainty
+
+
+    logical function is_textfield_start(line)
+        !! Return .true. if the trimmed line starts with ';' (semicolon),
+        !! indicating the start of a CIF TextField.
+        character(len=*), intent(in) :: line
+        character(len=256) :: t
+        t = adjustl(line)
+        is_textfield_start = (len_trim(t) > 0 .and. t(1:1) == ';')
+    end function is_textfield_start
+
+
+    subroutine parse_textfield_body(iunit, body, ios)
+        !! Read TextField body from current position until closing ';'.
+        !! The opening ';' has already been consumed from the first line.
+        !! Reads lines until a line with only ';' (or ';' + whitespace) is encountered.
+        !! Returns the concatenated text (lines joined by newline).
+        integer,           intent(in)  :: iunit
+        character(len=:),  allocatable, intent(out) :: body
+        integer,           intent(out) :: ios
+
+        character(len=256) :: line, trimmed
+        character(len=4096) :: accumulator
+        integer :: body_len, line_len
+
+        body_len = 0
+        accumulator = ''
+        ios = 0
+
+        do
+            read(iunit, '(A)', iostat=ios) line
+            if (ios /= 0) return  ! EOF or error
+
+            trimmed = adjustl(line)
+            line_len = len_trim(trimmed)
+
+            ! Check for closing semicolon (a line with only ';', possibly with whitespace)
+            if (line_len >= 1 .and. trimmed(1:1) == ';') then
+                ! If the rest of the line is whitespace-only, this is the closing delimiter
+                if (line_len == 1) exit
+                if (len_trim(trimmed(2:)) == 0) exit
+                ! Otherwise it contains content — likely a line starting with ';'
+                ! In the CIF standard, a line starting with ';' inside a textfield
+                ! is supposed to be the closing delimiter, so we exit
+                exit
+            end if
+
+            ! Append this line to accumulator
+            if (body_len + line_len + 1 <= len(accumulator)) then
+                if (body_len > 0) then
+                    accumulator(body_len+1:body_len+1) = char(10)
+                    body_len = body_len + 1
+                end if
+                if (line_len > 0) then
+                    accumulator(body_len+1:body_len+line_len) = trim(line)
+                else
+                    accumulator(body_len+1:body_len+1) = ' '
+                end if
+                body_len = body_len + max(line_len, 1)
+            end if
+        end do
+
+        allocate(character(len=body_len) :: body)
+        if (body_len > 0) then
+            body = accumulator(1:body_len)
+        else
+            body = ''
+        end if
+    end subroutine parse_textfield_body
 
     subroutine parse_pdb_inline(filename, data, iostat, iomsg)
         !! Parse PDB format: CRYST1 record for cell, ATOM/HETATM records for atoms
@@ -97,9 +217,11 @@ contains
                 if (n_atoms > MAX_ATOMS) exit
 
                 if (.not. allocated(data%atoms)) then
-                    call grow_atoms(data%atoms, 0, 64)
+                    call grow_atoms(data%atoms, 0, 64, ios)
+                    if (ios /= 0) exit
                 else if (n_atoms > size(data%atoms)) then
-                    call grow_atoms(data%atoms, n_atoms - 1, max(2 * size(data%atoms), n_atoms))
+                    call grow_atoms(data%atoms, n_atoms - 1, max(2 * size(data%atoms), n_atoms), ios)
+                    if (ios /= 0) exit
                 end if
 
                 ! Element symbol: columns 77-78 (right-justified)
@@ -323,9 +445,11 @@ contains
                     n_atoms = n_atoms + 1
                     if (n_atoms <= MAX_ATOMS) then
                         if (.not. allocated(data%atoms)) then
-                            call grow_atoms(data%atoms, 0, 64)
+                            call grow_atoms(data%atoms, 0, 64, ios_local)
+                            if (ios_local /= 0) exit
                         else if (n_atoms > size(data%atoms)) then
-                            call grow_atoms(data%atoms, n_atoms - 1, max(2 * size(data%atoms), n_atoms))
+                            call grow_atoms(data%atoms, n_atoms - 1, max(2 * size(data%atoms), n_atoms), ios_local)
+                            if (ios_local /= 0) exit
                         end if
                         data%atoms(n_atoms)%label = adjustl(elem)
                         data%atoms(n_atoms)%element = adjustl(elem)
@@ -350,19 +474,31 @@ contains
         character(len=*), optional, intent(out) :: iomsg
 
         integer :: ios, iunit, i, n, n_cols, line_len, start_pos, end_pos, j
-        integer :: idx_col(5)
-        character(len=256) :: line, tag, val
-        logical :: in_atom_loop, in_loop, file_found
+        integer :: idx_col(5), idx_symop_col
+        character(len=256) :: line, tag, val, clean_val
+        logical :: in_atom_loop, in_symop_loop, in_loop, file_found
         character(len=256) :: row_vals(50)
+        character(len=:), allocatable :: text_body
+        type(sym_op_t) :: sop
+        ! Warning counters for parse failures
+        integer :: n_warn_cell, n_warn_atom, n_warn_symop, n_warn_text
+        character(len=256) :: accum_warnings
 
+        n_warn_cell = 0; n_warn_atom = 0; n_warn_symop = 0; n_warn_text = 0
+        accum_warnings = ''
         iostat = 0
         data%a = 0.0_dp; data%b = 0.0_dp; data%c = 0.0_dp
         data%alpha = 90.0_dp; data%beta = 90.0_dp; data%gamma = 90.0_dp
         data%space_group = 'P1'
+        data%space_group_name = ''
+        data%space_group_it = 0
         data%n_atoms = 0
+        data%n_symops = 0
         data%positions_fractional = .true.   ! CIF coordinates are always fractional
         idx_col(1:5) = 0
+        idx_symop_col = 0
         if (allocated(data%atoms)) deallocate(data%atoms)
+        if (allocated(data%sym_ops)) deallocate(data%sym_ops)
 
         inquire(file=trim(filename), exist=file_found)
         if (.not. file_found) then
@@ -379,9 +515,11 @@ contains
         end if
 
         in_atom_loop = .false.
+        in_symop_loop = .false.
         in_loop = .false.
         n = 0
         n_cols = 0
+        idx_symop_col = 0
 
         do
             read(iunit, '(A)', iostat=ios) line
@@ -392,9 +530,11 @@ contains
 
             if (trim(line) == 'loop_') then
                 in_atom_loop = .false.
+                in_symop_loop = .false.
                 in_loop = .true.
                 n_cols = 0
                 idx_col(1:5) = 0
+                idx_symop_col = 0
                 cycle
             end if
 
@@ -413,13 +553,32 @@ contains
                             goto 100
                         end if
                     end if
-                    if (index(line, '_atom_site_label') > 0)       idx_col(1) = n_cols + 1
-                    if (index(line, '_atom_site_type_symbol') > 0) idx_col(2) = n_cols + 1
-                    if (index(line, '_atom_site_fract_x') > 0)     idx_col(3) = n_cols + 1
-                    if (index(line, '_atom_site_fract_y') > 0)     idx_col(4) = n_cols + 1
-                    if (index(line, '_atom_site_fract_z') > 0)     idx_col(5) = n_cols + 1
+                    ! Detect atom_site columns using exact tag matching
+                    j = index(line, ' ')
+                    if (j > 0) then
+                        tag = adjustl(line(1:j-1))
+                    else
+                        tag = adjustl(line)
+                    end if
+                    if (compare_tags(tag, '_atom_site_label') &
+                        .or. compare_tags(tag(1:18), '_atom_site_label')) &
+                        idx_col(1) = n_cols + 1
+                    if (compare_tags(tag, '_atom_site_type_symbol')) &
+                        idx_col(2) = n_cols + 1
+                    if (compare_tags(tag, '_atom_site_fract_x')) &
+                        idx_col(3) = n_cols + 1
+                    if (compare_tags(tag, '_atom_site_fract_y')) &
+                        idx_col(4) = n_cols + 1
+                    if (compare_tags(tag, '_atom_site_fract_z')) &
+                        idx_col(5) = n_cols + 1
                     if (idx_col(3) > 0 .and. idx_col(4) > 0 .and. idx_col(5) > 0) then
                         in_atom_loop = .true.
+                    end if
+                    ! Detect symmetry operation column
+                    if (compare_tags(tag, '_symmetry_equiv_pos_as_xyz') &
+                        .or. compare_tags(tag, '_space_group_symop_operation_xyz')) then
+                        idx_symop_col = n_cols + 1
+                        in_symop_loop = .true.
                     end if
                     n_cols = n_cols + 1
                     cycle
@@ -446,21 +605,52 @@ contains
                         if (n >= MAX_ATOMS) cycle  ! hard limit
                         n = n + 1
                         if (.not. allocated(data%atoms)) then
-                            call grow_atoms(data%atoms, 0, 64)
+                            call grow_atoms(data%atoms, 0, 64, ios)
+                            if (ios /= 0) exit
                         else if (n > size(data%atoms)) then
-                            call grow_atoms(data%atoms, n - 1, max(2 * size(data%atoms), n))
+                            call grow_atoms(data%atoms, n - 1, max(2 * size(data%atoms), n), ios)
+                            if (ios /= 0) exit
                         end if
                         call copy_str_no_quotes(row_vals(idx_col(1)), data%atoms(n)%label)
                         call copy_str_no_quotes(row_vals(idx_col(2)), data%atoms(n)%element)
-                        read(row_vals(idx_col(3)), *, iostat=ios) data%atoms(n)%x
-                        if (ios /= 0) then; n = n - 1; cycle; end if
-                        read(row_vals(idx_col(4)), *, iostat=ios) data%atoms(n)%y
-                        if (ios /= 0) then; n = n - 1; cycle; end if
-                        read(row_vals(idx_col(5)), *, iostat=ios) data%atoms(n)%z
-                        if (ios /= 0) then; n = n - 1; cycle; end if
+                        call strip_uncertainty(row_vals(idx_col(3)), clean_val)
+                        read(clean_val, *, iostat=ios) data%atoms(n)%x
+                        if (ios /= 0) then; n = n - 1; n_warn_atom = n_warn_atom + 1; cycle; end if
+                        call strip_uncertainty(row_vals(idx_col(4)), clean_val)
+                        read(clean_val, *, iostat=ios) data%atoms(n)%y
+                        if (ios /= 0) then; n = n - 1; n_warn_atom = n_warn_atom + 1; cycle; end if
+                        call strip_uncertainty(row_vals(idx_col(5)), clean_val)
+                        read(clean_val, *, iostat=ios) data%atoms(n)%z
+                        if (ios /= 0) then; n = n - 1; n_warn_atom = n_warn_atom + 1; cycle; end if
                     end if
                     cycle
                 end if
+                ! Symmetry operation data row — values may be quoted
+                if (in_symop_loop) then
+                    row_vals = ''
+                    n_cols = 0
+                    call tokenize_quoted_inline(line, row_vals, n_cols)
+                    if (idx_symop_col > 0 .and. idx_symop_col <= n_cols) then
+                        if (data%n_symops >= 256) cycle  ! safety cap
+                        if (.not. allocated(data%sym_ops)) then
+                            allocate(data%sym_ops(64))
+                        else if (data%n_symops >= size(data%sym_ops)) then
+                            call grow_symops(data%sym_ops, data%n_symops, &
+                                             2 * size(data%sym_ops), ios)
+                            if (ios /= 0) cycle
+                        end if
+                        call copy_str_no_quotes(row_vals(idx_symop_col), val)
+                        call parse_symop_xyz_string(val, sop, ios)
+                        if (ios == 0) then
+                            data%n_symops = data%n_symops + 1
+                            data%sym_ops(data%n_symops) = sop
+                        else
+                            n_warn_symop = n_warn_symop + 1
+                        end if
+                    end if
+                    cycle
+                end if
+
                 ! Non-atom data row - skip
                 cycle
             end if
@@ -474,27 +664,59 @@ contains
                 val = clean_str_inline(line(i+1:))
             end if
 
+            ! Handle TextField: if value starts with ';', read multiline body
+            if (is_textfield_start(line(i+1:))) then
+                call parse_textfield_body(iunit, text_body, ios)
+                if (ios == 0) then
+                    val = text_body
+                    deallocate(text_body)
+                else
+                    n_warn_text = n_warn_text + 1
+                end if
+            end if
+
+            ! Strip uncertainty before numeric parsing
+            call strip_uncertainty(val, clean_val)
+
             select case (trim(tag))
-            case ('_cell_length_a')    ; read(val, *, iostat=ios) data%a
-            case ('_cell_length_b')    ; read(val, *, iostat=ios) data%b
-            case ('_cell_length_c')    ; read(val, *, iostat=ios) data%c
-            case ('_cell_angle_alpha') ; read(val, *, iostat=ios) data%alpha
-            case ('_cell_angle_beta')  ; read(val, *, iostat=ios) data%beta
-            case ('_cell_angle_gamma') ; read(val, *, iostat=ios) data%gamma
-            case ('_symmetry_space_group_name_H-M', '_space_group_name_H-M_alt')
-                data%space_group = adjustl(val(1:min(len_trim(val), len(data%space_group))))
-            case ('_symmetry_Int_Tables_number')
-                ! Only set from IT number if not already set by an H-M name
-                if (trim(data%space_group) == 'P1' .or. trim(data%space_group) == '') then
+            case ('_cell_length_a')    ; read(clean_val, *, iostat=ios) data%a
+                                         if (ios /= 0) n_warn_cell = n_warn_cell + 1
+            case ('_cell_length_b')    ; read(clean_val, *, iostat=ios) data%b
+                                         if (ios /= 0) n_warn_cell = n_warn_cell + 1
+            case ('_cell_length_c')    ; read(clean_val, *, iostat=ios) data%c
+                                         if (ios /= 0) n_warn_cell = n_warn_cell + 1
+            case ('_cell_angle_alpha') ; read(clean_val, *, iostat=ios) data%alpha
+                                         if (ios /= 0) n_warn_cell = n_warn_cell + 1
+            case ('_cell_angle_beta')  ; read(clean_val, *, iostat=ios) data%beta
+                                         if (ios /= 0) n_warn_cell = n_warn_cell + 1
+            case ('_cell_angle_gamma') ; read(clean_val, *, iostat=ios) data%gamma
+                                         if (ios /= 0) n_warn_cell = n_warn_cell + 1
+            case ('_symmetry_space_group_name_H-M', '_space_group_name_H-M_alt', &
+                  '_symmetry_space_group_name_H-M_alt')
+                data%space_group_name = adjustl(val(1:min(len_trim(val), len(data%space_group_name))))
+                if (trim(data%space_group_name) /= '') &
                     data%space_group = adjustl(val(1:min(len_trim(val), len(data%space_group))))
+            case ('_symmetry_Int_Tables_number', '_space_group_IT_number')
+                ! Store IT number for symmetry expansion
+                read(clean_val, *, iostat=ios) data%space_group_it
+                if (ios /= 0) data%space_group_it = 0  ! reset on parse failure
+                ! Only set space_group from IT number if H-M name not already set
+                if (trim(data%space_group) == 'P1' .or. trim(data%space_group) == '') then
+                    data%space_group = adjustl(clean_val(1:min(len_trim(clean_val), len(data%space_group))))
                 end if
             case default
                 ! Handle atom_site tags as tag-value pairs (fallback)
-                if (index(tag, '_atom_site_label') > 0)       idx_col(1) = n_cols + 1
-                if (index(tag, '_atom_site_type_symbol') > 0) idx_col(2) = n_cols + 1
-                if (index(tag, '_atom_site_fract_x') > 0)     idx_col(3) = n_cols + 1
-                if (index(tag, '_atom_site_fract_y') > 0)     idx_col(4) = n_cols + 1
-                if (index(tag, '_atom_site_fract_z') > 0)     idx_col(5) = n_cols + 1
+                if (compare_tags(tag, '_atom_site_label') &
+                    .or. (len_trim(tag) >= 17 .and. compare_tags(tag(1:17), '_atom_site_label'))) &
+                    idx_col(1) = n_cols + 1
+                if (compare_tags(tag, '_atom_site_type_symbol')) &
+                    idx_col(2) = n_cols + 1
+                if (compare_tags(tag, '_atom_site_fract_x')) &
+                    idx_col(3) = n_cols + 1
+                if (compare_tags(tag, '_atom_site_fract_y')) &
+                    idx_col(4) = n_cols + 1
+                if (compare_tags(tag, '_atom_site_fract_z')) &
+                    idx_col(5) = n_cols + 1
                 if (idx_col(3) > 0 .and. idx_col(4) > 0 .and. idx_col(5) > 0) then
                     in_atom_loop = .true.
                 end if
@@ -504,7 +726,83 @@ contains
 
         close(iunit)
         data%n_atoms = n
+
+        ! ── Post-parse validation and warnings ──
+        ! Hard errors (set iostat)
+        if (n_warn_cell > 0) then
+            iostat = IO_PARSE_ERROR
+            if (present(iomsg)) write(iomsg, &
+                '("Failed to read ", i0, " cell parameter(s)")') n_warn_cell
+        end if
+        if (n == 0 .and. iostat == 0) then
+            iostat = IO_MISSING_ATOMS
+            if (present(iomsg)) iomsg = 'No atoms found in CIF file'
+        end if
+        ! Soft warnings (print only, don't block)
+        if (n_warn_atom > 0) &
+            write(*, '(a,i0,a)') '  Warning: Skipped ', n_warn_atom, &
+                ' unreadable atom coordinate(s)'
+        if (n_warn_symop > 0) &
+            write(*, '(a,i0,a)') '  Warning: Skipped ', n_warn_symop, &
+                ' unparseable symmetry operation(s)'
+        if (n_warn_text > 0) &
+            write(*, '(a,i0,a)') '  Warning: ', n_warn_text, &
+                ' TextField(s) could not be read'
     end subroutine parse_cif_inline
+
+    subroutine tokenize_quoted_inline(line, tokens, n_tokens)
+        !! Split tokens preserving quoted strings (single and double quotes).
+        !! e.g., `1  'x, y, z'` → ["1", "x, y, z"]
+        character(len=*), intent(in) :: line
+        character(len=*), intent(out) :: tokens(:)
+        integer, intent(out) :: n_tokens
+        integer :: i, n, n_cols, start_pos, end_pos
+        character(len=1) :: quote_char
+
+        n = len_trim(line)
+        n_tokens = 0
+        n_cols = 0
+        i = 1
+
+        do while (i <= n)
+            ! Skip whitespace
+            do while (i <= n .and. (line(i:i) == ' ' .or. line(i:i) == char(9)))
+                i = i + 1
+            end do
+            if (i > n) exit
+
+            n_cols = n_cols + 1
+            ! Check for quoted token
+            if (line(i:i) == "'" .or. line(i:i) == '"') then
+                quote_char = line(i:i)
+                i = i + 1  ! skip opening quote
+                start_pos = i
+                do while (i <= n .and. line(i:i) /= quote_char)
+                    i = i + 1
+                end do
+                end_pos = i - 1
+                if (i <= n) i = i + 1  ! skip closing quote
+                if (n_cols <= size(tokens)) then
+                    if (end_pos >= start_pos) then
+                        tokens(n_cols) = adjustl(line(start_pos:end_pos))
+                    else
+                        tokens(n_cols) = ''
+                    end if
+                end if
+            else
+                ! Unquoted token
+                start_pos = i
+                do while (i <= n .and. line(i:i) /= ' ' .and. line(i:i) /= char(9))
+                    i = i + 1
+                end do
+                end_pos = i - 1
+                if (n_cols <= size(tokens)) then
+                    tokens(n_cols) = adjustl(line(start_pos:end_pos))
+                end if
+            end if
+        end do
+        n_tokens = n_cols
+    end subroutine tokenize_quoted_inline
 
     subroutine tokenize_inline(line, tokens, n_tokens)
         !! Split whitespace-delimited tokens into array
@@ -539,16 +837,43 @@ contains
     end subroutine tokenize_inline
 
     function clean_str_inline(s) result(res)
+        !! Strip leading/trailing quotes and unescape CIF doubled quotes.
+        !! 'it''s'   → it's
+        !! "say ""hi""" → say "hi"
         character(len=*), intent(in) :: s
         character(len=64) :: res, tmp
+        integer :: i, n, j
+        character(len=1) :: quote_char
         tmp = trim(adjustl(s))
-        if (len_trim(tmp) == 0) then; res = ''; return; end if
-        if (tmp(1:1) == "'" .or. tmp(1:1) == '"') tmp = tmp(2:)
-        if (len_trim(tmp) > 0 .and. tmp(len_trim(tmp):len_trim(tmp)) == "'") &
-            tmp = tmp(:len_trim(tmp)-1)
-        if (len_trim(tmp) > 0 .and. tmp(len_trim(tmp):len_trim(tmp)) == '"') &
-            tmp = tmp(:len_trim(tmp)-1)
-        res = trim(adjustl(tmp))
+        n = len_trim(tmp)
+        if (n == 0) then; res = ''; return; end if
+        ! Detect quote type
+        quote_char = ' '
+        if (tmp(1:1) == "'" .or. tmp(1:1) == '"') quote_char = tmp(1:1)
+        if (quote_char /= ' ') then
+            ! Strip outer quotes
+            tmp = tmp(2:n)
+            n = n - 1
+            if (n > 0 .and. tmp(n:n) == quote_char) then
+                tmp(n:n) = ' '; n = n - 1
+            end if
+            ! Unescape doubled inner quotes: '' → '  or  "" → "
+            j = 1; i = 1
+            do while (i <= n)
+                if (i < n .and. tmp(i:i) == quote_char .and. tmp(i+1:i+1) == quote_char) then
+                    tmp(j:j) = quote_char
+                    j = j + 1
+                    i = i + 2  ! skip both quotes
+                else
+                    tmp(j:j) = tmp(i:i)
+                    j = j + 1
+                    i = i + 1
+                end if
+            end do
+            n = j - 1
+            tmp(n+1:) = ' '
+        end if
+        res = trim(adjustl(tmp(1:n)))
     end function clean_str_inline
 
     function clean_element_symbol(sym) result(elem)
@@ -569,12 +894,14 @@ contains
     end function clean_element_symbol
 
     subroutine copy_str_no_quotes(src, tgt)
-        !! Copy src to tgt, stripping leading/trailing quotes and whitespace
+        !! Copy src to tgt, stripping leading/trailing quotes and unescaping
+        !! CIF doubled quotes ('' → ', "" → ").
         !! tgt must be character(len=*) - copy only meaningful characters
         character(len=*), intent(in)  :: src
         character(len=*), intent(out) :: tgt
         character(len=len(src)) :: tmp
-        integer :: i, n
+        character(len=1) :: quote_char
+        integer :: i, n, j
 
         n = len_trim(src)
         if (n == 0) then
@@ -582,14 +909,39 @@ contains
             return
         end if
         tmp = adjustl(src)
-        if (tmp(1:1) == "'" .or. tmp(1:1) == '"') tmp = tmp(2:)
-        if (n > 0 .and. tmp(len_trim(tmp):len_trim(tmp)) == "'") tmp = tmp(:len_trim(tmp)-1)
-        if (n > 0 .and. tmp(len_trim(tmp):len_trim(tmp)) == '"') tmp = tmp(:len_trim(tmp)-1)
-        n = min(len_trim(tmp), len(tgt))
+        n = len_trim(tmp)
+
+        ! Detect quote type
+        quote_char = ' '
+        if (tmp(1:1) == "'" .or. tmp(1:1) == '"') quote_char = tmp(1:1)
+
+        if (quote_char /= ' ') then
+            ! Strip outer quotes
+            tmp = tmp(2:n)
+            n = n - 1
+            if (n > 0 .and. tmp(n:n) == quote_char) then
+                tmp(n:n) = ' '; n = n - 1
+            end if
+            ! Unescape doubled inner quotes: '' → '  or  "" → "
+            j = 1; i = 1
+            do while (i <= n)
+                if (i < n .and. tmp(i:i) == quote_char .and. tmp(i+1:i+1) == quote_char) then
+                    tmp(j:j) = quote_char
+                    j = j + 1
+                    i = i + 2
+                else
+                    tmp(j:j) = tmp(i:i)
+                    j = j + 1
+                    i = i + 1
+                end if
+            end do
+            n = j - 1
+        end if
+
+        n = min(n, len(tgt))
         do i = 1, n
             tgt(i:i) = tmp(i:i)
         end do
-        ! Blank-pad remaining positions for safety
         do i = n + 1, len(tgt)
             tgt(i:i) = ' '
         end do

@@ -6,6 +6,7 @@ program CASTEP_Suite
         compute_cartesian_lattice
     use cell_writer, only: write_cell_file
     use param_writer, only: write_param_file
+    use symmetry, only: expand_cif_symmetry
     use cli_menu, only: run_main_menu
     use poscastep_menu, only: run_poscastep_menu, precastep_cif_data, has_precastep_data, &
         precastep_source_file, free_cif_data
@@ -140,6 +141,17 @@ contains
             cfg%has_space_group = .true.
             cfg%space_group_name = sg_name
             write(*, '(a, a)') '  Space group: ', trim(sg_name)
+        end if
+
+        ! ── Symmetry expansion: if symops parsed, expand asymmetric unit to full cell ──
+        if (cif%n_symops > 1) then
+            write(*, '(a, i0)') '  Symmetry operations found: ', cif%n_symops
+            call expand_cif_symmetry(cif, istat)
+            if (istat == 0) then
+                write(*, '(a, i0, a)') '  Expanded to ', cif%n_atoms, ' atom(s) in full unit cell'
+            else
+                write(*, '(a)') '  Warning: Symmetry expansion failed, using asymmetric unit'
+            end if
         end if
 
         if (cif%n_atoms > 0) then

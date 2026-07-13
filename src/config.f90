@@ -166,6 +166,12 @@ module castep_config
         real(dp) :: x, y, z
     end type atom_t
 
+    !! Symmetry operation type: 3×3 rotation matrix (integer) + translation (fractional)
+    type, public :: sym_op_t
+        integer  :: rot(3, 3) = 0
+        real(dp) :: trans(3) = 0.0_dp
+    end type sym_op_t
+
     !! CIF parsed data type
     type :: cif_data_t
         real(dp) :: a, b, c, alpha, beta, gamma
@@ -173,6 +179,12 @@ module castep_config
         integer :: n_atoms
         type(atom_t), allocatable :: atoms(:)
         logical :: positions_fractional = .false.
+        ! Symmetry operations parsed from CIF
+        integer                      :: n_symops = 0
+        type(sym_op_t), allocatable  :: sym_ops(:)
+        ! Space group metadata
+        character(len=256)           :: space_group_name = ''
+        integer                      :: space_group_it = 0
     end type cif_data_t
 
     !! CASTEP configuration type
