@@ -122,8 +122,10 @@ contains
                 iy = max(1, min(nh, iy))
                 if (is == 1) then
                     grid(ix, iy) = 'U'
-                else
+                else if (is == 2) then
                     grid(ix, iy) = 'D'
+                else
+                    grid(ix, iy) = 'T'
                 end if
                 if (last_ix > 0) call draw_line(nw_data, nh, grid, last_ix, last_iy, ix, iy)
                 last_ix = ix; last_iy = iy
@@ -360,6 +362,7 @@ contains
         else if (ch == 'P') then; ct = 7    ! p-orbital PDOS
         else if (ch == 'L') then; ct = 8    ! d-orbital PDOS ('D' already used)
         else if (ch == 'F') then; ct = 9    ! f-orbital PDOS
+        else if (ch == 'T') then; ct = 10   ! 3rd curve overlay
         end if
     end function dos_char_type
 
@@ -380,6 +383,7 @@ contains
         case (7);  clr = C_YELLOW    ! p
         case (8);  clr = C_GREEN     ! d
         case (9);  clr = C_RED       ! f
+        case (10); clr = C_GREEN     ! 3rd curve (T)
         case default
             if (is_fermi) then; clr = C_RED
             else;               clr = ''

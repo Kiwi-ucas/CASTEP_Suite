@@ -12,6 +12,10 @@ module thermodynamics
     !! introduces systematic error at low T (artificial ω≈0 weight from
     !! finite-σ tails), so we use direct summation which is exact.
     !!
+    !! All quantities in eV and eV/K (consistent with CASTEP/MS output).
+    !!   E, F:  eV       (1 eV = 1000 meV)
+    !!   S, Cv: eV/K
+    !!
     !! Acoustic modes at Gamma (3 translational d.o.f.) are excluded.
     use castep_config, only: dp
     implicit none
@@ -21,8 +25,7 @@ module thermodynamics
 
     real(dp), parameter :: CM1_TO_MEV = 0.123984_dp
     real(dp), parameter :: KB_MEV     = 0.0861733_dp
-    real(dp), parameter :: MEV_TO_J   = 1.602176634e-22_dp
-    real(dp), parameter :: NA         = 6.02214076e23_dp
+    real(dp), parameter :: MEV_TO_EV  = 0.001_dp
 
     type :: thermo_data_t
         integer :: n_temps = 0
@@ -51,7 +54,7 @@ contains
         character(len=*), optional, intent(out) :: iomsg
         real(dp), intent(in), optional :: smearing   ! accepted, not used
 
-        integer  :: i, j, n_modes, nb, i_mode, idx
+        integer  :: i, j, n_modes, nb, i_mode, idx, n_actual
         real(dp) :: t, dt, freq_mev, x, expx, expx_m1, ln_term
         real(dp) :: e_sum, s_sum, cv_sum, zpe_accum, w
 
@@ -81,16 +84,16 @@ contains
             freq_mev = phdos%freqs(i) * CM1_TO_MEV
             zpe_accum = zpe_accum + 0.5_dp * freq_mev * phdos%weights(j)
         end do
-        thermo%zpe = zpe_accum
+        thermo%zpe = zpe_accum * MEV_TO_EV      ! meV → eV
 
         ! ── Temperature loop ──
-        thermo%n_temps = n_pts
-        allocate(thermo%temps(n_pts), thermo%energy(n_pts), thermo%free_e(n_pts), &
-                 thermo%entropy(n_pts), thermo%heat_cap(n_pts))
+        dt = (t_max - t_min) / max(n_pts, 1)       ! n_pts = number of intervals
+        n_actual = n_pts + 1                        ! → n_pts+1 grid points
+        thermo%n_temps = n_actual
+        allocate(thermo%temps(n_actual), thermo%energy(n_actual), thermo%free_e(n_actual), &
+                 thermo%entropy(n_actual), thermo%heat_cap(n_actual))
 
-        dt = (t_max - t_min) / max(n_pts - 1, 1)
-
-        do idx = 1, n_pts
+        do idx = 1, n_actual
             t = t_min + (idx - 1) * dt
             if (t < 1.0e-6_dp) t = 1.0e-6_dp
 
@@ -126,11 +129,10 @@ contains
                 cv_sum = cv_sum + KB_MEV * x * x * expx / (expx_m1 * expx_m1) * w
             end do
 
-            thermo%energy(idx)  = thermo%zpe + e_sum
-            thermo%free_e(idx)  = thermo%zpe + e_sum - t * s_sum
-            ! Convert meV/K → J/mol/K: × MEV_TO_J × NA ≈ × 96.5
-            thermo%entropy(idx) = s_sum * MEV_TO_J * NA
-            thermo%heat_cap(idx)= cv_sum * MEV_TO_J * NA
+            thermo%energy(idx)  = thermo%zpe + e_sum * MEV_TO_EV
+            thermo%free_e(idx)  = thermo%zpe + e_sum * MEV_TO_EV - t * s_sum * MEV_TO_EV
+            thermo%entropy(idx) = s_sum * MEV_TO_EV            ! meV/K → eV/K
+            thermo%heat_cap(idx)= cv_sum * MEV_TO_EV           ! meV/K → eV/K
         end do
 
     end subroutine compute_thermodynamics

@@ -40,8 +40,8 @@ module poscastep_menu
     integer, parameter :: POS_IR_SPEC    = 5
     integer, parameter :: POS_RAMAN_SPEC = 6
     integer, parameter :: POS_POLARIZABILITY = 7
-    integer, parameter :: POS_PHONON_MODES  = 8
-    integer, parameter :: POS_THERMO        = 9
+    integer, parameter :: POS_PHONON_MODES  = -2
+    integer, parameter :: POS_THERMO        = 8
     integer, parameter :: POS_VIEW_STRUCTURE = -1
 
     ! Module-level storage for PreCASTEP handoff (option 2: no file on disk)
@@ -67,6 +67,7 @@ contains
             write(*, '(a)') '  ================================'
             write(*, '(a)') '            PosCASTEP'
             write(*, '(a)') '  ================================'
+            write(*, '(a)') ' -2. Phonon Mode Visualization'
             write(*, '(a)') ' -1. View Crystal Structure (3D)'
             write(*, '(a)') '  0. Format Converter (.cell/.cif/.pdb)'
             write(*, '(a)') '  1. Plot Band Structure'
@@ -76,8 +77,7 @@ contains
             write(*, '(a)') '  5. Plot IR Spectrum'
             write(*, '(a)') '  6. Plot Raman Spectrum'
             write(*, '(a)') '  7. Static Polarizability'
-            write(*, '(a)') '  8. Phonon Mode Visualization'
-            write(*, '(a)') '  9. Thermodynamics'
+            write(*, '(a)') '  8. Thermodynamics'
             write(*, '(a)') '  Q. Back'
             write(*, '(a)', advance='no') '  Select option: '
 
@@ -2427,9 +2427,9 @@ contains
             phdos%n_branches, ' branches, ', phdos%n_qpoints, ' q-points.'
 
         ! ── Temperature range ──
-        t_min = 10.0_dp
-        t_max = 500.0_dp
-        n_pts = 100
+        t_min = 0.0_dp
+        t_max = 1000.0_dp
+        n_pts = 200
 
         write(*, '(a,f8.1,a)', advance='no') '  T_min (K) [', t_min, ']: '
         read(*, '(a)', iostat=ios) input
@@ -2468,7 +2468,7 @@ contains
             call free_phonon_dos_data(phdos); return
         end if
 
-        write(*, '(a,f12.4,a)') '  Zero-point energy: ', thermo%zpe, ' meV'
+        write(*, '(a,es14.6,a)') '  Zero-point energy: ', thermo%zpe, ' eV'
 
         ! ── Output mode ──
         write(*, '(a)') '  Output mode:'
@@ -2502,11 +2502,15 @@ contains
                 write(*, '(a)') '  Cannot write CSV file.'
                 call free_phonon_dos_data(phdos); call free_thermo_data(thermo); return
             end if
-            write(unit, '(a)') '# T(K),E(meV),S(J/mol/K),F(meV),Cv(J/mol/K)'
+            write(unit, '(a)') '# T(K),E_vib(eV),F_vib(eV),TS(eV),S(eV/K),Cv(eV/K)'
             do i = 1, thermo%n_temps
-                write(unit, '(f8.2,a,f12.4,a,f12.4,a,f12.4,a,f12.4)') &
-                    thermo%temps(i), ',', thermo%energy(i), ',', thermo%entropy(i), ',', &
-                    thermo%free_e(i), ',', thermo%heat_cap(i)
+                write(unit, '(es12.4,5(a,es14.6))') &
+                    thermo%temps(i), ',', &
+                    thermo%energy(i) - thermo%zpe, ',', &
+                    thermo%free_e(i) - thermo%zpe, ',', &
+                    thermo%temps(i) * thermo%entropy(i), ',', &
+                    thermo%entropy(i), ',', &
+                    thermo%heat_cap(i)
             end do
             close(unit)
             write(*, '(a)') '  Written ' // trim(csv_file)
@@ -2523,37 +2527,44 @@ contains
     subroutine run_thermo_navigator(thermo)
         !! Interactive ASCII plot: E, S, F, Cv vs T using unified plot_dos_ascii
         type(thermo_data_t), intent(in) :: thermo
-        integer, parameter :: N_CURVES = 4
-        integer :: cur_plot, i, tw, th, ios
+        integer, parameter :: N_CURVES = 2
+        integer :: cur_plot, tw, th, ios, nspin
         real(dp) :: x_center, half_range, x_center0, half_range0
         real(dp) :: y_center(N_CURVES), y_half(N_CURVES)
         real(dp) :: y_center0(N_CURVES), y_half0(N_CURVES)
-        real(dp), allocatable :: curve_data(:,:)
+        real(dp), allocatable :: curve_data(:,:), disp_data(:,:)
         character(len=32) :: titles(N_CURVES)
         character(len=1) :: ch
         character(len=3) :: arrow
 
         cur_plot = 1
-        titles(1) = 'Energy vs T'
-        titles(2) = 'Entropy vs T'
-        titles(3) = 'Free Energy vs T'
-        titles(4) = 'Heat Capacity vs T'
+        titles(1) = 'E_vib, F_vib & TS vs T'
+        titles(2) = 'Heat Capacity vs T'
 
-        ! Build data: all 4 curves in one array
-        allocate(curve_data(thermo%n_temps, N_CURVES))
-        curve_data(:,1) = thermo%energy
-        curve_data(:,2) = thermo%entropy
-        curve_data(:,3) = thermo%free_e
-        curve_data(:,4) = thermo%heat_cap
+        ! Build data: E_vib, F_vib, TS, Cv
+        allocate(curve_data(thermo%n_temps, 4))
+        curve_data(:,1) = thermo%energy - thermo%zpe   ! E_vib (eV)
+        curve_data(:,2) = thermo%free_e - thermo%zpe   ! F_vib (eV)
+        curve_data(:,3) = thermo%temps * thermo%entropy ! TS (eV)
+        curve_data(:,4) = thermo%heat_cap              ! Cv (eV/K)
 
-        ! Auto-range per curve
-        do i = 1, N_CURVES
-            y_half(i) = (maxval(curve_data(:,i)) - minval(curve_data(:,i))) * 0.575_dp
-            y_center(i) = (maxval(curve_data(:,i)) + minval(curve_data(:,i))) * 0.5_dp
-            if (y_half(i) < 1.0e-12_dp) y_half(i) = 1.0_dp
-            y_center0(i) = y_center(i)
-            y_half0(i) = y_half(i)
-        end do
+        ! Display 1 auto-range: covers E_vib, F_vib, TS
+        y_half(1) = (max(maxval(curve_data(:,1)), maxval(curve_data(:,2)), &
+                      maxval(curve_data(:,3))) &
+                  - min(minval(curve_data(:,1)), minval(curve_data(:,2)), &
+                      minval(curve_data(:,3)))) * 0.575_dp
+        y_center(1) = (max(maxval(curve_data(:,1)), maxval(curve_data(:,2)), &
+                        maxval(curve_data(:,3))) &
+                    + min(minval(curve_data(:,1)), minval(curve_data(:,2)), &
+                        minval(curve_data(:,3)))) * 0.5_dp
+        if (y_half(1) < 1.0e-12_dp) y_half(1) = 1.0_dp
+        y_center0(1) = y_center(1); y_half0(1) = y_half(1)
+
+        ! Display 2 auto-range: Cv only
+        y_half(2) = (maxval(curve_data(:,4)) - minval(curve_data(:,4))) * 0.575_dp
+        y_center(2) = (maxval(curve_data(:,4)) + minval(curve_data(:,4))) * 0.5_dp
+        if (y_half(2) < 1.0e-12_dp) y_half(2) = 1.0_dp
+        y_center0(2) = y_center(2); y_half0(2) = y_half(2)
 
         x_center = (thermo%temps(1) + thermo%temps(thermo%n_temps)) * 0.5_dp
         half_range = (thermo%temps(thermo%n_temps) - thermo%temps(1)) * 0.5_dp
@@ -2564,15 +2575,38 @@ contains
         do
             call get_term_size(tw, th)
             write(*, '(a)', advance='no') achar(27) // '[2J' // achar(27) // '[H'
+            write(*, '(a,es14.6,a)') '  ZPE = ', thermo%zpe, ' eV  (E_vib, F_vib exclude ZPE)'
+            write(*, '(a)') ''
 
-            call plot_dos_ascii(thermo%temps, curve_data(:,cur_plot:cur_plot), 1, &
-                0.0_dp, 0.0_dp, tw, th, &
-                y_center_in=y_center(cur_plot), y_half_in=y_half(cur_plot), &
-                e_center_in=x_center, half_range_in=half_range, &
-                xlabel='Temperature', xunit='K', hide_fermi=.true., &
-                title=titles(cur_plot))
+            if (cur_plot == 1) then
+                ! Overlay E_vib + F_vib + TS (all eV)
+                nspin = 3
+                allocate(disp_data(thermo%n_temps, 3))
+                disp_data(:,1) = curve_data(:,1)  ! E_vib
+                disp_data(:,2) = curve_data(:,2)  ! F_vib
+                disp_data(:,3) = curve_data(:,3)  ! TS
+                call plot_dos_ascii(thermo%temps, disp_data, nspin, &
+                    0.0_dp, 0.0_dp, tw, th, &
+                    y_center_in=y_center(1), y_half_in=y_half(1), &
+                    e_center_in=x_center, half_range_in=half_range, &
+                    xlabel='Temperature', xunit='K', hide_fermi=.true., &
+                    title=titles(1))
+                deallocate(disp_data)
+            else
+                ! Cv only
+                nspin = 1
+                allocate(disp_data(thermo%n_temps, 1))
+                disp_data(:,1) = curve_data(:,4)
+                call plot_dos_ascii(thermo%temps, disp_data, nspin, &
+                    0.0_dp, 0.0_dp, tw, th, &
+                    y_center_in=y_center(2), y_half_in=y_half(2), &
+                    e_center_in=x_center, half_range_in=half_range, &
+                    xlabel='Temperature', xunit='K', hide_fermi=.true., &
+                    title=titles(2))
+                deallocate(disp_data)
+            end if
 
-            write(*, '(a)') '  [1=E 2=S 3=F 4=Cv  arrows:pan  +/-:zoom  R:reset  Q:quit]'
+            write(*, '(a)') '  [1=E+F  2=Cv  arrows:pan  +/-:zoom  R:reset  Q:quit]'
 
             read(*, '(a)', advance='no', iostat=ios) ch
             if (ios /= 0) exit
@@ -2595,8 +2629,6 @@ contains
             select case (ch)
             case ('1'); cur_plot = 1
             case ('2'); cur_plot = 2
-            case ('3'); cur_plot = 3
-            case ('4'); cur_plot = 4
             case ('+', '=')
                 half_range = half_range * 0.5_dp
                 y_half(cur_plot) = y_half(cur_plot) * 0.5_dp
