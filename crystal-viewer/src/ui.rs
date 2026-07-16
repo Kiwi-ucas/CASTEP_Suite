@@ -10,6 +10,7 @@ use crate::Lattice;
 use crate::PhononState;
 use crate::RotateState;
 use crate::PanelRects;
+use crate::PesState;
 use crate::resources;
 
 #[derive(Resource)]
@@ -43,6 +44,7 @@ pub fn ui_system(
     mut phonon_state: Option<ResMut<PhononState>>,
     mut rotate_state: ResMut<RotateState>,
     mut panel_rects: ResMut<PanelRects>,
+    pes_state: Option<Res<PesState>>,
 ) {
     let ctx = contexts.ctx_mut();
 
@@ -185,6 +187,21 @@ pub fn ui_system(
                 }
             } else {
                 ui.label("Click an atom\nto see details");
+            }
+
+            // ── PES scan info ──
+            if let Some(ref pes) = pes_state {
+                ui.separator();
+                ui.label(egui::RichText::new("PES Scan").strong());
+                ui.label(format!("Plane: {}", pes.plane.to_uppercase()));
+                ui.label(format!("Grid: {}×{}", pes.nx, pes.ny));
+                ui.label(format!("Mode: {}", pes.scan_mode));
+                if pes.has_energies {
+                    ui.label(format!("E range: {:.4} – {:.4} eV", pes.e_min, pes.e_max));
+                    ui.label(format!("Surface: {}", if pes.show_surface { "ON (S)" } else { "OFF (S)" }));
+                } else {
+                    ui.label("No energies (run CASTEP first)");
+                }
             }
 
             ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {

@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 CASTEP Suite is a Fortran 2018 CLI suite with a Rust/Bevy 3D crystal structure viewer:
 
 1. **PreCASTEP** — converts crystallographic structure files (CIF, PDB, .cell) into CASTEP DFT input files (`.cell` and `.param`)
-2. **PosCASTEP** — post-processes CASTEP output: band structure with gap analysis, total DOS, projected DOS (s/p/d/f), phonon DOS, IR spectrum, Raman spectrum, static polarizability, and 3D crystal structure viewing. All plots ASCII terminal or CSV export
+2. **PosCASTEP** — post-processes CASTEP output: band structure with gap analysis, total DOS, projected DOS (s/p/d/f), phonon DOS, IR spectrum, Raman spectrum, static polarizability, PES (potential energy surface) scan with 3D visualization, and 3D crystal structure viewing. All plots ASCII terminal or CSV export
 3. **crystal-viewer** — standalone Rust/Bevy 3D viewer for interactive crystal structure visualization, atom picking, and editing (launched from PosCASTEP -1 or standalone)
 
 Launching `./CASTEP_Suite` shows a top-level suite menu. The PreCASTEP mode exits after successful file generation. PosCASTEP returns to its sub-menu (Q. Back) and then to the suite menu (Q. Quit). No `stop` statements remain — all error/recovery paths use `return`.
@@ -75,7 +75,9 @@ Post-processing menu for CASTEP output analysis and structure visualization:
 - `5. Plot IR Spectrum` — infrared absorption spectrum from `.phonon` file; ASCII (interactive) or CSV export
 - `6. Plot Raman Spectrum` — Raman scattering spectrum from `.phonon` file; ASCII (interactive) or CSV export
 - `7. Static Polarizability` — AIMD polarization fluctuation method: prompts for CASTEP `.castep` file (ε_∞), CP2K dipole directory, cell parameters, temperature, and MD time step; computes ionic dielectric constant via window-based extrapolation to W→0
-- `Q. Back` — Return to suite menu
+- `8. Thermodynamics` — compute E(T), S(T), F(T), Cv(T) from `.phonon` file via direct summation over phonon modes (CASTEP/Baroni formalism, δ-function limit). User-configurable temperature range + number of points; interactive ASCII plot (4 merged curves: E_vib, F_vib, TS, Cv) with ↑↓/←→/+−/R controls; CSV export
+- `9. PES Scan` — 2D potential energy surface scan: sub-menu (1. batch generate grid input files with IONIC_CONSTRAINTS, 2. collect .castep energies → JSON → 3D viewer surface rendering)
+- `-2. Phonon Mode Visualization` — parse eigenvectors + Born charges from `.phonon`/`.castep`, decompose modes, launch viewer with displacement arrows
 
 At any file path prompt, type `q` to cancel and return to the PosCASTEP menu. All interactive ASCII plots use the alternate screen buffer (`ESC[?1049h/l`) to avoid polluting terminal scrollback history.
 
@@ -141,6 +143,8 @@ Seventeen Fortran source files in `src/` (17 compiled, 1 uncompiled development 
 
 14. **polarizability.f90** — `polarizability` module. Static polarizability via AIMD polarization fluctuation method. Defines `pol_data_t` type (ε_∞ tensor, dipole trajectory, result tensors, unwrap statistics). Public: `parse_castep_epsilon` — extract optical dielectric tensor from `.castep` file, `parse_cp2k_dipoles` — read CP2K Berry phase dipole files via `find | sort` (handles 10k+ files without ARG_MAX overflow), `unwrap_dipoles` — unwrap polarization quantum jumps (raw-to-raw comparison with cumulative offset, nint for multi-quantum), `compute_static_dielectric_windowed` — window-based ε_ion with per-window detrend + median + W→0 extrapolation, `compute_polarizability` — convert ε tensor to α (ų). Private helpers: `detrend_window` (linear detrend), `compute_covariance_single` (3×3 covariance), `median` (selection sort). Module-level constants: `EPSILON_0`, `KBOLTZMANN`, `DEBYE_TO_CM`, `ANG3_TO_M3`, `DEBYE_PER_ANG`. Error codes: `IO_EPS_NOT_FOUND=112`, `IO_EPS_PARSE_ERROR=113`, `IO_DIPOLE_ERROR=114`.
 
+14.1 **pes_scan.f90** — `pes_scan` module. PES (Potential Energy Surface) scan — batch file generation and result collection. Defines `pes_grid_t` type (scan plane, grid dimensions, fractional range, mobile atom, scan mode). Public: `generate_pes_grid_points` — 2D grid point generation, `write_pes_metadata_json` — JSON metadata for crystal-viewer (lattice, structure atoms, energy placeholders), `collect_pes_energies` — scan grid subdirectories, parse `.castep` for "Final energy", fill energies into JSON. Private: `find_castep_in_dir` (hardcoded scan.castep → wildcard ls fallback), `parse_castep_energy`, `rewrite_json_with_energies`. Depends on `castep_config` only. Used by `poscastep_menu` (handle_pes_scan_menu).
+
 15. **phonon_modes.f90** — `phonon_modes` module. Phonon eigenvector parsing, Born effective charge parsing, and mode decomposition for 3D visualization. Defines `phonon_modes_data_t`, `phonon_mode_t`, `born_charge_t` types. Public: `parse_phonon_eigenvectors` — reads .phonon file header (structure + masses + frequencies + eigenvectors), `parse_castep_born_charges` — extracts 3×3 Born effective charge tensors per atom from .castep, `compute_mode_decomposition` — decomposes each phonon mode to per-atom contributions using Z*·u formalism (mode effective charge vector p_m, atom contribution fractions 0..1), `free_phonon_modes_data`. Error codes: `IO_EIGENVECTORS_NOT_FOUND=120`, `IO_BORN_MISMATCH=121`, `IO_BORN_NOT_FOUND=122`. Depends on `castep_config`.
 
 16. **crystal_json.f90** — `crystal_json` module. JSON bridge between Fortran and Rust crystal-viewer. Public: `write_crystal_json` (from `castep_config_t`), `write_crystal_json_cif` (from `cif_data_t` — auto-converts fractional→Cartesian), `write_crystal_json_modes` (from `phonon_modes_data_t` — writes crystal structure + per-mode per-atom displacement vectors), `read_crystal_json_to_cif` (parse modified JSON back into `cif_data_t`). Private: `lattice_vectors` (Cartesian lattice from cell params), `extract_json_real`, `extract_json_string`. Depends on `castep_config` + `parser` + `phonon_modes`.
@@ -154,7 +158,8 @@ Seventeen Fortran source files in `src/` (17 compiled, 1 uncompiled development 
 Standalone Bevy 0.15 3D application (5 source files, ~1100 lines):
 
 - **`crystal.rs`** — `CrystalData`, `Lattice`, `AtomData` types with serde JSON. `Lattice::to_vectors()` (Cartesian lattice), `Lattice::inverse_vectors()` (3×3 inverse), `Lattice::apply_inverse()` (M⁻¹ × vector), `CrystalData::expand_to_cell()` (asymmetric→full unit cell via ±1 fractional translations), `to_json()`/`write_to_file()`.
-- **`main.rs`** — App setup, `orbit_camera` (yaw/pitch quaternion via right-drag, ortho/perspective toggle via P), `rotate_camera_keys` (arrow keys ←→↑↓ with configurable angle in right panel), `move_selected_atom` (HKUMIN 6-direction movement with step via DragValue in right panel, default 0.5 Å), `display_mode_system` (1/2/3 ball-stick/space-filling/wireframe, A axes, B bonds, C cell), `spawn_cell_axes` (red X/green Y/blue Z arrows from origin, 1.5× lattice vectors with cone tips), `toggle_projection` (P key), `ortho_projection()` helper. Default: **orthographic projection**, bonds hidden, axes hidden, camera perpendicular to XY plane.
+- **`pes.rs`** — `PesData` type (plane, nx/ny grid, fractional ranges, lattice, structure atoms, energies, has_energies). `generate_surface()` — builds 3D triangle mesh from grid energy data: fractional coords → Cartesian, energy → height along plane normal, jet colormap 256×1 texture (blue→red) with UV mapping by energy value, front+back faces for double-sided rendering. `crystal_data_from_pes()` — converts PesData structure atoms to CrystalData for shared atom/cell rendering pipeline.
+- **`main.rs`** — App setup, `orbit_camera` (yaw/pitch quaternion via right-drag, ortho/perspective toggle via P), `rotate_camera_keys` (arrow keys ←→↑↓ with configurable angle in right panel), `move_selected_atom` (HKUMIN 6-direction movement with step via DragValue in right panel, default 0.5 Å), `display_mode_system` (1/2/3 ball-stick/space-filling/wireframe, A axes, B bonds, C cell), `spawn_cell_axes` (red X/green Y/blue Z arrows from origin, 1.5× lattice vectors with cone tips), `toggle_projection` (P key), `ortho_projection()` helper. **PES mode**: auto-detects `"pes_scan"` JSON type, spawns surface mesh with unlit colormap texture (S toggles visibility). Default: **orthographic projection**, bonds hidden, axes hidden, camera perpendicular to XY plane.
 - **`picking.rs`** — MVP-projection-based atom picking. `PickingState` with parent indices for symmetry-aware selection. `click_pick`/`hover_pick`/`highlight_atoms` (highlights all symmetry-equivalent atoms). Pick radius = 6% of viewport height. Custom `over_egui_panel` check prevents picks/hover over UI panels.
 - **`ui.rs`** — egui panels: left 180px (asymmetric-unit atom list + periodic table popup), right 220px (cell params + selected atom + Rotation Angle / Move Step DragValue), bottom toolbar (concise key hints). Panels fixed-width, non-resizable.
 - **`resources.rs`** — Periodic table data: covalent radii and CPK/Jmol colors for element→color mapping.
@@ -176,6 +181,7 @@ Key features:
 ```
 castep_config (leaf)
 term_utils    (leaf)
+  ├── symmetry        (config)
   ├── parser          (config)
   ├── cell_writer     (config)
   ├── param_writer    (config)
@@ -185,6 +191,9 @@ term_utils    (leaf)
   ├── phonon_modes    (config)
   ├── dos_compute     (config)
   ├── polarizability  (config)
+  ├── thermodynamics  (config)
+  ├── castep_vib      (config)
+  ├── pes_scan        (config)
   ├── crystal_json    (config + parser + phonon_modes)
   ├── bands_plotter   (config + term_utils)
   ├── dos_plotter     (config + term_utils)

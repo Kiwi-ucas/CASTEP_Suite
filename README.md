@@ -158,6 +158,7 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
   ================================
             PosCASTEP
   ================================
+ -2. Phonon Mode Visualization
  -1. View Crystal Structure (3D)
   0. Format Converter (.cell/.cif/.pdb)
   1. Plot Band Structure
@@ -167,7 +168,8 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
   5. Plot IR Spectrum
   6. Plot Raman Spectrum
   7. Static Polarizability
-  8. Phonon Mode Visualization
+  8. Thermodynamics
+  9. PES Scan
   Q. Back
 ```
 
@@ -258,6 +260,21 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
 - Supports `.phonon` files with or without Raman activity column
 - Born charge decomposition is optional — arrows still render without it (in white)
 
+### 9. PES Scan (Potential Energy Surface)
+
+2D potential energy surface scan with constrained geometry optimization and 3D visualization:
+
+- **Batch generation**: select a mobile atom, scan plane (XY/XZ/YZ), fractional coordinate range, and grid size → generates `grid_001_001/` … `grid_Nx_Ny/` subdirectories, each with `scan.cell` + `scan.param` + `IONIC_CONSTRAINTS`
+- **PreCASTEP integration**: user configures CASTEP parameters (task, XC, cutoff, etc.) via the standard PreCASTEP menu before generation
+- **Result collection**: parses all `.castep` files for "Final energy", writes `pes_metadata.json` with energy grid
+- **3D surface visualization**: launches crystal-viewer with energy surface rendered as a colored mesh
+  - Jet colormap: blue (low energy) → cyan → green → yellow → red (high energy)
+  - Surface height proportional to energy along the plane normal
+  - Double-sided rendering visible from any angle
+  - S key toggles surface visibility
+  - Right-drag to rotate, scroll to zoom, standard viewer controls
+- **No-energies mode**: viewer shows structure atoms + cell frame before CASTEP runs
+
 ## Project structure
 
 ```
@@ -282,13 +299,15 @@ CASTEP_Suite/
 │   ├── poscastep_menu.f90   # PosCASTEP post-processing + viewer integration
 │   ├── crystal_json.f90     # JSON bridge for Rust crystal-viewer
 │   ├── polarizability.f90   # Static polarizability (AIMD fluctuation method)
+│   ├── pes_scan.f90         # PES scan: batch generation + result collection
 │   ├── drift_analysis.f90   # Drift rate diagnostics (not compiled, dev artifact)
 │   └── main.f90             # Entry point, suite menu dispatcher
 └── crystal-viewer/          # Rust/Bevy 3D viewer subproject
     ├── Cargo.toml
     └── src/
-        ├── main.rs           # App setup, camera, movement, display modes
+        ├── main.rs           # App setup, camera, movement, PES surface, display modes
         ├── crystal.rs        # Data types, lattice math, cell expansion
+        ├── pes.rs            # PES data types, surface mesh generation, colormap
         ├── picking.rs        # MVP-projection atom picking/highlighting
         ├── ui.rs             # egui panels (atom list, info, toolbar)
         └── resources.rs      # Periodic table (radii, CPK/Jmol colors)

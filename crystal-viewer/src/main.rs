@@ -1,6 +1,6 @@
 //! Crystal Viewer — Interactive 3D crystal structure visualization
 
-mod crystal; mod resources; mod picking; mod ui;
+mod crystal; mod resources; mod picking; mod ui; mod pes;
 
 use bevy::prelude::*;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
@@ -9,6 +9,7 @@ use bevy_egui::EguiContexts;
 use crystal::{CrystalData, Lattice, PhononModesData};
 use picking::{PickingState, click_pick, hover_pick, highlight_atoms};
 use ui::{AtomInfo, CrystalMeta, ui_system};
+use pes::PesData;
 use std::f32::consts::PI;
 use std::env;
 
@@ -32,6 +33,7 @@ fn main() {
         .add_systems(Update, (display_mode_system, sync_atom_radii).chain())
         .add_systems(Update, sync_axes_visibility.after(display_mode_system))
         .add_systems(Update, (toggle_projection, sync_arrow_visibility))
+        .add_systems(Update, toggle_pes_surface)
         .run();
 }
 
@@ -85,6 +87,21 @@ pub struct PhononState {
 #[derive(Resource)]
 #[derive(Component)]
 struct CellAxes;
+
+#[derive(Resource, Clone)]
+pub struct PesState {
+    pub plane: String,
+    pub nx: usize,
+    pub ny: usize,
+    pub e_min: f64,
+    pub e_max: f64,
+    pub scan_mode: String,
+    pub has_energies: bool,
+    pub show_surface: bool,
+}
+
+#[derive(Component)]
+struct PesSurface;
 
 #[derive(Resource)]
 struct DisplayMode {
@@ -522,13 +539,28 @@ fn uv_sphere(radius: f32, sec: u32, stk: u32) -> Mesh {
 
 fn setup(
     mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>, crystal_path: Res<CrystalPath>,
 ) {
-    let data = if crystal_path.0.is_empty() { default_cu_fcc() } else {
-        CrystalData::from_json(&crystal_path.0).unwrap_or_else(|e| {
+    // Detect PES JSON (type == "pes_scan")
+    let json_str = if crystal_path.0.is_empty() {
+        String::new()
+    } else {
+        std::fs::read_to_string(&crystal_path.0).unwrap_or_default()
+    };
+    let pes_opt: Option<PesData> = if PesData::detect(&json_str) {
+        PesData::from_json(&crystal_path.0).ok()
+    } else {
+        None
+    };
+
+    let data = match &pes_opt {
+        Some(pes) => crystal_data_from_pes(pes),
+        None if crystal_path.0.is_empty() => default_cu_fcc(),
+        None => CrystalData::from_json(&crystal_path.0).unwrap_or_else(|e| {
             eprintln!("Failed to load {}: {}. Using Cu FCC.", crystal_path.0, e);
             default_cu_fcc()
-        })
+        }),
     };
 
     let (positions, parent_indices, image_offsets) = data.expand_to_cell();
@@ -689,7 +721,44 @@ fn setup(
         MainCamera,
     ));
 
-    println!("Loaded {} atoms. Right-drag to rotate, scroll to zoom, click to select.", n);
+    // ── PES surface mesh ──
+    if let Some(pes) = &pes_opt {
+        let e_range = pes.energy_range();
+        if let Some((mesh, tex_image)) = pes.generate_surface() {
+            let tex_handle = materials.add(StandardMaterial {
+                base_color_texture: Some(images.add(tex_image)),
+                alpha_mode: AlphaMode::Blend,
+                unlit: true,
+                ..default()
+            });
+            commands.spawn((
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(tex_handle),
+                PesSurface,
+            ));
+            println!("PES surface: {}×{} grid, {} energies, plane={}",
+                pes.nx, pes.ny,
+                if pes.has_energies { "with" } else { "no" },
+                pes.plane);
+        }
+
+        commands.insert_resource(PesState {
+            plane: pes.plane.clone(),
+            nx: pes.nx,
+            ny: pes.ny,
+            e_min: e_range.map(|(min, _)| min).unwrap_or(0.0),
+            e_max: e_range.map(|(_, max)| max).unwrap_or(0.0),
+            scan_mode: pes.scan_mode.clone(),
+            has_energies: pes.has_energies,
+            show_surface: pes.has_energies,
+        });
+    }
+
+    if pes_opt.is_some() {
+        println!("PES mode: {} atoms. Right-drag: rotate | Scroll: zoom | S: surface toggle.", n);
+    } else {
+        println!("Loaded {} atoms. Right-drag to rotate, scroll to zoom, click to select.", n);
+    }
 }
 
 /// Build a cone mesh pointing along +Y (apex at top, base at origin)
@@ -956,6 +1025,41 @@ fn default_cu_fcc() -> CrystalData {
         positions_fractional: false,
         modified: false,
         phonon_modes: None,
+    }
+}
+
+/// Convert PesData structure_atoms (fx/fy/fz) to CrystalData for shared rendering.
+fn crystal_data_from_pes(pes: &PesData) -> CrystalData {
+    crystal::CrystalData {
+        lattice: pes.lattice.clone(),
+        atoms: pes.structure_atoms.iter().map(|pa| crystal::AtomData {
+            element: pa.element.clone(),
+            x: pa.fx as f32,
+            y: pa.fy as f32,
+            z: pa.fz as f32,
+            label: String::new(),
+        }).collect(),
+        positions_fractional: true,
+        modified: false,
+        phonon_modes: None,
+    }
+}
+
+/// Toggle PES surface visibility with S key
+fn toggle_pes_surface(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut pes_state: Option<ResMut<PesState>>,
+    mut surface_q: Query<&mut Visibility, With<PesSurface>>,
+    mut contexts: EguiContexts,
+) {
+    if contexts.ctx_mut().wants_keyboard_input() { return; }
+    if !keys.just_pressed(KeyCode::KeyS) { return; }
+    if let Some(ref mut ps) = pes_state {
+        ps.show_surface = !ps.show_surface;
+        let vis = if ps.show_surface { Visibility::Inherited } else { Visibility::Hidden };
+        for mut v in surface_q.iter_mut() {
+            *v = vis;
+        }
     }
 }
 

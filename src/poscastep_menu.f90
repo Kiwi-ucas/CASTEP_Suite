@@ -3,10 +3,13 @@ module poscastep_menu
     !! Structure: top-level menu -> property-specific sub-menus
     !! Currently implements: Plot Band Structure
     use castep_config, only: dp, pi, HARTREE_TO_EV, bands_data_t, pdos_data_t, &
-        cif_data_t, atom_t, MAX_LINE_LEN, IO_INVALID_INPUT, IO_SUCCESS, IO_USER_QUIT, &
-        IO_FILE_NOT_FOUND, IO_PARSE_ERROR, IO_WRITE_ERROR, IO_PRECASTEP_LAUNCH, strip_quotes, &
-        compute_cartesian_lattice
-    use parser, only: parse_cif_inline, parse_pdb_inline, parse_cell_inline
+        cif_data_t, atom_t, castep_config_t, MAX_LINE_LEN, &
+        IO_INVALID_INPUT, IO_SUCCESS, IO_USER_QUIT, &
+        IO_FILE_NOT_FOUND, IO_PARSE_ERROR, IO_WRITE_ERROR, IO_PRECASTEP_LAUNCH, &
+        TASK_ENERGY, TASK_GEOMETRY_OPT, PSEUDO_C19MK2, KPOINT_GAMMA, &
+        default_config, strip_quotes, compute_cartesian_lattice
+    use parser, only: parse_cif_inline, parse_pdb_inline, parse_cell_inline, &
+        clean_element_symbol
     use phonon_dos, only: phonon_dos_data_t, parse_phonon_file, compute_phonon_dos, &
         free_phonon_dos_data
     use castep_vib, only: vib_data_t, parse_castep_vib, compute_ir_spectrum, &
@@ -28,6 +31,11 @@ module poscastep_menu
     use crystal_json, only: write_crystal_json_cif, read_crystal_json_to_cif
     use thermodynamics, only: thermo_data_t, compute_thermodynamics, free_thermo_data
     use symmetry, only: expand_cif_symmetry
+    use cell_writer, only: write_cell_file
+    use param_writer, only: write_param_file
+    use cli_menu, only: run_main_menu
+    use pes_scan, only: pes_grid_t, generate_pes_grid_points, write_pes_metadata_json, &
+        collect_pes_energies
     implicit none
     private
 
@@ -43,6 +51,7 @@ module poscastep_menu
     integer, parameter :: POS_POLARIZABILITY = 7
     integer, parameter :: POS_PHONON_MODES  = -2
     integer, parameter :: POS_THERMO        = 8
+    integer, parameter :: POS_PES_SCAN      = 9
     integer, parameter :: POS_VIEW_STRUCTURE = -1
 
     ! Module-level storage for PreCASTEP handoff (option 2: no file on disk)
@@ -79,6 +88,7 @@ contains
             write(*, '(a)') '  6. Plot Raman Spectrum'
             write(*, '(a)') '  7. Static Polarizability'
             write(*, '(a)') '  8. Thermodynamics'
+            write(*, '(a)') '  9. PES Scan'
             write(*, '(a)') '  Q. Back'
             write(*, '(a)', advance='no') '  Select option: '
 
@@ -132,6 +142,9 @@ contains
                 if (iostat == IO_USER_QUIT) return
             case (POS_THERMO)
                 call handle_thermo_menu(iostat)
+                if (iostat == IO_USER_QUIT) return
+            case (POS_PES_SCAN)
+                call handle_pes_scan_menu(iostat)
                 if (iostat == IO_USER_QUIT) return
             case (POS_VIEW_STRUCTURE)
                 call handle_view_structure(iostat)
@@ -2666,5 +2679,281 @@ contains
         if (allocated(data%atoms)) deallocate(data%atoms)
         data%n_atoms = 0
     end subroutine free_cif_data
+
+    ! ═══════════════════════════════════════════════════════════════
+    !  PES Scan sub-menu
+    ! ═══════════════════════════════════════════════════════════════
+
+    subroutine handle_pes_scan_menu(iostat)
+        integer, intent(out) :: iostat
+        integer :: ios
+        character(len=256) :: input
+        logical :: has_saved  ! tracks if first sub-item has been used
+
+        iostat = 0
+        has_saved = .false.
+
+        do
+            write(*, '(a)') ''
+            write(*, '(a)') '  =================================='
+            write(*, '(a)') '            PES Scan'
+            write(*, '(a)') '  =================================='
+            write(*, '(a)') '  1. Generate Scan Input Files'
+            write(*, '(a)') '  2. Collect Results & Visualize'
+            write(*, '(a)') '  Q. Back'
+            write(*, '(a)', advance='no') '  Select option: '
+            read(*, '(a)', iostat=ios) input
+            if (ios /= 0) then; iostat = 0; exit; end if
+            input = adjustl(input)
+
+            select case (trim(input))
+            case ('1')
+                call handle_pes_generate(ios)
+                if (ios == 0) has_saved = .true.
+            case ('2')
+                call handle_pes_collect(ios)
+            case ('q', 'Q')
+                exit
+            case default
+                write(*, '(a)') '  Invalid option.'
+            end select
+        end do
+    end subroutine handle_pes_scan_menu
+
+
+    subroutine handle_pes_generate(iostat)
+        !! PES sub-menu 1: Generate scan input files
+        integer, intent(out) :: iostat
+
+        type(cif_data_t) :: cif
+        type(castep_config_t) :: cfg
+        type(pes_grid_t) :: grid
+        character(len=MAX_LINE_LEN) :: file_path, scan_dir, sub_dir, stem, input
+        character(len=MAX_LINE_LEN) :: cell_path, param_path
+        real(dp), allocatable :: frac_points(:,:)
+        integer :: ios, i, n_total, mi, n_pts(2)
+        real(dp) :: fx, fy, range_vals(4)
+        character(len=8) :: plane_choice, mode_choice
+
+        iostat = 0
+
+        ! ── Load structure ──
+        write(*, '(a)', advance='no') '  Enter structure file (.cif/.pdb/.cell): '
+        read(*, '(a)', iostat=ios) file_path
+        if (ios /= 0) return
+        file_path = adjustl(file_path); call strip_quotes(file_path)
+        if (file_path == 'q' .or. file_path == 'Q') return
+        call parse_cif_inline(trim(file_path), cif, ios)
+        if (ios /= 0) then
+            write(*, '(a)') '  Error parsing file.'; return
+        end if
+        call expand_cif_symmetry(cif, ios)
+
+        ! ── Populate castep_config_t ──
+        call default_config(cfg)
+        stem = get_file_stem(file_path)
+        cfg%cif_file_path = trim(file_path)
+        cfg%cell_length(1) = cif%a
+        cfg%cell_length(2) = cif%b
+        cfg%cell_length(3) = cif%c
+        cfg%cell_angle(1)  = cif%alpha
+        cfg%cell_angle(2)  = cif%beta
+        cfg%cell_angle(3)  = cif%gamma
+        cfg%num_atoms = cif%n_atoms
+        cfg%cartesian_coords = .not. cif%positions_fractional
+        allocate(cfg%atom_type(cfg%num_atoms))
+        allocate(cfg%atom_x(cfg%num_atoms))
+        allocate(cfg%atom_y(cfg%num_atoms))
+        allocate(cfg%atom_z(cfg%num_atoms))
+        do i = 1, cif%n_atoms
+            cfg%atom_type(i) = trim(clean_element_symbol(cif%atoms(i)%element))
+            cfg%atom_x(i)    = cif%atoms(i)%x
+            cfg%atom_y(i)    = cif%atoms(i)%y
+            cfg%atom_z(i)    = cif%atoms(i)%z
+        end do
+        call free_cif_data(cif)
+
+        ! ── Select mobile atom ──
+        write(*, '(a)') '  Atom list:'
+        do i = 1, cfg%num_atoms
+            if (cfg%cartesian_coords) then
+                write(*, '(i4, a, a8, a, 3f10.6)') i, '. ', trim(cfg%atom_type(i)), '  cart:', &
+                    cfg%atom_x(i), cfg%atom_y(i), cfg%atom_z(i)
+            else
+                write(*, '(i4, a, a8, a, 3f10.6)') i, '. ', trim(cfg%atom_type(i)), '  frac:', &
+                    cfg%atom_x(i), cfg%atom_y(i), cfg%atom_z(i)
+            end if
+        end do
+        write(*, '(a,i0,a)', advance='no') '  Select mobile atom (1-', cfg%num_atoms, '): '
+        read(*, *, iostat=ios) mi
+        if (ios /= 0 .or. mi < 1 .or. mi > cfg%num_atoms) then
+            write(*, '(a)') '  Invalid selection.'; return
+        end if
+        grid%mobile_atom_idx = mi
+
+        ! ── Select plane ──
+        write(*, '(a)') '  Scan plane: 1=xy  2=xz  3=yz'
+        write(*, '(a)', advance='no') '  Choice: '
+        read(*, '(a)', iostat=ios) plane_choice
+        if (plane_choice(1:1) == '1') then; grid%plane_axis = [1, 2]
+        else if (plane_choice(1:1) == '2') then; grid%plane_axis = [1, 3]
+        else if (plane_choice(1:1) == '3') then; grid%plane_axis = [2, 3]
+        else; write(*, '(a)') '  Invalid.'; return; end if
+
+        ! ── Grid parameters ──
+        write(*, '(a)', advance='no') '  Grid Nx (default 5): '
+        read(*, '(a)', iostat=ios) input
+        n_pts(1) = 5; if (len_trim(input) > 0) read(input, *, iostat=ios) n_pts(1)
+        write(*, '(a)', advance='no') '  Grid Ny (default 5): '
+        read(*, '(a)', iostat=ios) input
+        n_pts(2) = 5; if (len_trim(input) > 0) read(input, *, iostat=ios) n_pts(2)
+        grid%n_points = n_pts
+
+        write(*, '(a)', advance='no') '  fx range (min max, default 0 1): '
+        read(*, '(a)', iostat=ios) input
+        range_vals(1) = 0.0_dp; range_vals(2) = 1.0_dp
+        if (len_trim(input) > 0) read(input, *, iostat=ios) range_vals(1), range_vals(2)
+        grid%frac_range(1,1) = range_vals(1); grid%frac_range(1,2) = range_vals(2)
+
+        write(*, '(a)', advance='no') '  fy range (min max, default 0 1): '
+        read(*, '(a)', iostat=ios) input
+        range_vals(3) = 0.0_dp; range_vals(4) = 1.0_dp
+        if (len_trim(input) > 0) read(input, *, iostat=ios) range_vals(3), range_vals(4)
+        grid%frac_range(2,1) = range_vals(3); grid%frac_range(2,2) = range_vals(4)
+
+        ! ── Scan mode ──
+        write(*, '(a)') '  Mode: 1=Single-point (SP)  2=Constrained relax (RELAX)'
+        write(*, '(a)', advance='no') '  Choice (default SP): '
+        read(*, '(a)', iostat=ios) mode_choice
+        grid%scan_mode = 'SP'
+        if (mode_choice(1:1) == '2') grid%scan_mode = 'RELAX'
+
+        if (grid%scan_mode == 'RELAX') then
+            cfg%task_type = TASK_GEOMETRY_OPT
+            cfg%cell_opt_mode = 'FIX_CELL'
+        else
+            cfg%task_type = TASK_ENERGY
+        end if
+
+        ! Set PES constraints: mobile atom is fixed in the direction
+        ! perpendicular to the scan plane, free to move in the plane.
+        ! SP mode: mobile atom fully fixed ([1,1,1]).
+        ! RELAX mode: mobile atom fixed only out-of-plane (e.g. xy→[0,0,1]).
+        cfg%pes_mobile_idx = mi
+        cfg%pes_fix_axes = [1, 1, 1]
+        if (grid%scan_mode == 'RELAX') then
+            cfg%pes_fix_axes = [0, 0, 0]
+            ! The third axis (not in the scan plane) is the fixed direction
+            cfg%pes_fix_axes(6 - grid%plane_axis(1) - grid%plane_axis(2)) = 1
+        end if
+
+        ! ── PreCASTEP parameter configuration ──
+        write(*, '(a)') ''
+        write(*, '(a)') '  ── Configure CASTEP parameters ──'
+        write(*, '(a)') '  (Select 0. Generate when ready to proceed)'
+        cfg%cif_file_path = trim(file_path)
+        call run_main_menu(cfg, ios)
+        if (ios == IO_USER_QUIT) return
+
+        ! ── Generate grid points ──
+        call generate_pes_grid_points(grid, frac_points, n_total, ios)
+        if (ios /= 0) then
+            write(*, '(a)') '  Error generating grid.'; return
+        end if
+
+        ! ── Create output directory ──
+        scan_dir = 'pes_scan/' // trim(stem)
+        sub_dir = 'mkdir -p "' // trim(scan_dir) // '"'
+        call execute_command_line(trim(sub_dir), exitstat=ios)
+
+        ! ── Generate files ──
+        write(*, '(a,i0,a)') '  Generating ', n_total, ' grid points...'
+        do i = 1, n_total
+            fx = frac_points(i, 1)
+            fy = frac_points(i, 2)
+
+            ! Set mobile atom to grid point fractional coords
+            select case (grid%plane_axis(1))
+            case (1); cfg%atom_x(mi) = fx
+            case (2); cfg%atom_y(mi) = fx
+            case (3); cfg%atom_z(mi) = fx
+            end select
+            select case (grid%plane_axis(2))
+            case (1); cfg%atom_x(mi) = fy
+            case (2); cfg%atom_y(mi) = fy
+            case (3); cfg%atom_z(mi) = fy
+            end select
+
+            write(sub_dir, '(a, a, i3.3, a, i3.3)') trim(scan_dir), '/grid_', &
+                modulo(i-1, grid%n_points(1)) + 1, '_', &
+                (i-1) / grid%n_points(1) + 1
+
+            call execute_command_line('mkdir -p "' // trim(sub_dir) // '"', exitstat=ios)
+
+            cell_path  = trim(sub_dir) // '/scan.cell'
+            param_path = trim(sub_dir) // '/scan.param'
+            call write_cell_file(cell_path, cfg, ios)
+            call write_param_file(param_path, cfg, ios)
+        end do
+
+        ! ── Write metadata JSON ──
+        call write_pes_metadata_json(trim(scan_dir)//'/pes_metadata.json', grid, cfg, ios)
+
+        ! ── Cleanup ──
+        deallocate(frac_points)
+        deallocate(cfg%atom_type, cfg%atom_x, cfg%atom_y, cfg%atom_z)
+
+        write(*, '(a)') ''
+        write(*, '(a)') '  =================================='
+        write(*, '(a)') '    PES scan files generated!'
+        write(*, '(a)') '  =================================='
+        write(*, '(a,i0,a)') '  Grid: ', grid%n_points(1), ' x ', grid%n_points(2)
+        write(*, '(a,a)') '  Directory: ', trim(scan_dir)
+        write(*, '(a)') ''
+        write(*, '(a)') '  Next steps:'
+        write(*, '(a)') '    1. Run CASTEP in each grid_*/ subdirectory'
+        write(*, '(a)') '    2. Return to PosCASTEP → 9 → 2 to collect results'
+    end subroutine handle_pes_generate
+
+
+    subroutine handle_pes_collect(iostat)
+        !! PES sub-menu 2: Collect .castep results and launch viewer
+        integer, intent(out) :: iostat
+
+        character(len=MAX_LINE_LEN) :: scan_dir, json_path, input
+        integer :: ios
+        logical :: exists
+
+        iostat = 0
+
+        write(*, '(a)') '  Enter scan directory (e.g. pes_scan/NaCl):'
+        write(*, '(a)', advance='no') '  Path: '
+        read(*, '(a)', iostat=ios) scan_dir
+        if (ios /= 0) return
+        scan_dir = adjustl(scan_dir); call strip_quotes(scan_dir)
+        if (scan_dir == 'q' .or. scan_dir == 'Q') return
+
+        inquire(file=trim(scan_dir)//'/pes_metadata.json', exist=exists)
+        if (.not. exists) then
+            write(*, '(a)') '  pes_metadata.json not found in directory.'
+            return
+        end if
+
+        ! ── Collect energies ──
+        call collect_pes_energies(trim(scan_dir), ios)
+        if (ios /= 0) then
+            write(*, '(a)') '  Error collecting energies.'
+            return
+        end if
+
+        ! ── Launch viewer? ──
+        write(*, '(a)', advance='no') '  Launch 3D Viewer? (y/n): '
+        read(*, '(a)', iostat=ios) input
+        if (ios == 0 .and. (input(1:1) == 'y' .or. input(1:1) == 'Y')) then
+            json_path = trim(scan_dir) // '/pes_metadata.json'
+            call launch_viewer(json_path)
+        end if
+    end subroutine handle_pes_collect
+
 
 end module poscastep_menu

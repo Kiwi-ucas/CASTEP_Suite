@@ -10,11 +10,16 @@ module cell_writer
          PHONON_METHOD_FD, PHONON_FINE_SUPERCELL, &
          KPOINT_GAMMA, KPOINT_MONKHORST_PACK, &
          compare_tags, IO_WRITE_FAIL, &
+         compute_cartesian_lattice, &
          castep_config_t
     implicit none
     private
 
     public :: write_cell_file
+    public :: write_block_lattice_abc, write_block_lattice_cart
+    public :: write_block_positions_abs, write_block_positions_frac
+    public :: write_block_species_pot, write_block_kpoint_grid
+    public :: write_block_ionic_constraints
 
 contains
 
@@ -23,23 +28,23 @@ contains
         integer, intent(in) :: unit
         type(castep_config_t), intent(in) :: cfg
 
-        write(unit, '(a)') '%BLOCK LATTICE_ABC'
-        write(unit, '(3(f12.7, 1x))') cfg%cell_length(1), cfg%cell_length(2), cfg%cell_length(3)
-        write(unit, '(3(f12.7, 1x))') cfg%cell_angle(1), cfg%cell_angle(2), cfg%cell_angle(3)
-        write(unit, '(a)') '%ENDBLOCK LATTICE_ABC'
+        write(unit, '(a)') '#%BLOCK LATTICE_ABC  (commented out — for reference)'
+        write(unit, '(a,3(f12.7,1x))') '#', cfg%cell_length(1), cfg%cell_length(2), cfg%cell_length(3)
+        write(unit, '(a,3(f12.7,1x))') '#', cfg%cell_angle(1), cfg%cell_angle(2), cfg%cell_angle(3)
+        write(unit, '(a)') '#%ENDBLOCK LATTICE_ABC'
         write(unit, '(a)') ''
     end subroutine write_block_lattice_abc
 
     subroutine write_block_lattice_cart(unit, cfg)
-        !! Write %BLOCK LATTICE_CART (commented out with # for comparison with LATTICE_ABC)
+        !! Write %BLOCK LATTICE_CART from cfg%cell_basis.
         integer, intent(in) :: unit
         type(castep_config_t), intent(in) :: cfg
-
-        write(unit, '(a)') '#%BLOCK LATTICE_CART'
-        write(unit, '(a,3(f12.7,1x))') '#', cfg%cell_basis(1,1), cfg%cell_basis(1,2), cfg%cell_basis(1,3)
-        write(unit, '(a,3(f12.7,1x))') '#', cfg%cell_basis(2,1), cfg%cell_basis(2,2), cfg%cell_basis(2,3)
-        write(unit, '(a,3(f12.7,1x))') '#', cfg%cell_basis(3,1), cfg%cell_basis(3,2), cfg%cell_basis(3,3)
-        write(unit, '(a)') '#%ENDBLOCK LATTICE_CART'
+        integer :: i
+        write(unit, '(a)') '%BLOCK LATTICE_CART'
+        do i = 1, 3
+            write(unit, '(3(f12.7, 1x))') cfg%cell_basis(i,1), cfg%cell_basis(i,2), cfg%cell_basis(i,3)
+        end do
+        write(unit, '(a)') '%ENDBLOCK LATTICE_CART'
         write(unit, '(a)') ''
     end subroutine write_block_lattice_cart
 
@@ -82,7 +87,8 @@ contains
     end subroutine write_block_species_pot
 
     subroutine write_block_positions_abs(unit, cfg)
-        !! Write %BLOCK POSITIONS_ABS with Cartesian coordinates
+        !! Write %BLOCK POSITIONS_ABS with Cartesian coordinates.
+        !! Converts from fractional via cfg%cell_basis if cartesian_coords is false.
         integer, intent(in) :: unit
         type(castep_config_t), intent(in) :: cfg
         real(dp), allocatable :: cart_coords(:,:)
@@ -92,14 +98,12 @@ contains
 
         allocate(cart_coords(cfg%num_atoms, 3))
         if (cfg%cartesian_coords) then
-            ! Atoms already in Cartesian coordinates (from PDB or .cell)
             do i = 1, cfg%num_atoms
                 cart_coords(i,1) = cfg%atom_x(i)
                 cart_coords(i,2) = cfg%atom_y(i)
                 cart_coords(i,3) = cfg%atom_z(i)
             end do
         else
-            ! CIF input: atoms are fractional, convert via lattice basis
             do i = 1, cfg%num_atoms
                 do j = 1, 3
                     cart_coords(i,j) = cfg%cell_basis(j,1) * cfg%atom_x(i) &
@@ -109,12 +113,12 @@ contains
             end do
         end if
 
-        write(unit, '(a)') '%BLOCK POSITIONS_ABS'
+        write(unit, '(a)') '#%BLOCK POSITIONS_ABS  (commented out — for reference)'
         do i = 1, cfg%num_atoms
-            write(unit, '(a, 3(1x, f10.7))') trim(cfg%atom_type(i)), &
+            write(unit, '(a, a, 3(1x, f10.7))') '#', trim(cfg%atom_type(i)), &
                 cart_coords(i,1), cart_coords(i,2), cart_coords(i,3)
         end do
-        write(unit, '(a)') '%ENDBLOCK POSITIONS_ABS'
+        write(unit, '(a)') '#%ENDBLOCK POSITIONS_ABS'
         write(unit, '(a)') ''
 
         deallocate(cart_coords)
@@ -279,9 +283,10 @@ contains
     end subroutine write_block_phonon_supercell_matrix
 
     subroutine write_cell_file(filename, cfg, iostat, iomsg)
-        !! Write a CASTEP .cell file in %BLOCK format
+        !! Write a CASTEP .cell file in %BLOCK format.
+        !! Sets cfg%cell_basis if not already computed.
         character(len=*), intent(in) :: filename
-        type(castep_config_t), intent(in) :: cfg
+        type(castep_config_t), intent(inout) :: cfg
         integer, intent(out) :: iostat
         character(len=*), optional, intent(out) :: iomsg
         integer :: unit, ios
@@ -298,10 +303,21 @@ contains
         write(unit, '(a)') '! CASTEP Suite generated cell file'
         write(unit, '(a)') ''
 
+        ! Ensure lattice basis is computed
+        if (all(abs(cfg%cell_basis) < 1.0e-12_dp)) then
+            cfg%cell_basis = compute_cartesian_lattice(cfg%cell_length(1), cfg%cell_length(2), &
+                               cfg%cell_length(3), cfg%cell_angle(1), &
+                               cfg%cell_angle(2), cfg%cell_angle(3))
+        end if
+
         call write_block_lattice_abc(unit, cfg)
         call write_block_lattice_cart(unit, cfg)
 
         call write_block_positions_abs(unit, cfg)
+        call write_block_positions_frac(unit, cfg)
+        if (cfg%pes_mobile_idx > 0) then
+            call write_block_ionic_constraints(unit, cfg, cfg%pes_mobile_idx, cfg%pes_fix_axes)
+        end if
         if (trim(cfg%task_type) == TASK_GEOMETRY_OPT) then
             call write_block_cell_constraints(unit, cfg)
             write(unit, '(a)') 'FIX_COM : false'
@@ -356,5 +372,91 @@ contains
 
         close(unit)
     end subroutine write_cell_file
+
+    ! ── PES scan support ──
+
+    subroutine write_block_positions_frac(unit, cfg)
+        !! Write %BLOCK POSITIONS_FRAC with fractional coordinates.
+        !! Used by PES scan to place mobile atom at exact fractional grid points.
+        integer, intent(in) :: unit
+        type(castep_config_t), intent(in) :: cfg
+        integer :: i
+
+        if (cfg%num_atoms == 0) return
+
+        write(unit, '(a)') '%BLOCK POSITIONS_FRAC'
+        do i = 1, cfg%num_atoms
+            write(unit, '(a, 3(1x, f12.8))') trim(cfg%atom_type(i)), &
+                cfg%atom_x(i), cfg%atom_y(i), cfg%atom_z(i)
+        end do
+        write(unit, '(a)') '%ENDBLOCK POSITIONS_FRAC'
+        write(unit, '(a)') ''
+    end subroutine write_block_positions_frac
+
+
+    subroutine write_block_ionic_constraints(unit, cfg, mobile_idx, fix_axes)
+        !! Write %BLOCK IONIC_CONSTRAINTS for PES scan.
+        !!
+        !! CASTEP format: each constraint removes ONE degree of freedom.
+        !!   constraint_num  element  elem_atom_idx  x_wt  y_wt  z_wt
+        !! where elem_atom_idx counts atoms PER ELEMENT (not global).
+        !!
+        !! mobile_idx: 1-based GLOBAL index of the mobile atom.
+        !! fix_axes(3): 1=fix, 0=free for x,y,z (e.g. [0,0,1] = fix z only).
+        !! Non-mobile atoms are always fully fixed (3 constraints each).
+        integer, intent(in) :: unit
+        type(castep_config_t), intent(in) :: cfg
+        integer, intent(in) :: mobile_idx
+        integer, intent(in) :: fix_axes(3)
+        integer :: i, dir, cnum, elem_count
+        character(len=16) :: prev_elem
+
+        if (cfg%num_atoms == 0) return
+
+        write(unit, '(a)') '%BLOCK IONIC_CONSTRAINTS'
+        cnum = 0
+        prev_elem = ''
+        elem_count = 0
+        do i = 1, cfg%num_atoms
+            ! Per-element atom index (CASTEP counts atoms within each element)
+            if (trim(cfg%atom_type(i)) /= trim(prev_elem)) then
+                elem_count = 1
+                prev_elem = trim(cfg%atom_type(i))
+            else
+                elem_count = elem_count + 1
+            end if
+
+            if (i == mobile_idx) then
+                ! Mobile atom: constrain only the directions in fix_axes
+                do dir = 1, 3
+                    if (fix_axes(dir) == 1) then
+                        cnum = cnum + 1
+                        call write_one_constraint(unit, cnum, &
+                            trim(cfg%atom_type(i)), elem_count, dir)
+                    end if
+                end do
+            else
+                ! Other atoms: fully fixed (3 constraints: x, y, z)
+                do dir = 1, 3
+                    cnum = cnum + 1
+                    call write_one_constraint(unit, cnum, &
+                        trim(cfg%atom_type(i)), elem_count, dir)
+                end do
+            end if
+        end do
+        write(unit, '(a)') '%ENDBLOCK IONIC_CONSTRAINTS'
+        write(unit, '(a)') ''
+    end subroutine write_block_ionic_constraints
+
+    subroutine write_one_constraint(unit, cnum, element, atom_idx, dir)
+        !! Write a single constraint line fixing one Cartesian direction.
+        integer, intent(in) :: unit, cnum, atom_idx, dir
+        character(len=*), intent(in) :: element
+        real(dp) :: w(3)
+        w = [0.0_dp, 0.0_dp, 0.0_dp]
+        w(dir) = 1.0_dp
+        write(unit, '(i7, 1x, a, i8, 3(1x, f12.10))') &
+            cnum, trim(element), atom_idx, w(1), w(2), w(3)
+    end subroutine write_one_constraint
 
 end module cell_writer

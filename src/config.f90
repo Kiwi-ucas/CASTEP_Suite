@@ -242,6 +242,10 @@ module castep_config
         real(dp), allocatable         :: interm_atom_z(:)
         logical :: interm_cartesian_coords = .false.
 
+        ! PES scan constraints (0 = not a PES cell file)
+        integer :: pes_mobile_idx = 0
+        integer :: pes_fix_axes(3) = [0, 0, 0]
+
         ! CINEB file paths
         character(len=1024) :: prod_file_path    = ''
         character(len=1024) :: interm_file_path  = ''

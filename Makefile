@@ -41,7 +41,8 @@ $(TARGET): $(SRCDIR)/config.f90 $(SRCDIR)/term_utils.f90 $(SRCDIR)/symmetry.f90 
            $(SRCDIR)/phonon_dos.f90 $(SRCDIR)/polarizability.f90 \
            $(SRCDIR)/phonon_modes.f90 $(SRCDIR)/crystal_json.f90 \
            $(SRCDIR)/thermodynamics.f90 $(SRCDIR)/castep_vib.f90 \
-           $(SRCDIR)/poscastep_menu.f90 $(SRCDIR)/main.f90 \
+           $(SRCDIR)/pes_scan.f90 $(SRCDIR)/poscastep_menu.f90 \
+           $(SRCDIR)/main.f90 \
            | $(OBJDIR)
 	@$(FC) $(FCFLAGS) -J$(OBJDIR) -c -o $(OBJDIR)/config.o $(SRCDIR)/config.f90
 	@$(FC) $(FCFLAGS) -J$(OBJDIR) -c -o $(OBJDIR)/term_utils.o $(SRCDIR)/term_utils.f90
@@ -61,6 +62,7 @@ $(TARGET): $(SRCDIR)/config.f90 $(SRCDIR)/term_utils.f90 $(SRCDIR)/symmetry.f90 
 	@$(FC) $(FCFLAGS) -I$(OBJDIR) -J$(OBJDIR) -c -o $(OBJDIR)/crystal_json.o $(SRCDIR)/crystal_json.f90
 	@$(FC) $(FCFLAGS) -I$(OBJDIR) -J$(OBJDIR) -c -o $(OBJDIR)/thermodynamics.o $(SRCDIR)/thermodynamics.f90
 	@$(FC) $(FCFLAGS) -I$(OBJDIR) -J$(OBJDIR) -c -o $(OBJDIR)/castep_vib.o $(SRCDIR)/castep_vib.f90
+	@$(FC) $(FCFLAGS) -I$(OBJDIR) -J$(OBJDIR) -c -o $(OBJDIR)/pes_scan.o $(SRCDIR)/pes_scan.f90
 	@$(FC) $(FCFLAGS) -I$(OBJDIR) -J$(OBJDIR) -c -o $(OBJDIR)/poscastep_menu.o $(SRCDIR)/poscastep_menu.f90
 	@$(FC) $(FCFLAGS) -I$(OBJDIR) -J$(OBJDIR) -c -o $(OBJDIR)/main.o $(SRCDIR)/main.f90
 	@$(FC) $(FCFLAGS) $(LDFLAGS) -o $@ $(OBJDIR)/config.o $(OBJDIR)/term_utils.o \
@@ -70,7 +72,7 @@ $(TARGET): $(SRCDIR)/config.f90 $(SRCDIR)/term_utils.f90 $(SRCDIR)/symmetry.f90 
 	    $(OBJDIR)/dos_compute.o $(OBJDIR)/dos_plotter.o $(OBJDIR)/cli_menu.o \
 	    $(OBJDIR)/phonon_dos.o $(OBJDIR)/polarizability.o $(OBJDIR)/phonon_modes.o \
 	    $(OBJDIR)/crystal_json.o $(OBJDIR)/thermodynamics.o $(OBJDIR)/castep_vib.o \
-	    $(OBJDIR)/poscastep_menu.o $(OBJDIR)/main.o
+	    $(OBJDIR)/pes_scan.o $(OBJDIR)/poscastep_menu.o $(OBJDIR)/main.o
 
 fortran: $(SRCDIR)/config.f90 $(SRCDIR)/term_utils.f90 $(SRCDIR)/symmetry.f90 \
 	           $(SRCDIR)/parser.f90 \
@@ -81,7 +83,8 @@ fortran: $(SRCDIR)/config.f90 $(SRCDIR)/term_utils.f90 $(SRCDIR)/symmetry.f90 \
 	           $(SRCDIR)/phonon_dos.f90 $(SRCDIR)/polarizability.f90 \
 	           $(SRCDIR)/phonon_modes.f90 $(SRCDIR)/crystal_json.f90 \
 	           $(SRCDIR)/thermodynamics.f90 $(SRCDIR)/castep_vib.f90 \
-	           $(SRCDIR)/poscastep_menu.f90 $(SRCDIR)/main.f90 \
+	           $(SRCDIR)/pes_scan.f90 $(SRCDIR)/poscastep_menu.f90 \
+	           $(SRCDIR)/main.f90 \
 	           | $(OBJDIR)
 	@$(FC) $(FCFLAGS) -J$(OBJDIR) -c -o $(OBJDIR)/config.o $(SRCDIR)/config.f90
 	@$(FC) $(FCFLAGS) -J$(OBJDIR) -c -o $(OBJDIR)/term_utils.o $(SRCDIR)/term_utils.f90
@@ -101,6 +104,7 @@ fortran: $(SRCDIR)/config.f90 $(SRCDIR)/term_utils.f90 $(SRCDIR)/symmetry.f90 \
 	@$(FC) $(FCFLAGS) -I$(OBJDIR) -J$(OBJDIR) -c -o $(OBJDIR)/crystal_json.o $(SRCDIR)/crystal_json.f90
 	@$(FC) $(FCFLAGS) -I$(OBJDIR) -J$(OBJDIR) -c -o $(OBJDIR)/thermodynamics.o $(SRCDIR)/thermodynamics.f90
 	@$(FC) $(FCFLAGS) -I$(OBJDIR) -J$(OBJDIR) -c -o $(OBJDIR)/castep_vib.o $(SRCDIR)/castep_vib.f90
+	@$(FC) $(FCFLAGS) -I$(OBJDIR) -J$(OBJDIR) -c -o $(OBJDIR)/pes_scan.o $(SRCDIR)/pes_scan.f90
 	@$(FC) $(FCFLAGS) -I$(OBJDIR) -J$(OBJDIR) -c -o $(OBJDIR)/poscastep_menu.o $(SRCDIR)/poscastep_menu.f90
 	@$(FC) $(FCFLAGS) -I$(OBJDIR) -J$(OBJDIR) -c -o $(OBJDIR)/main.o $(SRCDIR)/main.f90
 	@$(FC) $(FCFLAGS) $(LDFLAGS) -o $(TARGET) $(OBJDIR)/config.o $(OBJDIR)/term_utils.o \
@@ -110,7 +114,7 @@ fortran: $(SRCDIR)/config.f90 $(SRCDIR)/term_utils.f90 $(SRCDIR)/symmetry.f90 \
 	    $(OBJDIR)/dos_compute.o $(OBJDIR)/dos_plotter.o $(OBJDIR)/cli_menu.o \
 	    $(OBJDIR)/phonon_dos.o $(OBJDIR)/polarizability.o $(OBJDIR)/phonon_modes.o \
 	    $(OBJDIR)/crystal_json.o $(OBJDIR)/thermodynamics.o $(OBJDIR)/castep_vib.o \
-	    $(OBJDIR)/poscastep_menu.o $(OBJDIR)/main.o
+	    $(OBJDIR)/pes_scan.o $(OBJDIR)/poscastep_menu.o $(OBJDIR)/main.o
 
 clean:
 	rm -rf $(OBJDIR) $(TARGET)
