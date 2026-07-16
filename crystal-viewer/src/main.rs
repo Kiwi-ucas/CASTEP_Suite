@@ -1029,16 +1029,20 @@ fn default_cu_fcc() -> CrystalData {
 }
 
 /// Convert PesData structure_atoms (fx/fy/fz) to CrystalData for shared rendering.
+/// The mobile atom is excluded — it is the one being scanned across the surface.
 fn crystal_data_from_pes(pes: &PesData) -> CrystalData {
+    let mobile_idx = pes.mobile_atom.index.max(0) as usize;
     crystal::CrystalData {
         lattice: pes.lattice.clone(),
-        atoms: pes.structure_atoms.iter().map(|pa| crystal::AtomData {
-            element: pa.element.clone(),
-            x: pa.fx as f32,
-            y: pa.fy as f32,
-            z: pa.fz as f32,
-            label: String::new(),
-        }).collect(),
+        atoms: pes.structure_atoms.iter().enumerate()
+            .filter(|(i, _)| *i != mobile_idx)
+            .map(|(_, pa)| crystal::AtomData {
+                element: pa.element.clone(),
+                x: pa.fx as f32,
+                y: pa.fy as f32,
+                z: pa.fz as f32,
+                label: String::new(),
+            }).collect(),
         positions_fractional: true,
         modified: false,
         phonon_modes: None,

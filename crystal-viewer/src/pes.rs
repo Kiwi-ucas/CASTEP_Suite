@@ -87,22 +87,24 @@ impl PesData {
         let normal = lattice_vecs[pa0].cross(lattice_vecs[pa1]).normalize();
 
         // ── Energy range from valid subdivided points ──
-        let mut e_min = f64::MAX;
-        let mut e_max_valid = f64::MIN;
-        for e in &sub_energies {
-            if let Some(v) = e {
-                e_min = e_min.min(*v);
-                e_max_valid = e_max_valid.max(*v);
-            }
+        let mut valid_vals: Vec<f64> = sub_energies.iter()
+            .filter_map(|e| *e).collect();
+        if valid_vals.is_empty() {
+            return None;
         }
+        valid_vals.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let e_min = valid_vals[0];
+        let e_max_valid = *valid_vals.last().unwrap();
         if e_min >= e_max_valid {
             return None;
         }
-        let e_range = e_max_valid - e_min;
 
-        // Clip threshold: 30% above valid max. Null points assigned 5× range above valid max.
-        let e_clip = e_max_valid + e_range * 0.3;
-        let e_fill = e_max_valid + e_range * 5.0;
+        // Clip threshold: Q3 + 1.5×IQR (Tukey fence for outliers)
+        let q1 = percentile(&valid_vals, 0.25);
+        let q3 = percentile(&valid_vals, 0.75);
+        let iqr = q3 - q1;
+        let e_clip = (q3 + iqr * 1.5).max(e_max_valid * 1.001);
+        let e_fill = e_clip + (e_clip - e_min) * 2.0;
         let clip_range = e_clip - e_min;
 
         // Height scale: ~30% of the third lattice vector length
@@ -298,6 +300,15 @@ impl PesData {
 
         (sub, snx, sny)
     }
+}
+
+/// Linear-interpolated percentile of sorted slice.
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    let i = p * (sorted.len() - 1) as f64;
+    let lo = i.floor() as usize;
+    let hi = i.ceil() as usize;
+    let frac = i - lo as f64;
+    sorted[lo] + (sorted[hi] - sorted[lo]) * frac
 }
 
 // ── Colormap helpers ──

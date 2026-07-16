@@ -2743,7 +2743,17 @@ contains
         if (ios /= 0) return
         file_path = adjustl(file_path); call strip_quotes(file_path)
         if (file_path == 'q' .or. file_path == 'Q') return
-        call parse_cif_inline(trim(file_path), cif, ios)
+        select case (trim(get_ext_lower(file_path)))
+        case ('cif')
+            call parse_cif_inline(trim(file_path), cif, ios)
+        case ('pdb')
+            call parse_pdb_inline(trim(file_path), cif, ios)
+        case ('cell')
+            call parse_cell_inline(trim(file_path), cif, ios)
+        case default
+            write(*, '(a)') '  Unsupported file format. Use .cif, .pdb, or .cell.'
+            iostat = 1; return
+        end select
         if (ios /= 0) then
             write(*, '(a)') '  Error parsing file.'; return
         end if

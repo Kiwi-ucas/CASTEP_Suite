@@ -270,8 +270,8 @@ contains
         write(*, '(a, i0, a, i0)') '  Collected: ', collected, ' / ', n_total
         if (missing > 0) write(*, '(a, i0)') '  Missing:   ', missing
         if (collected > 0) then
-            write(*, '(a, f12.6)') '  E min (eV): ', e_min
-            write(*, '(a, f12.6)') '  E max (eV): ', e_max
+            write(*, '(a, f18.8)') '  E min (eV): ', e_min
+            write(*, '(a, f18.8)') '  E max (eV): ', e_max
         end if
 
         deallocate(energies)
@@ -386,9 +386,9 @@ contains
                     do j = 1, n_total
                         if (has_energy(j)) then
                             if (j < n_total) then
-                                write(unit_out, '(a, f14.8, a)') '    ', energies(j), ','
+                                write(unit_out, '(a, f20.8, a)') '    ', energies(j), ','
                             else
-                                write(unit_out, '(a, f14.8)') '    ', energies(j)
+                                write(unit_out, '(a, f20.8)') '    ', energies(j)
                             end if
                         else
                             if (j < n_total) then
