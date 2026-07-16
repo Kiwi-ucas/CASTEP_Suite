@@ -247,12 +247,13 @@ fn rotate_camera_keys(
     let angle_rad = rotate_state.angle_deg.clamp(1.0, 90.0).to_radians();
     let mut delta = Quat::IDENTITY;
 
-    // ← → : yaw around world Y axis
+    // ← → : yaw around camera's up axis (not world Y)
+    let up = cam_state.rot * Vec3::Y;
     if keys.just_pressed(KeyCode::ArrowRight) {
-        delta = Quat::from_axis_angle(Vec3::Y, -angle_rad);
+        delta = Quat::from_axis_angle(up, -angle_rad);
     }
     if keys.just_pressed(KeyCode::ArrowLeft) {
-        delta = Quat::from_axis_angle(Vec3::Y, angle_rad);
+        delta = Quat::from_axis_angle(up, angle_rad);
     }
 
     // ↑ ↓ : pitch around camera's right axis
