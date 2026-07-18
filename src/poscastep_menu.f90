@@ -2733,7 +2733,7 @@ contains
         real(dp), allocatable :: frac_points(:,:)
         integer :: ios, i, n_total, mi, n_pts(2)
         real(dp) :: fx, fy, range_vals(4)
-        character(len=8) :: plane_choice, mode_choice
+        character(len=8) :: plane_choice, mode_choice, mobile_elem, plane_str
 
         iostat = 0
 
@@ -2872,7 +2872,7 @@ contains
         end if
 
         ! ── Create output directory ──
-        scan_dir = 'pes_scan/' // trim(stem)
+        scan_dir = 'pes_scan/' // trim(stem) // '_' // trim(grid%scan_mode)
         sub_dir = 'mkdir -p "' // trim(scan_dir) // '"'
         call execute_command_line(trim(sub_dir), exitstat=ios)
 
@@ -2910,19 +2910,33 @@ contains
         call write_pes_metadata_json(trim(scan_dir)//'/pes_metadata.json', grid, cfg, ios)
 
         ! ── Cleanup ──
+        ! Save element and plane label before deallocation
+        mobile_elem = trim(cfg%atom_type(mi))
+        if (grid%plane_axis(1) == 1 .and. grid%plane_axis(2) == 2) then
+            plane_str = 'XY'
+        else if (grid%plane_axis(1) == 1 .and. grid%plane_axis(2) == 3) then
+            plane_str = 'XZ'
+        else
+            plane_str = 'YZ'
+        end if
+
         deallocate(frac_points)
         deallocate(cfg%atom_type, cfg%atom_x, cfg%atom_y, cfg%atom_z)
 
         write(*, '(a)') ''
-        write(*, '(a)') '  =================================='
-        write(*, '(a)') '    PES scan files generated!'
-        write(*, '(a)') '  =================================='
-        write(*, '(a,i0,a)') '  Grid: ', grid%n_points(1), ' x ', grid%n_points(2)
-        write(*, '(a,a)') '  Directory: ', trim(scan_dir)
+        write(*, '(a)') '  ========================================'
+        write(*, '(a)') '       PES scan files generated!'
+        write(*, '(a)') '  ========================================'
+        write(*, '(a,a)')   '  Structure:    ', trim(stem)
+        write(*, '(a,a)')   '  Scan mode:    ', trim(grid%scan_mode)
+        write(*, '(a,i0,a,a,a)') '  Mobile atom:  #', mi, ' (', trim(mobile_elem), ')'
+        write(*, '(a,i0,a,i0)') '  Grid:         ', grid%n_points(1), ' x ', grid%n_points(2)
+        write(*, '(a,i0)')      '  Total points: ', n_total
+        write(*, '(a,a)')   '  Plane:        ', trim(plane_str)
+        write(*, '(a,f8.4,a,f8.4,a)') '  fx range:     [', grid%frac_range(1,1), ', ', grid%frac_range(1,2), ']'
+        write(*, '(a,f8.4,a,f8.4,a)') '  fy range:     [', grid%frac_range(2,1), ', ', grid%frac_range(2,2), ']'
+        write(*, '(a,a)')   '  Directory:    ', trim(scan_dir)
         write(*, '(a)') ''
-        write(*, '(a)') '  Next steps:'
-        write(*, '(a)') '    1. Run CASTEP in each grid_*/ subdirectory'
-        write(*, '(a)') '    2. Return to PosCASTEP → 9 → 2 to collect results'
     end subroutine handle_pes_generate
 
 
