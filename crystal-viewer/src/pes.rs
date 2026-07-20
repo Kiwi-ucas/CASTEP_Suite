@@ -73,7 +73,7 @@ impl PesData {
     ///
     /// Null/missing grid points are treated as very-high energy, clipped at a fixed
     /// threshold above the valid range → flat red plateau ("volcano crater rim").
-    pub fn generate_surface(&self) -> Option<(Mesh, Image)> {
+    pub fn generate_surface(&self, color_clip: f32) -> Option<(Mesh, Image)> {
         if !self.has_energies || self.nx < 2 || self.ny < 2 {
             return None;
         }
@@ -143,7 +143,8 @@ impl PesData {
                 // Energy → capped height + colormap
                 let raw_e = sub_energies[j * nx + i].unwrap_or(e_fill);
                 let capped = raw_e.min(e_clip);
-                let t = ((capped - e_min) / clip_range) as f32;
+                let t = ((capped - e_min) / (clip_range * color_clip.max(0.01) as f64)) as f32;
+                let t = t.min(1.0);
                 let height = t.max(0.0) * max_height;
 
                 let pos = cart + normal * height;
@@ -234,6 +235,20 @@ impl PesData {
         Some((mesh, image))
     }
 
+    /// Generate a standalone colormap texture (256×1, jet) for external users (e.g., 3D PES).
+    pub fn generate_surface_static(_e_min: f32, _e_max: f32) -> Image {
+        let tex_w = 256u32;
+        let tex_size = Extent3d { width: tex_w, height: 1, depth_or_array_layers: 1 };
+        let mut pixels: Vec<u8> = Vec::with_capacity(tex_w as usize * 4);
+        for x in 0..tex_w {
+            let t = x as f32 / (tex_w - 1).max(1) as f32;
+            let (r, g, b) = jet_rgb(t);
+            pixels.extend_from_slice(&[r, g, b, 200]);
+        }
+        Image::new(tex_size, TextureDimension::D2, pixels, TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::RENDER_WORLD)
+    }
+
     /// Compute (min, max) energy across the grid.
     pub fn energy_range(&self) -> Option<(f64, f64)> {
         let mut e_min = f64::MAX;
@@ -315,7 +330,7 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 
 /// Jet colormap (blue → cyan → green → yellow → red).
 /// Returns (r, g, b) as u8 values 0–255.
-fn jet_rgb(t: f32) -> (u8, u8, u8) {
+pub fn jet_rgb(t: f32) -> (u8, u8, u8) {
     let t = t.clamp(0.0, 1.0);
     let r = if t < 0.375 {
         0.0

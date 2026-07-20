@@ -1,6 +1,7 @@
 //! Crystal Viewer — Interactive 3D crystal structure visualization
 
 mod crystal; mod resources; mod picking; mod ui; mod pes;
+mod cube_reader; mod marching_cubes; mod volume_render; mod slice_plane;
 
 use bevy::prelude::*;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
@@ -10,8 +11,14 @@ use crystal::{CrystalData, Lattice, PhononModesData};
 use picking::{PickingState, click_pick, hover_pick, highlight_atoms};
 use ui::{AtomInfo, CrystalMeta, ui_system};
 use pes::PesData;
+use cube_reader::{CubeData, is_cube, parse_cube};
+use marching_cubes::marching_cubes_mesh;
+
+use slice_plane::{generate_slice_texture, slice_plane_mesh};
 use std::f32::consts::PI;
 use std::env;
+
+static FRAC_RANGE: [[f64; 2]; 3] = [[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]];
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -33,7 +40,10 @@ fn main() {
         .add_systems(Update, (display_mode_system, sync_atom_radii).chain())
         .add_systems(Update, sync_axes_visibility.after(display_mode_system))
         .add_systems(Update, (toggle_projection, sync_arrow_visibility))
-        .add_systems(Update, toggle_pes_surface)
+        .add_systems(Update, (toggle_surface_combined, update_color_clip, update_pes_surface).chain().after(ui_system))
+        .add_systems(Update, toggle_pes3d_mode.after(ui_system))
+        .add_systems(Update, (update_isosurface, update_isosurface_mesh).chain().after(ui_system))
+        .add_systems(Update, update_slices_inner.after(ui_system))
         .run();
 }
 
@@ -98,10 +108,36 @@ pub struct PesState {
     pub scan_mode: String,
     pub has_energies: bool,
     pub show_surface: bool,
+    pub color_step: i32,
+}
+
+/// Convert step counter to color_clip f32 (exponential, symmetric).
+const COLOR_STEP_MIN: i32 = 0;
+const COLOR_STEP_MAX: i32 = 13;
+fn step_to_clip(step: i32) -> f32 {
+    (0.8_f32.powi(step)).max(0.05)
 }
 
 #[derive(Component)]
 struct PesSurface;
+
+#[derive(Clone, PartialEq)]
+pub enum VisMode { Isosurface, Volume, Slice }
+
+#[derive(Resource, Clone)]
+#[allow(dead_code)]
+pub struct Pes3dState {
+    pub nx: usize, pub ny: usize, pub nz: usize,
+    pub e_min: f32, pub e_max: f32,
+    pub has_energies: bool, pub has_expanded: bool,
+    pub show_surface: bool, pub vis_mode: VisMode,
+    pub color_clip: f32, pub iso_value: f32,
+    pub slice_axis: u8, pub slice_pos: f32,
+}
+#[derive(Resource)] struct CubeResource(CubeData);
+#[derive(Component)] struct IsoSurface;
+#[derive(Component)] struct VolumeProxy;
+#[derive(Component)] struct SlicePlaneMesh;
 
 #[derive(Resource)]
 struct DisplayMode {
@@ -542,25 +578,37 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>, crystal_path: Res<CrystalPath>,
 ) {
+    // ── 3D PES cube detection ──
+    let cube_opt: Option<CubeData> = if is_cube(&crystal_path.0) {
+        match parse_cube(&crystal_path.0) {
+            Ok(cd) => { println!("Loaded cube: {}x{}x{} grid", cd.nx, cd.ny, cd.nz); Some(cd) }
+            Err(e) => { eprintln!("Cube parse error: {}", e); None }
+        }
+    } else { None };
+
     // Detect PES JSON (type == "pes_scan")
     let json_str = if crystal_path.0.is_empty() {
         String::new()
     } else {
         std::fs::read_to_string(&crystal_path.0).unwrap_or_default()
     };
-    let pes_opt: Option<PesData> = if PesData::detect(&json_str) {
+    let pes_opt: Option<PesData> = if cube_opt.is_none() && PesData::detect(&json_str) {
         PesData::from_json(&crystal_path.0).ok()
     } else {
         None
     };
 
-    let data = match &pes_opt {
-        Some(pes) => crystal_data_from_pes(pes),
-        None if crystal_path.0.is_empty() => default_cu_fcc(),
-        None => CrystalData::from_json(&crystal_path.0).unwrap_or_else(|e| {
-            eprintln!("Failed to load {}: {}. Using Cu FCC.", crystal_path.0, e);
-            default_cu_fcc()
-        }),
+    let data = if let Some(ref cube) = cube_opt {
+        crystal_data_from_cube(cube)
+    } else {
+        match &pes_opt {
+            Some(pes) => crystal_data_from_pes(pes),
+            None if crystal_path.0.is_empty() => default_cu_fcc(),
+            None => CrystalData::from_json(&crystal_path.0).unwrap_or_else(|e| {
+                eprintln!("Failed to load {}: {}. Using Cu FCC.", crystal_path.0, e);
+                default_cu_fcc()
+            }),
+        }
     };
 
     let (positions, parent_indices, image_offsets) = data.expand_to_cell();
@@ -724,7 +772,7 @@ fn setup(
     // ── PES surface mesh ──
     if let Some(pes) = &pes_opt {
         let e_range = pes.energy_range();
-        if let Some((mesh, tex_image)) = pes.generate_surface() {
+        if let Some((mesh, tex_image)) = pes.generate_surface(1.0) {
             let tex_handle = materials.add(StandardMaterial {
                 base_color_texture: Some(images.add(tex_image)),
                 alpha_mode: AlphaMode::Blend,
@@ -751,10 +799,65 @@ fn setup(
             scan_mode: pes.scan_mode.clone(),
             has_energies: pes.has_energies,
             show_surface: pes.has_energies,
+            color_step: 0,
+        });
+        commands.insert_resource(PesDataResource(pes.clone()));
+    }
+
+    // ── PES 3D surface mesh (isosurface + slice planes) ──
+    if let Some(ref cube) = cube_opt {
+        let lattice = cube.to_lattice();
+        let e_min = cube.field.iter().cloned().fold(f32::MAX, f32::min);
+        let e_max = cube.field.iter().cloned().fold(f32::MIN, f32::max);
+        println!("PES 3D: {}x{}x{} grid, E=[{:.4}, {:.4}], {} atoms",
+            cube.nx, cube.ny, cube.nz, e_min, e_max, cube.atoms.len());
+
+        // Spawn MC isosurface
+        let iso_value = e_min + 0.15 * (e_max - e_min);
+        if let Some(mc_mesh) = marching_cubes_mesh(
+            &cube.field, cube.nx, cube.ny, cube.nz,
+            &FRAC_RANGE, &lattice,
+            iso_value, e_min, e_max,
+        ) {
+            let colormap = PesData::generate_surface_static(e_min, e_max);
+            let tex_handle = materials.add(StandardMaterial {
+                base_color_texture: Some(images.add(colormap)),
+                alpha_mode: AlphaMode::Blend,
+                unlit: true,
+                ..default()
+            });
+            commands.spawn((
+                Mesh3d(meshes.add(mc_mesh)),
+                MeshMaterial3d(tex_handle),
+                IsoSurface,
+            ));
+        }
+
+        // Spawn slice planes (hidden until VisMode::Slice)
+        for (axis, pos) in [(2u8, 0.5f32), (1, 0.5), (0, 0.5)] {
+            let sm = meshes.add(slice_plane_mesh(&lattice, axis, pos));
+            let tex = generate_slice_texture(&cube.field, cube.nx, cube.ny, cube.nz, axis, pos, e_min, e_max, 1.0);
+            let mat = materials.add(StandardMaterial {
+                base_color_texture: Some(images.add(tex)),
+                alpha_mode: AlphaMode::Blend, unlit: true, ..default()
+            });
+            commands.spawn((Mesh3d(sm), MeshMaterial3d(mat), SlicePlaneMesh, Visibility::Hidden));
+        }
+
+        commands.insert_resource(CubeResource(cube.clone()));
+        commands.insert_resource(Pes3dState {
+            nx: cube.nx, ny: cube.ny, nz: cube.nz,
+            e_min, e_max,
+            has_energies: true, has_expanded: false,
+            show_surface: true, vis_mode: VisMode::Isosurface,
+            color_clip: 1.0, iso_value,
+            slice_axis: 2, slice_pos: 0.5,
         });
     }
 
-    if pes_opt.is_some() {
+    if cube_opt.is_some() {
+        println!("PES 3D mode: {} atoms. 4:isosurface 5:volume 6:slice S:toggle -/+:iso [ ]:clip", n);
+    } else if pes_opt.is_some() {
         println!("PES mode: {} atoms. Right-drag: rotate | Scroll: zoom | S: surface toggle.", n);
     } else {
         println!("Loaded {} atoms. Right-drag to rotate, scroll to zoom, click to select.", n);
@@ -1049,21 +1152,271 @@ fn crystal_data_from_pes(pes: &PesData) -> CrystalData {
     }
 }
 
-/// Toggle PES surface visibility with S key
-fn toggle_pes_surface(
+/// Convert CubeData atoms to CrystalData for shared rendering.
+fn crystal_data_from_cube(cube: &CubeData) -> CrystalData {
+    let lattice = cube.to_lattice();
+    crystal::CrystalData {
+        lattice,
+        atoms: cube.atoms.iter().map(|a| crystal::AtomData {
+            element: atom_z_to_symbol(a.z),
+            x: a.x, y: a.y, z: a.z_coord,
+            label: String::new(),
+        }).collect(),
+        positions_fractional: false,
+        modified: false,
+        phonon_modes: None,
+    }
+}
+
+/// Atomic number → element symbol (supports up to Xe, 54).
+fn atom_z_to_symbol(z: i32) -> String {
+    const SYM: &[&str] = &[
+        "X", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne",
+        "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca",
+        "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
+        "Ga", "Ge", "As", "Se", "Br", "Kr", "Rb", "Sr", "Y", "Zr",
+        "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In", "Sn",
+        "Sb", "Te", "I", "Xe",
+    ];
+    if z >= 0 && (z as usize) < SYM.len() { SYM[z as usize].to_string() } else { format!("Z{}", z) }
+}
+
+/// Toggle surface visibility with S key (handles both 2D and 3D PES).
+fn toggle_surface_combined(
     keys: Res<ButtonInput<KeyCode>>,
     mut pes_state: Option<ResMut<PesState>>,
-    mut surface_q: Query<&mut Visibility, With<PesSurface>>,
+    mut pes3d_state: Option<ResMut<Pes3dState>>,
+    mut vis_q: ParamSet<(
+        Query<&mut Visibility, With<PesSurface>>,
+        Query<&mut Visibility, With<IsoSurface>>,
+        Query<&mut Visibility, With<SlicePlaneMesh>>,
+    )>,
     mut contexts: EguiContexts,
 ) {
     if contexts.ctx_mut().wants_keyboard_input() { return; }
     if !keys.just_pressed(KeyCode::KeyS) { return; }
+    // 3D takes priority
+    if let Some(ref mut ps) = pes3d_state {
+        ps.show_surface = !ps.show_surface;
+        let vis = if ps.show_surface { Visibility::Inherited } else { Visibility::Hidden };
+        if ps.vis_mode == VisMode::Isosurface {
+            for mut v in vis_q.p1().iter_mut() { *v = vis; }
+        } else if ps.vis_mode == VisMode::Slice {
+            for mut v in vis_q.p2().iter_mut() { *v = vis; }
+        }
+        return;
+    }
     if let Some(ref mut ps) = pes_state {
         ps.show_surface = !ps.show_surface;
         let vis = if ps.show_surface { Visibility::Inherited } else { Visibility::Hidden };
-        for mut v in surface_q.iter_mut() {
-            *v = vis;
+        for mut v in vis_q.p0().iter_mut() { *v = vis; }
+    }
+}
+
+/// Adjust color clip range with -/+ keys for 2D PES.
+/// Integer step counter (0..14) → symmetric exponential scale via 0.8^step.
+/// just_pressed → instant response; held → throttle-repeat at ~6.7 Hz.
+fn update_color_clip(
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    mut pes_state: Option<ResMut<PesState>>,
+    mut contexts: EguiContexts,
+    mut repeat_timer: Local<f32>,
+) {
+    if contexts.ctx_mut().wants_keyboard_input() { return; }
+    let ps = match pes_state.as_mut() { Some(ps) => ps, None => return };
+
+    if keys.just_pressed(KeyCode::KeyR) {
+        ps.color_step = 0;
+        *repeat_timer = 0.0;
+        return;
+    }
+
+    let just_plus  = keys.just_pressed(KeyCode::Equal) || keys.just_pressed(KeyCode::NumpadAdd);
+    let just_minus = keys.just_pressed(KeyCode::Minus) || keys.just_pressed(KeyCode::NumpadSubtract);
+    let held_plus  = keys.pressed(KeyCode::Equal) || keys.pressed(KeyCode::NumpadAdd);
+    let held_minus = keys.pressed(KeyCode::Minus) || keys.pressed(KeyCode::NumpadSubtract);
+
+    let active = if just_plus || just_minus {
+        *repeat_timer = 0.0;
+        true
+    } else if held_plus || held_minus {
+        *repeat_timer += time.delta_secs();
+        if *repeat_timer >= 0.15 {
+            *repeat_timer = 0.0;
+            true
+        } else {
+            false
         }
+    } else {
+        *repeat_timer = 0.0;
+        false
+    };
+
+    if !active { return; }
+
+    let new_step = if just_plus || held_plus {
+        (ps.color_step + 1).min(COLOR_STEP_MAX)
+    } else {
+        (ps.color_step - 1).max(COLOR_STEP_MIN)
+    };
+    if new_step != ps.color_step {
+        ps.color_step = new_step;
+    }
+}
+
+/// Stored 2D PES data for mesh rebuild on color_clip change.
+#[derive(Resource)]
+struct PesDataResource(pes::PesData);
+
+/// Rebuild 2D PES surface mesh when color_clip changes.
+fn update_pes_surface(
+    pes_state: Option<Res<PesState>>,
+    pes_data: Option<Res<PesDataResource>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    surface_q: Query<Entity, With<PesSurface>>,
+) {
+    let ps = match pes_state.as_ref() { Some(ps) => ps, None => return };
+    if !ps.is_changed() { return; }
+    let pd = match pes_data.as_ref() { Some(pd) => pd, None => return };
+
+    for e in surface_q.iter() { commands.entity(e).despawn(); }
+
+    if let Some((mesh, tex)) = pd.0.generate_surface(step_to_clip(ps.color_step)) {
+        let mat = materials.add(StandardMaterial {
+            base_color_texture: Some(images.add(tex)),
+            alpha_mode: AlphaMode::Blend, unlit: true, ..default()
+        });
+        let vis = if ps.show_surface { Visibility::Inherited } else { Visibility::Hidden };
+        commands.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(mat), PesSurface, vis));
+    }
+}
+
+/// Switch 3D PES visualization mode (4=isosurface, 5=volume, 6=slice).
+fn toggle_pes3d_mode(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut pes3d_state: Option<ResMut<Pes3dState>>,
+    mut vis_q: ParamSet<(
+        Query<&mut Visibility, With<IsoSurface>>,
+        Query<&mut Visibility, With<VolumeProxy>>,
+        Query<&mut Visibility, With<SlicePlaneMesh>>,
+    )>,
+    mut contexts: EguiContexts,
+) {
+    if contexts.ctx_mut().wants_keyboard_input() { return; }
+    let ps = match pes3d_state.as_mut() { Some(ps) => ps, None => return };
+
+    let new_mode = if keys.just_pressed(KeyCode::Digit4) {
+        Some(VisMode::Isosurface)
+    } else if keys.just_pressed(KeyCode::Digit5) {
+        Some(VisMode::Volume)
+    } else if keys.just_pressed(KeyCode::Digit6) {
+        Some(VisMode::Slice)
+    } else { None };
+
+    if let Some(mode) = new_mode {
+        ps.vis_mode = mode;
+        let show = ps.show_surface;
+        let vis_on = if show { Visibility::Inherited } else { Visibility::Hidden };
+        for mut v in vis_q.p0().iter_mut() { *v = if ps.vis_mode == VisMode::Isosurface { vis_on } else { Visibility::Hidden }; }
+        for mut v in vis_q.p1().iter_mut() { *v = if ps.vis_mode == VisMode::Volume { vis_on } else { Visibility::Hidden }; }
+        for mut v in vis_q.p2().iter_mut() { *v = if ps.vis_mode == VisMode::Slice { vis_on } else { Visibility::Hidden }; }
+    }
+}
+
+/// Adjust isosurface isovalue with -/+ keys (continuous press, 80ms throttle).
+fn update_isosurface(
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    mut pes3d_state: Option<ResMut<Pes3dState>>,
+    mut contexts: EguiContexts,
+    mut last_time: Local<f32>,
+) {
+    if contexts.ctx_mut().wants_keyboard_input() { return; }
+    let ps = match pes3d_state.as_mut() { Some(ps) => ps, None => return };
+    if ps.vis_mode != VisMode::Isosurface { return; }
+
+    let plus = keys.pressed(KeyCode::Equal) || keys.pressed(KeyCode::NumpadAdd);
+    let minus = keys.pressed(KeyCode::Minus) || keys.pressed(KeyCode::NumpadSubtract);
+    if !plus && !minus { return; }
+
+    *last_time += time.delta_secs();
+    if *last_time < 0.08 { return; }
+    *last_time = 0.0;
+
+    let delta = (ps.e_max - ps.e_min) * 0.02;
+    ps.iso_value = (ps.iso_value + if plus { delta } else { -delta }).clamp(ps.e_min, ps.e_max);
+}
+
+/// Rebuild isosurface mesh when isovalue changes.
+fn update_isosurface_mesh(
+    pes3d_state: Option<Res<Pes3dState>>,
+    cube: Option<Res<CubeResource>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    iso_q: Query<Entity, With<IsoSurface>>,
+) {
+    let ps = match pes3d_state.as_ref() { Some(ps) => ps, None => return };
+    if !ps.is_changed() { return; }
+    if ps.vis_mode != VisMode::Isosurface { return; }
+
+    let cube = match cube.as_ref() { Some(c) => c, None => return };
+    let lattice = cube.0.to_lattice();
+
+    // Despawn old isosurface
+    for e in iso_q.iter() { commands.entity(e).despawn(); }
+
+    // Build new mesh
+    if let Some(mc_mesh) = marching_cubes_mesh(
+        &cube.0.field, cube.0.nx, cube.0.ny, cube.0.nz,
+        &FRAC_RANGE, &lattice,
+        ps.iso_value, ps.e_min, ps.e_max,
+    ) {
+        let colormap = PesData::generate_surface_static(ps.e_min, ps.e_max);
+        let tex = materials.add(StandardMaterial {
+            base_color_texture: Some(images.add(colormap)),
+            alpha_mode: AlphaMode::Blend, unlit: true, ..default()
+        });
+        let vis = if ps.show_surface { Visibility::Inherited } else { Visibility::Hidden };
+        commands.spawn((Mesh3d(meshes.add(mc_mesh)), MeshMaterial3d(tex), IsoSurface, vis));
+    }
+}
+
+/// Update slice plane textures when axis/position/color_clip changes.
+fn update_slices_inner(
+    pes3d_state: Option<Res<Pes3dState>>,
+    cube: Option<Res<CubeResource>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    slice_q: Query<Entity, With<SlicePlaneMesh>>,
+    mut commands: Commands,
+) {
+    let ps = match pes3d_state.as_ref() { Some(ps) => ps, None => return };
+    if !ps.is_changed() { return; }
+    let cube = match cube.as_ref() { Some(c) => c, None => return };
+
+    // Regenerate all slice textures (despawn old, spawn new)
+    for entity in slice_q.iter() { commands.entity(entity).despawn(); }
+    let lattice = cube.0.to_lattice();
+    for axis in 0u8..3 {
+        let pos = if axis == ps.slice_axis { ps.slice_pos } else { 0.5 };
+        let sm = meshes.add(slice_plane_mesh(&lattice, axis, pos));
+        let tex = generate_slice_texture(
+            &cube.0.field, cube.0.nx, cube.0.ny, cube.0.nz,
+            axis, pos, ps.e_min, ps.e_max, ps.color_clip,
+        );
+        let mat = materials.add(StandardMaterial {
+            base_color_texture: Some(images.add(tex)),
+            alpha_mode: AlphaMode::Blend, unlit: true, ..default()
+        });
+        let vis = if ps.show_surface && ps.vis_mode == VisMode::Slice { Visibility::Inherited } else { Visibility::Hidden };
+        commands.spawn((Mesh3d(sm), MeshMaterial3d(mat), SlicePlaneMesh, vis));
     }
 }
 

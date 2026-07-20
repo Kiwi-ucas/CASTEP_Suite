@@ -11,6 +11,8 @@ use crate::PhononState;
 use crate::RotateState;
 use crate::PanelRects;
 use crate::PesState;
+use crate::Pes3dState;
+use crate::VisMode;
 use crate::resources;
 
 #[derive(Resource)]
@@ -45,6 +47,7 @@ pub fn ui_system(
     mut rotate_state: ResMut<RotateState>,
     mut panel_rects: ResMut<PanelRects>,
     pes_state: Option<Res<PesState>>,
+    pes3d_state: Option<Res<Pes3dState>>,
 ) {
     let ctx = contexts.ctx_mut();
 
@@ -75,7 +78,13 @@ pub fn ui_system(
                         p, el, img_count)
                 ).strong());
             } else {
-                ui.label("\u{1f5b0} Right-drag: rotate | Scroll: zoom | Click: select | 1/2/3: mode | P: proj | A: axes | B: bonds | C: cell | R: reset");
+                let mut base = "\u{1f5b0} Right-drag: rotate | Scroll: zoom | Click: select | 1/2/3: mode | P: proj | A: axes | B: bonds | C: cell | R: reset".to_string();
+                if let Some(ref pes) = pes_state {
+                    if pes.has_energies {
+                        base.push_str(" | +/-: color range");
+                    }
+                }
+                ui.label(base);
             }
         });
     });
@@ -189,7 +198,7 @@ pub fn ui_system(
                 ui.label("Click an atom\nto see details");
             }
 
-            // ── PES scan info ──
+            // ── PES scan info (2D) ──
             if let Some(ref pes) = pes_state {
                 ui.separator();
                 ui.label(egui::RichText::new("PES Scan").strong());
@@ -198,7 +207,27 @@ pub fn ui_system(
                 ui.label(format!("Mode: {}", pes.scan_mode));
                 if pes.has_energies {
                     ui.label(format!("E range: {:.4} – {:.4} eV", pes.e_min, pes.e_max));
+                    let pct = (crate::step_to_clip(pes.color_step) * 100.0 + 0.5) as u32;
+                    ui.label(format!("Color range: {}% (+/-)", pct));
                     ui.label(format!("Surface: {}", if pes.show_surface { "ON (S)" } else { "OFF (S)" }));
+                } else {
+                    ui.label("No energies (run CASTEP first)");
+                }
+            }
+
+            // ── PES 3D scan info ──
+            if let Some(ref ps) = pes3d_state {
+                ui.separator();
+                ui.label(egui::RichText::new("PES 3D Scan").strong());
+                ui.label(format!("Grid: {}×{}×{}", ps.nx, ps.ny, ps.nz));
+                if ps.has_energies {
+                    ui.label(format!("E range: {:.2} – {:.2} eV", ps.e_min, ps.e_max));
+                    let mode_str = match ps.vis_mode {
+                        VisMode::Isosurface => format!("Isosurface (4) iso={:.2}", ps.iso_value),
+                        VisMode::Volume => "Volume (5)".to_string(),
+                        VisMode::Slice => format!("Slice (6) axis={} pos={:.2}", ps.slice_axis, ps.slice_pos),
+                    };
+                    ui.label(format!("Mode: {}", mode_str));
                 } else {
                     ui.label("No energies (run CASTEP first)");
                 }

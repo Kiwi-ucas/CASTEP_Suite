@@ -34,6 +34,8 @@ module poscastep_menu
     use cell_writer, only: write_cell_file
     use param_writer, only: write_param_file
     use cli_menu, only: run_main_menu
+    use pes3d, only: pes3d_grid_t, compute_local_grid_bounds, generate_pes3d_grid_points, &
+        write_pes3d_cube, collect_pes3d_energies, symmetry_expand_energies
     use pes_scan, only: pes_grid_t, generate_pes_grid_points, write_pes_metadata_json, &
         collect_pes_energies
     implicit none
@@ -2698,8 +2700,10 @@ contains
             write(*, '(a)') '  =================================='
             write(*, '(a)') '            PES Scan'
             write(*, '(a)') '  =================================='
-            write(*, '(a)') '  1. Generate Scan Input Files'
-            write(*, '(a)') '  2. Collect Results & Visualize'
+            write(*, '(a)') '  1. Generate 2D Scan Input Files'
+            write(*, '(a)') '  2. Collect 2D Results & Visualize'
+            write(*, '(a)') '  3. Generate 3D Scan Input Files'
+            write(*, '(a)') '  4. Collect 3D Results & Visualize'
             write(*, '(a)') '  Q. Back'
             write(*, '(a)', advance='no') '  Select option: '
             read(*, '(a)', iostat=ios) input
@@ -2712,6 +2716,11 @@ contains
                 if (ios == 0) has_saved = .true.
             case ('2')
                 call handle_pes_collect(ios)
+            case ('3')
+                call handle_pes3d_generate(ios)
+                if (ios == 0) has_saved = .true.
+            case ('4')
+                call handle_pes3d_collect(ios)
             case ('q', 'Q')
                 exit
             case default
@@ -2978,6 +2987,324 @@ contains
             call launch_viewer(json_path)
         end if
     end subroutine handle_pes_collect
+
+
+    ! ── 3D PES Scan sub-routines ──
+
+    subroutine handle_pes3d_generate(iostat)
+        !! PES 3D sub-menu: Generate 3D voxel grid scan input files.
+        !! Supports symmetry-aware scanning: with space-group info, only the
+        !! asymmetric sub-volume around a reference atom is scanned; without
+        !! symmetry, full [0,1)^3 cell scan.
+        integer, intent(out) :: iostat
+
+        type(cif_data_t) :: cif
+        type(castep_config_t) :: cfg
+        type(pes3d_grid_t) :: grid
+        character(len=MAX_LINE_LEN) :: file_path, scan_dir, sub_dir, stem, input
+        character(len=MAX_LINE_LEN) :: cell_path, param_path
+        real(dp), allocatable :: frac_points(:,:)
+        real(dp), allocatable :: dummy_energies(:)
+        integer :: ios, i, n_total, mi, n_pts(3)
+        real(dp) :: fx, fy, fz, range_vals(6)
+        character(len=8) :: mode_choice, sym_choice
+        character(len=8) :: mobile_elem
+
+        iostat = 0
+
+        ! ── Load structure ──
+        write(*, '(a)', advance='no') '  Enter structure file (.cif/.pdb/.cell): '
+        read(*, '(a)', iostat=ios) file_path
+        if (ios /= 0) return
+        file_path = adjustl(file_path); call strip_quotes(file_path)
+        if (file_path == 'q' .or. file_path == 'Q') return
+        select case (trim(get_ext_lower(file_path)))
+        case ('cif')
+            call parse_cif_inline(trim(file_path), cif, ios)
+        case ('pdb')
+            call parse_pdb_inline(trim(file_path), cif, ios)
+        case ('cell')
+            call parse_cell_inline(trim(file_path), cif, ios)
+        case default
+            write(*, '(a)') '  Unsupported file format. Use .cif, .pdb, or .cell.'
+            iostat = 1; return
+        end select
+        if (ios /= 0) then
+            write(*, '(a)') '  Error parsing file.'; return
+        end if
+
+        ! ── Symmetry choice (only for CIF with sym_ops) ──
+        grid%use_symmetry = .false.
+        if (cif%n_symops > 1) then
+            write(*, '(a)') ''
+            write(*, '(a,i0,a)') '  Structure has ', cif%n_symops, ' symmetry operations.'
+            write(*, '(a)') '  How to handle symmetry?'
+            write(*, '(a)') '    1. Use symmetry — scan only asymmetric sub-volume,'
+            write(*, '(a)') '       then expand to full cell (recommended)'
+            write(*, '(a)') '    2. Treat as P1 — full-cell scan, no symmetry'
+            write(*, '(a)', advance='no') '  Choice (1/2, default 1): '
+            read(*, '(a)', iostat=ios) sym_choice
+            if (sym_choice(1:1) == '2') then
+                grid%use_symmetry = .false.
+            else
+                grid%use_symmetry = .true.
+            end if
+        end if
+
+        ! ── Expand symmetry only for atom list display ──
+        ! Keep cif%sym_ops intact for later JSON output
+        call expand_cif_symmetry(cif, ios)
+
+        ! ── Populate castep_config_t ──
+        call default_config(cfg)
+        stem = get_file_stem(file_path)
+        cfg%cif_file_path = trim(file_path)
+        cfg%cell_length(1) = cif%a
+        cfg%cell_length(2) = cif%b
+        cfg%cell_length(3) = cif%c
+        cfg%cell_angle(1)  = cif%alpha
+        cfg%cell_angle(2)  = cif%beta
+        cfg%cell_angle(3)  = cif%gamma
+        cfg%num_atoms = cif%n_atoms
+        cfg%cartesian_coords = .not. cif%positions_fractional
+        allocate(cfg%atom_type(cfg%num_atoms))
+        allocate(cfg%atom_x(cfg%num_atoms))
+        allocate(cfg%atom_y(cfg%num_atoms))
+        allocate(cfg%atom_z(cfg%num_atoms))
+        do i = 1, cif%n_atoms
+            cfg%atom_type(i) = trim(clean_element_symbol(cif%atoms(i)%element))
+            cfg%atom_x(i)    = cif%atoms(i)%x
+            cfg%atom_y(i)    = cif%atoms(i)%y
+            cfg%atom_z(i)    = cif%atoms(i)%z
+        end do
+
+        ! ── Select reference atom ──
+        write(*, '(a)') '  Atom list (expanded cell):'
+        do i = 1, cfg%num_atoms
+            if (cfg%cartesian_coords) then
+                write(*, '(i4, a, a8, a, 3f10.6)') i, '. ', trim(cfg%atom_type(i)), '  cart:', &
+                    cfg%atom_x(i), cfg%atom_y(i), cfg%atom_z(i)
+            else
+                write(*, '(i4, a, a8, a, 3f10.6)') i, '. ', trim(cfg%atom_type(i)), '  frac:', &
+                    cfg%atom_x(i), cfg%atom_y(i), cfg%atom_z(i)
+            end if
+        end do
+        write(*, '(a,i0,a)', advance='no') '  Select reference atom (1-', cfg%num_atoms, '): '
+        read(*, *, iostat=ios) mi
+        if (ios /= 0 .or. mi < 1 .or. mi > cfg%num_atoms) then
+            write(*, '(a)') '  Invalid selection.'; return
+        end if
+        grid%ref_atom_idx = mi
+        grid%ref_frac = [cfg%atom_x(mi), cfg%atom_y(mi), cfg%atom_z(mi)]
+
+        ! ── Grid parameters ──
+        if (grid%use_symmetry) then
+            ! Symmetry mode: auto-compute sub-volume bounds
+            call compute_local_grid_bounds(mi, cif%atoms, cif%n_atoms, &
+                cif%sym_ops, cif%n_symops, grid%half_dist, ios)
+            if (ios /= 0) then
+                write(*, '(a)') '  Warning: could not compute symmetry bounds, using defaults.'
+                grid%half_dist = 0.3_dp
+            end if
+
+            write(*, '(a)') ''
+            write(*, '(a)') '  ── Asymmetric Sub-Volume (auto-computed) ──'
+            write(*, '(a,3f10.6)') '  Reference atom frac: ', grid%ref_frac
+            write(*, '(a,3f10.6)') '  Half-distance:       ', grid%half_dist
+            grid%frac_range(1,1) = max(0.0_dp, grid%ref_frac(1) - grid%half_dist(1))
+            grid%frac_range(1,2) = min(1.0_dp, grid%ref_frac(1) + grid%half_dist(1))
+            grid%frac_range(2,1) = max(0.0_dp, grid%ref_frac(2) - grid%half_dist(2))
+            grid%frac_range(2,2) = min(1.0_dp, grid%ref_frac(2) + grid%half_dist(2))
+            grid%frac_range(3,1) = max(0.0_dp, grid%ref_frac(3) - grid%half_dist(3))
+            grid%frac_range(3,2) = min(1.0_dp, grid%ref_frac(3) + grid%half_dist(3))
+            write(*, '(a, 2f10.6)') '  fx range: ', grid%frac_range(1,:)
+            write(*, '(a, 2f10.6)') '  fy range: ', grid%frac_range(2,:)
+            write(*, '(a, 2f10.6)') '  fz range: ', grid%frac_range(3,:)
+        else
+            ! No symmetry: user inputs grid range manually
+            grid%frac_range(1,1) = 0.0_dp; grid%frac_range(1,2) = 1.0_dp
+            grid%frac_range(2,1) = 0.0_dp; grid%frac_range(2,2) = 1.0_dp
+            grid%frac_range(3,1) = 0.0_dp; grid%frac_range(3,2) = 1.0_dp
+        end if
+
+        write(*, '(a)', advance='no') '  Grid Nx (default 5): '
+        read(*, '(a)', iostat=ios) input
+        n_pts(1) = 5; if (len_trim(input) > 0) read(input, *, iostat=ios) n_pts(1)
+        write(*, '(a)', advance='no') '  Grid Ny (default 5): '
+        read(*, '(a)', iostat=ios) input
+        n_pts(2) = 5; if (len_trim(input) > 0) read(input, *, iostat=ios) n_pts(2)
+        write(*, '(a)', advance='no') '  Grid Nz (default 5): '
+        read(*, '(a)', iostat=ios) input
+        n_pts(3) = 5; if (len_trim(input) > 0) read(input, *, iostat=ios) n_pts(3)
+        grid%n_points = n_pts
+
+        if (.not. grid%use_symmetry) then
+            write(*, '(a)', advance='no') '  fx range (min max, default 0 1): '
+            read(*, '(a)', iostat=ios) input
+            range_vals(1) = 0.0_dp; range_vals(2) = 1.0_dp
+            if (len_trim(input) > 0) read(input, *, iostat=ios) range_vals(1), range_vals(2)
+            grid%frac_range(1,1) = range_vals(1); grid%frac_range(1,2) = range_vals(2)
+
+            write(*, '(a)', advance='no') '  fy range (min max, default 0 1): '
+            read(*, '(a)', iostat=ios) input
+            range_vals(3) = 0.0_dp; range_vals(4) = 1.0_dp
+            if (len_trim(input) > 0) read(input, *, iostat=ios) range_vals(3), range_vals(4)
+            grid%frac_range(2,1) = range_vals(3); grid%frac_range(2,2) = range_vals(4)
+
+            write(*, '(a)', advance='no') '  fz range (min max, default 0 1): '
+            read(*, '(a)', iostat=ios) input
+            range_vals(5) = 0.0_dp; range_vals(6) = 1.0_dp
+            if (len_trim(input) > 0) read(input, *, iostat=ios) range_vals(5), range_vals(6)
+            grid%frac_range(3,1) = range_vals(5); grid%frac_range(3,2) = range_vals(6)
+        end if
+
+        ! ── Scan mode ──
+        write(*, '(a)') '  Mode: 1=Single-point (SP)  2=Constrained relax (RELAX)'
+        write(*, '(a)', advance='no') '  Choice (default SP): '
+        read(*, '(a)', iostat=ios) mode_choice
+        grid%scan_mode = 'SP'
+        if (mode_choice(1:1) == '2') grid%scan_mode = 'RELAX'
+
+        if (grid%scan_mode == 'RELAX') then
+            cfg%task_type = TASK_GEOMETRY_OPT
+            cfg%cell_opt_mode = 'FIX_CELL'
+        else
+            cfg%task_type = TASK_ENERGY
+        end if
+
+        ! PES 3D constraints: mobile atom fixed in SP mode, fully free in RELAX
+        cfg%pes_mobile_idx = mi
+        cfg%pes_fix_axes = [1, 1, 1]  ! SP: fully fixed
+        if (grid%scan_mode == 'RELAX') then
+            cfg%pes_fix_axes = [0, 0, 0]  ! RELAX: fully free in 3D volume
+        end if
+
+        ! ── PreCASTEP parameter configuration ──
+        write(*, '(a)') ''
+        write(*, '(a)') '  ── Configure CASTEP parameters ──'
+        write(*, '(a)') '  (Select 0. Generate when ready to proceed)'
+        cfg%cif_file_path = trim(file_path)
+        call run_main_menu(cfg, ios)
+        if (ios == IO_USER_QUIT) return
+
+        ! ── Generate grid points ──
+        call generate_pes3d_grid_points(grid, frac_points, n_total, ios)
+        if (ios /= 0) then
+            write(*, '(a)') '  Error generating grid.'; return
+        end if
+
+        ! ── Create output directory ──
+        scan_dir = 'pes_scan/' // trim(stem) // '_' // trim(grid%scan_mode)
+        sub_dir = 'mkdir -p "' // trim(scan_dir) // '"'
+        call execute_command_line(trim(sub_dir), exitstat=ios)
+
+        ! ── Generate files ──
+        write(*, '(a,i0,a)') '  Generating ', n_total, ' grid points...'
+        do i = 1, n_total
+            fx = frac_points(i, 1)
+            fy = frac_points(i, 2)
+            fz = frac_points(i, 3)
+
+            ! Set mobile atom to grid point fractional coords
+            cfg%atom_x(mi) = fx
+            cfg%atom_y(mi) = fy
+            cfg%atom_z(mi) = fz
+
+            write(sub_dir, '(a, a, i3.3, a, i3.3, a, i3.3)') trim(scan_dir), '/grid_', &
+                modulo(i-1, grid%n_points(1)) + 1, '_', &
+                modulo((i-1)/grid%n_points(1), grid%n_points(2)) + 1, '_', &
+                (i-1) / (grid%n_points(1)*grid%n_points(2)) + 1
+
+            call execute_command_line('mkdir -p "' // trim(sub_dir) // '"', exitstat=ios)
+
+            cell_path  = trim(sub_dir) // '/scan.cell'
+            param_path = trim(sub_dir) // '/scan.param'
+            call write_cell_file(cell_path, cfg, ios)
+            call write_param_file(param_path, cfg, ios)
+        end do
+
+        ! ── Write cube file (sym_ops in comment line + placeholder energies) ──
+        allocate(dummy_energies(n_total)); dummy_energies = 0.0_dp
+        call write_pes3d_cube(trim(scan_dir)//'/pes3d.cube', &
+            grid, cfg, cif, dummy_energies, n_total, ios)
+        deallocate(dummy_energies)
+
+        ! Save element before deallocation (cif is still valid here)
+        mobile_elem = trim(clean_element_symbol(cif%atoms(mi)%element))
+
+        ! ── Cleanup ──
+        deallocate(frac_points)
+        deallocate(cfg%atom_type, cfg%atom_x, cfg%atom_y, cfg%atom_z)
+        call free_cif_data(cif)
+
+        write(*, '(a)') ''
+        write(*, '(a)') '  ========================================'
+        write(*, '(a)') '    3D PES scan files generated!'
+        write(*, '(a)') '  ========================================'
+        write(*, '(a,a)')   '  Structure:    ', trim(stem)
+        write(*, '(a,a)')   '  Scan mode:    ', trim(grid%scan_mode)
+        write(*, '(a,i0,a,a,a)') '  Ref. atom:    #', mi, ' (', trim(mobile_elem), ')'
+        write(*, '(a,i0,a,i0,a,i0)') '  Grid:         ', grid%n_points(1), &
+            ' x ', grid%n_points(2), ' x ', grid%n_points(3)
+        write(*, '(a,i0)')      '  Total points: ', n_total
+        write(*, '(a,l1)')      '  Use symmetry: ', grid%use_symmetry
+        if (grid%use_symmetry) then
+            write(*, '(a,f8.4,a,f8.4,a)') '  fx range:     [', grid%frac_range(1,1), &
+                ', ', grid%frac_range(1,2), ']'
+            write(*, '(a,f8.4,a,f8.4,a)') '  fy range:     [', grid%frac_range(2,1), &
+                ', ', grid%frac_range(2,2), ']'
+            write(*, '(a,f8.4,a,f8.4,a)') '  fz range:     [', grid%frac_range(3,1), &
+                ', ', grid%frac_range(3,2), ']'
+        end if
+        write(*, '(a,a)')   '  Directory:    ', trim(scan_dir)
+        write(*, '(a)') ''
+    end subroutine handle_pes3d_generate
+
+
+    subroutine handle_pes3d_collect(iostat)
+        !! PES 3D sub-menu: Collect .castep results from 3D grid, optionally
+        !! symmetry-expand, and launch viewer.
+        integer, intent(out) :: iostat
+
+        character(len=MAX_LINE_LEN) :: scan_dir, json_path, input
+        integer :: ios
+        logical :: exists
+
+        iostat = 0
+
+        write(*, '(a)') '  Enter scan directory (e.g. pes_scan/NaCl_SP):'
+        read(*, '(a)', iostat=ios) scan_dir
+        if (ios /= 0) return
+        scan_dir = adjustl(scan_dir); call strip_quotes(scan_dir)
+        if (scan_dir == 'q' .or. scan_dir == 'Q') return
+
+        ! Check for pes3d_metadata.json
+        json_path = trim(scan_dir) // '/pes3d_metadata.json'
+        inquire(file=trim(json_path), exist=exists)
+        if (.not. exists) then
+            write(*, '(a)') '  pes3d_metadata.json not found in ' // trim(scan_dir)
+            return
+        end if
+
+        ! Collect CASTEP energies
+        call collect_pes3d_energies(trim(scan_dir), ios)
+        if (ios /= 0) then
+            write(*, '(a)') '  Error collecting energies.'
+            return
+        end if
+
+        ! Check if symmetry expansion is needed (from JSON)
+        ! If use_symmetry is true, expand
+        call symmetry_expand_energies(trim(json_path), ios)
+
+        ! Launch viewer
+        write(*, '(a)') ''
+        write(*, '(a)', advance='no') '  Launch 3D viewer? (y/n): '
+        read(*, '(a)', iostat=ios) input
+        if (ios == 0 .and. (input(1:1) == 'y' .or. input(1:1) == 'Y')) then
+            call launch_viewer(json_path)
+        end if
+    end subroutine handle_pes3d_collect
 
 
 end module poscastep_menu
