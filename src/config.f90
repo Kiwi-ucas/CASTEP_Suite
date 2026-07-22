@@ -245,6 +245,7 @@ module castep_config
         ! PES scan constraints (0 = not a PES cell file)
         integer :: pes_mobile_idx = 0
         integer :: pes_fix_axes(3) = [0, 0, 0]
+        logical :: pes_constrain_others = .true.  ! .false. = relax non-mobile atoms
 
         ! CINEB file paths
         character(len=1024) :: prod_file_path    = ''

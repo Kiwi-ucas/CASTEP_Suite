@@ -435,7 +435,7 @@ contains
                             trim(cfg%atom_type(i)), elem_count, dir)
                     end if
                 end do
-            else
+            else if (cfg%pes_constrain_others) then
                 ! Other atoms: fully fixed (3 constraints: x, y, z)
                 do dir = 1, 3
                     cnum = cnum + 1

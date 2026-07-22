@@ -2853,16 +2853,17 @@ contains
             cfg%task_type = TASK_ENERGY
         end if
 
-        ! Set PES constraints: mobile atom is fixed in the direction
-        ! perpendicular to the scan plane, free to move in the plane.
-        ! SP mode: mobile atom fully fixed ([1,1,1]).
-        ! RELAX mode: mobile atom fixed only out-of-plane (e.g. xy→[0,0,1]).
-        cfg%pes_mobile_idx = mi
-        cfg%pes_fix_axes = [1, 1, 1]
+        ! PES constraints:
+        ! SP mode: no constraints (single-point, atoms do not move).
+        ! RELAX mode: mobile atom pinned to scan plane (in-plane fixed,
+        !   out-of-plane free), all other atoms free to relax.
         if (grid%scan_mode == 'RELAX') then
-            cfg%pes_fix_axes = [0, 0, 0]
-            ! The third axis (not in the scan plane) is the fixed direction
-            cfg%pes_fix_axes(6 - grid%plane_axis(1) - grid%plane_axis(2)) = 1
+            cfg%pes_mobile_idx = mi
+            cfg%pes_fix_axes = [1, 1, 1]
+            cfg%pes_constrain_others = .false.
+            cfg%pes_fix_axes(6 - grid%plane_axis(1) - grid%plane_axis(2)) = 0
+        else
+            cfg%pes_mobile_idx = 0  ! SP: no constraints needed
         end if
 
         ! ── PreCASTEP parameter configuration ──
@@ -3003,9 +3004,10 @@ contains
             ! Prefer cube file over legacy JSON
             cube_path = trim(scan_dir) // '/scan.cube'
             inquire(file=trim(cube_path), exist=exists)
+            if (.not. exists) inquire(file=trim(scan_dir)//'/pes3d.cube', exist=exists)
             if (.not. exists) cube_path = trim(scan_dir) // '/pes3d.cube'
-            if (.not. exists) json_path = trim(scan_dir) // '/pes_metadata.json'
-            call launch_viewer(json_path)
+            if (.not. exists) cube_path = trim(scan_dir) // '/pes_metadata.json'
+            call launch_viewer(cube_path)
         end if
     end subroutine handle_pes_collect
 
@@ -3193,11 +3195,16 @@ contains
             cfg%task_type = TASK_ENERGY
         end if
 
-        ! PES 3D constraints: mobile atom fixed in SP mode, fully free in RELAX
-        cfg%pes_mobile_idx = mi
-        cfg%pes_fix_axes = [1, 1, 1]  ! SP: fully fixed
+        ! PES 3D constraints:
+        ! SP mode: no constraints (single-point, atoms do not move).
+        ! RELAX mode: mobile atom FIXED at grid point ([1,1,1]),
+        !             other atoms free to relax → adiabatic PES.
         if (grid%scan_mode == 'RELAX') then
-            cfg%pes_fix_axes = [0, 0, 0]  ! RELAX: fully free in 3D volume
+            cfg%pes_mobile_idx = mi
+            cfg%pes_fix_axes = [1, 1, 1]
+            cfg%pes_constrain_others = .false.
+        else
+            cfg%pes_mobile_idx = 0  ! SP: no constraints needed
         end if
 
         ! ── PreCASTEP parameter configuration ──

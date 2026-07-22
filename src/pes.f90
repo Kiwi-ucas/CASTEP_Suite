@@ -262,7 +262,7 @@ contains
         real(dp) :: scan_domain_1, scan_domain_2
         integer :: unit, ios, i, nx, ny, nz, n_total, pa0, pa1, pa2
         real(dp) :: e_val
-        character(len=512) :: meta_json
+        character(len=2048) :: meta_json
         character(len=64) :: desc, plane_label
         integer :: z_num
         character(len=8) :: el
@@ -835,7 +835,7 @@ contains
     function build_metadata_json(grid, cfg) result(json)
         type(pes_grid_t), intent(in) :: grid
         type(castep_config_t), intent(in), target :: cfg
-        character(len=512) :: json
+        character(len=2048) :: json
         character(len=128) :: lat_str, plane_l, mob_el
         integer :: mi
 
@@ -859,7 +859,7 @@ contains
                 '"fy_range":[', grid%frac_range(2,1), ',', grid%frac_range(2,2), '],', &
                 '"lattice":{', trim(lat_str), '}}'
         else
-            write(json, '(a,a,a,a,i0,a,a,a,a,f12.8,a,f12.8,a,a,f12.8,a,f12.8,a,a,f12.8,a,f12.8,a,a,a,l1,a)') &
+            write(json, '(a,a,a,i0,a,a,a,a,f12.8,a,f12.8,a,a,f12.8,a,f12.8,a,a,f12.8,a,f12.8,a,a,a,a,a,l1,a)') &
                 '{"type":"pes_3d","scan_mode":"', trim(grid%scan_mode), &
                 '","mobile_idx":', mi - 1, &
                 ',"mobile_el":"', trim(mob_el), '",', &
