@@ -578,7 +578,7 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>, crystal_path: Res<CrystalPath>,
 ) {
-    // ── 3D PES cube detection ──
+    // ── Cube file detection ──
     let cube_opt: Option<CubeData> = if is_cube(&crystal_path.0) {
         match parse_cube(&crystal_path.0) {
             Ok(cd) => { println!("Loaded cube: {}x{}x{} grid", cd.nx, cd.ny, cd.nz); Some(cd) }
@@ -586,22 +586,40 @@ fn setup(
         }
     } else { None };
 
-    // Detect PES JSON (type == "pes_scan")
+    // Detect PES JSON (type == "pes_scan") — legacy fallback
     let json_str = if crystal_path.0.is_empty() {
         String::new()
     } else {
         std::fs::read_to_string(&crystal_path.0).unwrap_or_default()
     };
-    let pes_opt: Option<PesData> = if cube_opt.is_none() && PesData::detect(&json_str) {
+
+    // ── 2D PES from cube (nz==1) → convert to PesData ──
+    let pes_from_cube: Option<PesData> = cube_opt.as_ref()
+        .and_then(|c| if c.is_pes_2d() { PesData::from_cube(c).ok() } else { None });
+
+    // Legacy JSON PES (only if no 2D cube already converted)
+    let pes_opt: Option<PesData> = if pes_from_cube.is_none() && cube_opt.as_ref().map_or(true, |c| !c.is_pes_3d())
+        && PesData::detect(&json_str)
+    {
+        eprintln!("  Note: loading legacy pes_metadata.json (consider migrating to .cube format)");
         PesData::from_json(&crystal_path.0).ok()
     } else {
         None
     };
 
+    // Use pes_from_cube first, then pes_opt, then regular
+    let final_pes: Option<&PesData> = pes_from_cube.as_ref().or(pes_opt.as_ref());
+
     let data = if let Some(ref cube) = cube_opt {
-        crystal_data_from_cube(cube)
+        if cube.is_pes_2d() {
+            // 2D PES cube: exclude mobile atom from structure rendering
+            let mobile_idx = cube.pes_meta.as_ref().and_then(|m| m.mobile_idx).unwrap_or(0);
+            crystal_data_from_pes_cube(cube, mobile_idx)
+        } else {
+            crystal_data_from_cube(cube)
+        }
     } else {
-        match &pes_opt {
+        match final_pes {
             Some(pes) => crystal_data_from_pes(pes),
             None if crystal_path.0.is_empty() => default_cu_fcc(),
             None => CrystalData::from_json(&crystal_path.0).unwrap_or_else(|e| {
@@ -769,8 +787,8 @@ fn setup(
         MainCamera,
     ));
 
-    // ── PES surface mesh ──
-    if let Some(pes) = &pes_opt {
+    // ── PES 2D surface mesh (from cube or legacy JSON) ──
+    if let Some(pes) = &final_pes {
         let e_range = pes.energy_range();
         if let Some((mesh, tex_image)) = pes.generate_surface(1.0) {
             let tex_handle = materials.add(StandardMaterial {
@@ -801,11 +819,13 @@ fn setup(
             show_surface: pes.has_energies,
             color_step: 0,
         });
-        commands.insert_resource(PesDataResource(pes.clone()));
+        commands.insert_resource(PesDataResource((*pes).clone()));
     }
 
-    // ── PES 3D surface mesh (isosurface + slice planes) ──
+    // ── PES 3D surface mesh (isosurface + slice planes) — 3D cubes only ──
     if let Some(ref cube) = cube_opt {
+        if cube.is_pes_2d() { /* handled by 2D surface above */ }
+        else {
         let lattice = cube.to_lattice();
         let e_min = cube.field.iter().cloned().fold(f32::MAX, f32::min);
         let e_max = cube.field.iter().cloned().fold(f32::MIN, f32::max);
@@ -853,12 +873,13 @@ fn setup(
             color_clip: 1.0, iso_value,
             slice_axis: 2, slice_pos: 0.5,
         });
+        } // end else (3D path)
     }
 
-    if cube_opt.is_some() {
+    if cube_opt.as_ref().map_or(false, |c| c.is_pes_3d()) {
         println!("PES 3D mode: {} atoms. 4:isosurface 5:volume 6:slice S:toggle -/+:iso [ ]:clip", n);
-    } else if pes_opt.is_some() {
-        println!("PES mode: {} atoms. Right-drag: rotate | Scroll: zoom | S: surface toggle.", n);
+    } else if final_pes.is_some() {
+        println!("PES 2D mode: {} atoms. Right-drag: rotate | Scroll: zoom | S: surface toggle.", n);
     } else {
         println!("Loaded {} atoms. Right-drag to rotate, scroll to zoom, click to select.", n);
     }
@@ -1145,6 +1166,31 @@ fn crystal_data_from_pes(pes: &PesData) -> CrystalData {
                 y: pa.fy as f32,
                 z: pa.fz as f32,
                 label: String::new(),
+            }).collect(),
+        positions_fractional: true,
+        modified: false,
+        phonon_modes: None,
+    }
+}
+
+/// Convert CubeData atoms (excluding mobile atom) to CrystalData for 2D PES rendering.
+fn crystal_data_from_pes_cube(cube: &CubeData, mobile_idx: usize) -> CrystalData {
+    let lattice = cube.to_lattice();
+    let inv = lattice.inverse_vectors();
+    crystal::CrystalData {
+        lattice,
+        atoms: cube.atoms.iter().enumerate()
+            .filter(|(i, _)| *i != mobile_idx)
+            .map(|(_, a)| {
+                let cart_x = a.x as f32; let cart_y = a.y as f32; let cart_z = a.z_coord as f32;
+                let fx = inv[0][0]*cart_x + inv[0][1]*cart_y + inv[0][2]*cart_z;
+                let fy = inv[1][0]*cart_x + inv[1][1]*cart_y + inv[1][2]*cart_z;
+                let fz = inv[2][0]*cart_x + inv[2][1]*cart_y + inv[2][2]*cart_z;
+                crystal::AtomData {
+                    element: atom_z_to_symbol(a.z),
+                    x: fx, y: fy, z: fz,
+                    label: String::new(),
+                }
             }).collect(),
         positions_fractional: true,
         modified: false,

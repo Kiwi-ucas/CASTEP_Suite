@@ -9,6 +9,7 @@ use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use serde::{Deserialize, Serialize};
 use crate::crystal::Lattice;
+use crate::cube_reader::CubeData;
 
 // ── PES data types (match Fortran write_pes_metadata_json output) ──
 
@@ -51,7 +52,66 @@ impl PesData {
         Ok(serde_json::from_str(&content)?)
     }
 
-    /// Quick check whether JSON content is a PES scan file.
+    /// Construct PesData from a 2D PES cube file (nz=1).
+    ///
+    /// Extracts scan plane, mobile atom, fractional ranges, lattice,
+    /// and structure atoms from the cube header + line-2 JSON metadata.
+    /// Energies are converted from the cube's volumetric field (NaN → None).
+    pub fn from_cube(cube: &CubeData) -> Result<Self, String> {
+        let meta = cube.pes_meta.as_ref()
+            .ok_or("Cube file missing PES metadata on line 2")?;
+
+        let plane = meta.plane.as_ref()
+            .ok_or("Missing 'plane' in PES metadata")?.clone();
+        let scan_mode = meta.scan_mode.as_ref()
+            .unwrap_or(&"SP".to_string()).clone();
+        let mobile_index = meta.mobile_idx.unwrap_or(0) as i32;
+        let mobile_element = meta.mobile_el.as_ref()
+            .unwrap_or(&"X".to_string()).clone();
+        let fx_range = meta.fx_range.unwrap_or([0.0, 1.0]);
+        let fy_range = meta.fy_range.unwrap_or([0.0, 1.0]);
+
+        let lattice = cube.to_lattice();
+
+        // Convert cube atoms (Cartesian) → fractional PesAtom
+        let inv = lattice.inverse_vectors();
+        let structure_atoms: Vec<PesAtom> = cube.atoms.iter().map(|a| {
+            let cart = Vec3::new(a.x as f32, a.y as f32, a.z_coord as f32);
+            let frac_x = inv[0][0]*cart.x + inv[0][1]*cart.y + inv[0][2]*cart.z;
+            let frac_y = inv[1][0]*cart.x + inv[1][1]*cart.y + inv[1][2]*cart.z;
+            let frac_z = inv[2][0]*cart.x + inv[2][1]*cart.y + inv[2][2]*cart.z;
+            PesAtom {
+                element: cube_atom_element(a.z),
+                fx: frac_x as f64,
+                fy: frac_y as f64,
+                fz: frac_z as f64,
+            }
+        }).collect();
+
+        // Convert field → energies (NaN → None)
+        let energies: Vec<Option<f64>> = cube.field.iter()
+            .map(|&v| if v.is_finite() { Some(v as f64) } else { None })
+            .collect();
+
+        let has_energies = energies.iter().any(|e| e.is_some());
+
+        Ok(PesData {
+            data_type: Some("pes_scan".into()),
+            plane,
+            nx: cube.nx,
+            ny: cube.ny,
+            fx_range,
+            fy_range,
+            mobile_atom: MobileAtom { index: mobile_index, element: mobile_element },
+            scan_mode,
+            lattice,
+            structure_atoms,
+            energies,
+            has_energies,
+        })
+    }
+
+    /// Quick check whether JSON content is a PES scan file (legacy).
     pub fn detect(json_str: &str) -> bool {
         json_str.contains("\"pes_scan\"")
     }
@@ -315,6 +375,19 @@ impl PesData {
 
         (sub, snx, sny)
     }
+}
+
+/// Atomic number → element symbol (up to Xe, 54).
+fn cube_atom_element(z: i32) -> String {
+    const SYM: &[&str] = &[
+        "X", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne",
+        "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca",
+        "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
+        "Ga", "Ge", "As", "Se", "Br", "Kr", "Rb", "Sr", "Y", "Zr",
+        "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In", "Sn",
+        "Sb", "Te", "I", "Xe",
+    ];
+    if z >= 0 && (z as usize) < SYM.len() { SYM[z as usize].to_string() } else { format!("Z{}", z) }
 }
 
 /// Linear-interpolated percentile of sorted slice.

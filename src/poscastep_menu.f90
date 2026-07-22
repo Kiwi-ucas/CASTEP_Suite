@@ -34,10 +34,8 @@ module poscastep_menu
     use cell_writer, only: write_cell_file
     use param_writer, only: write_param_file
     use cli_menu, only: run_main_menu
-    use pes3d, only: pes3d_grid_t, compute_local_grid_bounds, generate_pes3d_grid_points, &
-        write_pes3d_cube, collect_pes3d_energies, symmetry_expand_energies
-    use pes_scan, only: pes_grid_t, generate_pes_grid_points, write_pes_metadata_json, &
-        collect_pes_energies
+    use pes, only: pes_grid_t, compute_local_grid_bounds, generate_pes_grid_points, &
+        write_pes_cube, collect_pes_energies, symmetry_expand_energies
     implicit none
     private
 
@@ -2740,7 +2738,7 @@ contains
         character(len=MAX_LINE_LEN) :: file_path, scan_dir, sub_dir, stem, input
         character(len=MAX_LINE_LEN) :: cell_path, param_path
         real(dp), allocatable :: frac_points(:,:)
-        integer :: ios, i, n_total, mi, n_pts(2)
+        integer :: ios, i, n_total, mi, n_pts(3)
         real(dp) :: fx, fy, range_vals(4)
         character(len=8) :: plane_choice, mode_choice, mobile_elem, plane_str
 
@@ -2826,6 +2824,7 @@ contains
         write(*, '(a)', advance='no') '  Grid Ny (default 5): '
         read(*, '(a)', iostat=ios) input
         n_pts(2) = 5; if (len_trim(input) > 0) read(input, *, iostat=ios) n_pts(2)
+        n_pts(3) = 1  ! 2D: nz=1
         grid%n_points = n_pts
 
         write(*, '(a)', advance='no') '  fx range (min max, default 0 1): '
@@ -2915,8 +2914,19 @@ contains
             call write_param_file(param_path, cfg, ios)
         end do
 
-        ! ── Write metadata JSON ──
-        call write_pes_metadata_json(trim(scan_dir)//'/pes_metadata.json', grid, cfg, ios)
+        ! ── Write cube file (2D PES with nz=1) ──
+        block
+            real(dp), allocatable :: dummy_e(:)
+            logical, allocatable :: dummy_h(:)
+            integer :: dummy_n
+            dummy_n = grid%n_points(1) * grid%n_points(2)
+            allocate(dummy_e(dummy_n), dummy_h(dummy_n))
+            dummy_e = 0.0_dp; dummy_h = .false.
+            grid%ndim = 2
+            call write_pes_cube(trim(scan_dir)//'/scan.cube', grid, cfg, &
+                dummy_e, dummy_h, ios)
+            deallocate(dummy_e, dummy_h)
+        end block
 
         ! ── Cleanup ──
         ! Save element and plane label before deallocation
@@ -2953,7 +2963,7 @@ contains
         !! PES sub-menu 2: Collect .castep results and launch viewer
         integer, intent(out) :: iostat
 
-        character(len=MAX_LINE_LEN) :: scan_dir, json_path, input
+        character(len=MAX_LINE_LEN) :: scan_dir, json_path, cube_path, input
         integer :: ios
         logical :: exists
 
@@ -2966,9 +2976,16 @@ contains
         scan_dir = adjustl(scan_dir); call strip_quotes(scan_dir)
         if (scan_dir == 'q' .or. scan_dir == 'Q') return
 
-        inquire(file=trim(scan_dir)//'/pes_metadata.json', exist=exists)
+        ! Check for scan.cube (primary) or pes_metadata.json (legacy)
+        inquire(file=trim(scan_dir)//'/scan.cube', exist=exists)
         if (.not. exists) then
-            write(*, '(a)') '  pes_metadata.json not found in directory.'
+            inquire(file=trim(scan_dir)//'/pes3d.cube', exist=exists)
+        end if
+        if (.not. exists) then
+            inquire(file=trim(scan_dir)//'/pes_metadata.json', exist=exists)
+        end if
+        if (.not. exists) then
+            write(*, '(a)') '  No scan.cube or pes_metadata.json found in directory.'
             return
         end if
 
@@ -2983,7 +3000,11 @@ contains
         write(*, '(a)', advance='no') '  Launch 3D Viewer? (y/n): '
         read(*, '(a)', iostat=ios) input
         if (ios == 0 .and. (input(1:1) == 'y' .or. input(1:1) == 'Y')) then
-            json_path = trim(scan_dir) // '/pes_metadata.json'
+            ! Prefer cube file over legacy JSON
+            cube_path = trim(scan_dir) // '/scan.cube'
+            inquire(file=trim(cube_path), exist=exists)
+            if (.not. exists) cube_path = trim(scan_dir) // '/pes3d.cube'
+            if (.not. exists) json_path = trim(scan_dir) // '/pes_metadata.json'
             call launch_viewer(json_path)
         end if
     end subroutine handle_pes_collect
@@ -3000,7 +3021,7 @@ contains
 
         type(cif_data_t) :: cif
         type(castep_config_t) :: cfg
-        type(pes3d_grid_t) :: grid
+        type(pes_grid_t) :: grid
         character(len=MAX_LINE_LEN) :: file_path, scan_dir, sub_dir, stem, input
         character(len=MAX_LINE_LEN) :: cell_path, param_path
         real(dp), allocatable :: frac_points(:,:)
@@ -3094,7 +3115,7 @@ contains
         if (ios /= 0 .or. mi < 1 .or. mi > cfg%num_atoms) then
             write(*, '(a)') '  Invalid selection.'; return
         end if
-        grid%ref_atom_idx = mi
+        grid%mobile_atom_idx = mi
         grid%ref_frac = [cfg%atom_x(mi), cfg%atom_y(mi), cfg%atom_z(mi)]
 
         ! ── Grid parameters ──
@@ -3188,7 +3209,8 @@ contains
         if (ios == IO_USER_QUIT) return
 
         ! ── Generate grid points ──
-        call generate_pes3d_grid_points(grid, frac_points, n_total, ios)
+        grid%ndim = 3
+        call generate_pes_grid_points(grid, frac_points, n_total, ios)
         if (ios /= 0) then
             write(*, '(a)') '  Error generating grid.'; return
         end if
@@ -3223,10 +3245,15 @@ contains
             call write_param_file(param_path, cfg, ios)
         end do
 
-        ! ── Write cube file (sym_ops in comment line + placeholder energies) ──
-        allocate(dummy_energies(n_total)); dummy_energies = 0.0_dp
-        call write_pes3d_cube(trim(scan_dir)//'/pes3d.cube', &
-            grid, cfg, cif, dummy_energies, n_total, ios)
+        ! ── Write cube file with placeholder energies ──
+        block
+            logical, allocatable :: dummy_h(:)
+            allocate(dummy_energies(n_total), dummy_h(n_total))
+            dummy_energies = 0.0_dp; dummy_h = .false.
+            call write_pes_cube(trim(scan_dir)//'/scan.cube', &
+                grid, cfg, dummy_energies, dummy_h, ios)
+            deallocate(dummy_h)
+        end block
         deallocate(dummy_energies)
 
         ! Save element before deallocation (cif is still valid here)
@@ -3278,31 +3305,34 @@ contains
         scan_dir = adjustl(scan_dir); call strip_quotes(scan_dir)
         if (scan_dir == 'q' .or. scan_dir == 'Q') return
 
-        ! Check for pes3d_metadata.json
-        json_path = trim(scan_dir) // '/pes3d_metadata.json'
-        inquire(file=trim(json_path), exist=exists)
+        ! Check for scan.cube (primary) or pes3d.cube / pes3d_metadata.json (legacy)
+        inquire(file=trim(scan_dir)//'/scan.cube', exist=exists)
+        if (.not. exists) inquire(file=trim(scan_dir)//'/pes3d.cube', exist=exists)
         if (.not. exists) then
-            write(*, '(a)') '  pes3d_metadata.json not found in ' // trim(scan_dir)
+            json_path = trim(scan_dir) // '/pes3d_metadata.json'
+            inquire(file=trim(json_path), exist=exists)
+        end if
+        if (.not. exists) then
+            write(*, '(a)') '  No scan.cube or pes3d_metadata.json found in ' // trim(scan_dir)
             return
         end if
 
         ! Collect CASTEP energies
-        call collect_pes3d_energies(trim(scan_dir), ios)
+        call collect_pes_energies(trim(scan_dir), ios)
         if (ios /= 0) then
             write(*, '(a)') '  Error collecting energies.'
             return
         end if
 
-        ! Check if symmetry expansion is needed (from JSON)
-        ! If use_symmetry is true, expand
-        call symmetry_expand_energies(trim(json_path), ios)
+        ! Symmetry expansion (reads use_symmetry from cube line 2 JSON)
+        call symmetry_expand_energies(trim(scan_dir), ios)
 
         ! Launch viewer
         write(*, '(a)') ''
         write(*, '(a)', advance='no') '  Launch 3D viewer? (y/n): '
         read(*, '(a)', iostat=ios) input
         if (ios == 0 .and. (input(1:1) == 'y' .or. input(1:1) == 'Y')) then
-            call launch_viewer(json_path)
+            call launch_viewer(trim(scan_dir)//'/scan.cube')
         end if
     end subroutine handle_pes3d_collect
 
