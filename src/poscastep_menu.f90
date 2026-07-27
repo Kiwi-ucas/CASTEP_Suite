@@ -3339,7 +3339,13 @@ contains
         write(*, '(a)', advance='no') '  Launch 3D viewer? (y/n): '
         read(*, '(a)', iostat=ios) input
         if (ios == 0 .and. (input(1:1) == 'y' .or. input(1:1) == 'Y')) then
-            call launch_viewer(trim(scan_dir)//'/scan.cube')
+            ! Launch expanded cube if available, otherwise local cube
+            inquire(file=trim(scan_dir)//'/pes3d_expanded.cube', exist=exists)
+            if (exists) then
+                call launch_viewer(trim(scan_dir)//'/pes3d_expanded.cube')
+            else
+                call launch_viewer(trim(scan_dir)//'/scan.cube')
+            end if
         end if
     end subroutine handle_pes3d_collect
 

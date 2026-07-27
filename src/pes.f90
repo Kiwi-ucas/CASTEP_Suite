@@ -8,6 +8,7 @@ module pes
     !! describes the scan plane, mobile atom, lattice, and symmetry info.
     use castep_config, only: dp, castep_config_t, cif_data_t, atom_t, sym_op_t, &
         IO_WRITE_FAIL, IO_PARSE_ERROR, IO_FILE_NOT_FOUND
+    use parser, only: parse_cif_inline
     implicit none
     private
 
@@ -18,6 +19,7 @@ module pes
     public :: write_pes_cube
     public :: collect_pes_energies
     public :: symmetry_expand_energies
+    public :: write_symops_json
 
     ! Legacy wrappers — kept for backward compatibility with poscastep_menu.f90
     public :: write_pes_metadata_json   ! deprecated: use write_pes_cube
@@ -262,7 +264,7 @@ contains
         real(dp) :: scan_domain_1, scan_domain_2
         integer :: unit, ios, i, nx, ny, nz, n_total, pa0, pa1, pa2
         real(dp) :: e_val
-        character(len=2048) :: meta_json
+        character(len=4096) :: meta_json
         character(len=64) :: desc, plane_label
         integer :: z_num
         character(len=8) :: el
@@ -568,8 +570,105 @@ contains
 
 
     ! ═══════════════════════════════════════════════════════════════════════════
+    !  Symmetry operations JSON writer
+    ! ═══════════════════════════════════════════════════════════════════════════
+
+    subroutine write_symops_json(json_path, sym_ops, n_symops, iostat, iomsg)
+        !! Write symmetry operations to a compact JSON file for use by
+        !! symmetry_expand_energies during result collection.
+        character(len=*), intent(in) :: json_path
+        type(sym_op_t), intent(in) :: sym_ops(:)
+        integer, intent(in) :: n_symops
+        integer, intent(out) :: iostat
+        character(len=*), optional, intent(out) :: iomsg
+
+        integer :: unit, iop
+        character(len=64) :: rot_str
+
+        iostat = 0
+        open(newunit=unit, file=trim(json_path), status='replace', action='write', iostat=iostat)
+        if (iostat /= 0) then
+            if (present(iomsg)) iomsg = 'Cannot write: ' // trim(json_path)
+            return
+        end if
+
+        write(unit, '(a)') '{"sym_ops":['
+        do iop = 1, n_symops
+            write(rot_str, '(i2,a,i2,a,i2,a,i2,a,i2,a,i2,a,i2,a,i2,a,i2)') &
+                sym_ops(iop)%rot(1,1), ',', sym_ops(iop)%rot(1,2), ',', sym_ops(iop)%rot(1,3), ',', &
+                sym_ops(iop)%rot(2,1), ',', sym_ops(iop)%rot(2,2), ',', sym_ops(iop)%rot(2,3), ',', &
+                sym_ops(iop)%rot(3,1), ',', sym_ops(iop)%rot(3,2), ',', sym_ops(iop)%rot(3,3)
+            if (iop < n_symops) then
+                write(unit, '(a,a,a,f10.8,a,f10.8,a,f10.8,a)') &
+                    '{"rot":[', trim(rot_str), '],"trans":[', &
+                    sym_ops(iop)%trans(1), ',', sym_ops(iop)%trans(2), ',', sym_ops(iop)%trans(3), ']},'
+            else
+                write(unit, '(a,a,a,f10.8,a,f10.8,a,f10.8,a)') &
+                    '{"rot":[', trim(rot_str), '],"trans":[', &
+                    sym_ops(iop)%trans(1), ',', sym_ops(iop)%trans(2), ',', sym_ops(iop)%trans(3), ']}'
+            end if
+        end do
+        write(unit, '(a)') ']}'
+        close(unit)
+    end subroutine write_symops_json
+
+
+    ! ═══════════════════════════════════════════════════════════════════════════
     !  Symmetry expansion (3D only)
     ! ═══════════════════════════════════════════════════════════════════════════
+
+    subroutine fill_nan_holes(energies, filled, nx, ny, nz)
+        !! One pass: replace each unfilled cell with the average of its
+        !! filled 6-face neighbours. Cells with no filled neighbours stay NaN.
+        real(dp), intent(inout) :: energies(:)
+        logical, intent(inout) :: filled(:)
+        integer, intent(in) :: nx, ny, nz
+        real(dp) :: sum_e, new_energies(size(energies))
+        logical :: new_filled(size(energies))
+        integer :: i, j, k, idx, ni, nj, nk, nidx, nn
+
+        new_energies = energies
+        new_filled = filled
+
+        do k = 1, nz
+            do j = 1, ny
+                do i = 1, nx
+                    idx = (k-1)*nx*ny + (j-1)*nx + i
+                    if (filled(idx)) cycle
+
+                    sum_e = 0.0_dp; nn = 0
+                    ! 6 face neighbours
+                    if (i > 1) then; nidx = idx - 1
+                        if (filled(nidx)) then; sum_e = sum_e + energies(nidx); nn = nn + 1; end if
+                    end if
+                    if (i < nx) then; nidx = idx + 1
+                        if (filled(nidx)) then; sum_e = sum_e + energies(nidx); nn = nn + 1; end if
+                    end if
+                    if (j > 1) then; nidx = idx - nx
+                        if (filled(nidx)) then; sum_e = sum_e + energies(nidx); nn = nn + 1; end if
+                    end if
+                    if (j < ny) then; nidx = idx + nx
+                        if (filled(nidx)) then; sum_e = sum_e + energies(nidx); nn = nn + 1; end if
+                    end if
+                    if (k > 1) then; nidx = idx - nx*ny
+                        if (filled(nidx)) then; sum_e = sum_e + energies(nidx); nn = nn + 1; end if
+                    end if
+                    if (k < nz) then; nidx = idx + nx*ny
+                        if (filled(nidx)) then; sum_e = sum_e + energies(nidx); nn = nn + 1; end if
+                    end if
+
+                    if (nn > 0) then
+                        new_energies(idx) = sum_e / real(nn, dp)
+                        new_filled(idx) = .true.
+                    end if
+                end do
+            end do
+        end do
+
+        energies = new_energies
+        filled = new_filled
+    end subroutine fill_nan_holes
+
 
     subroutine symmetry_expand_energies(scan_dir, iostat, iomsg)
         !! Read energies from cube, apply symmetry ops to expand local grid
@@ -596,13 +695,13 @@ contains
         integer :: exp_nx, exp_ny, exp_nz, n_exp
         real(dp), allocatable :: exp_energies(:)
         logical, allocatable :: exp_filled(:)
-        real(dp) :: sp_x, sp_y, sp_z
+        real(dp) :: sp_x, sp_y, sp_z, sp_uniform
         real(dp) :: local_frac(3), exp_frac(3)
         real(dp) :: e_min_final, e_max_final
         real(dp) :: el
 
-        character(len=1024) :: cube_path, exp_path, json_path, line
-        integer :: unit_in, ios, i, j, k, idx, iop, iexp, ei, ej, ek
+        character(len=1024) :: cube_path, exp_path, cif_path, line
+        integer :: unit_in, ios, i, j, k, idx, iop, iexp, ei, ej, ek, iter, n_filled
         logical :: exists, use_sym
         character(len=4096), allocatable :: header_buf(:)
         integer :: n_header_lines
@@ -641,29 +740,37 @@ contains
         read(unit_in, '(a)') line   ! line 1: skip
         read(unit_in, '(a)') line   ! line 2: metadata JSON
         close(unit_in)
-        use_sym = index(line, '"use_symmetry":true') > 0
+        use_sym = index(line, '"use_symmetry":true')  > 0 &
+             .or. index(line, '"use_symmetry":T')     > 0 &
+             .or. index(line, '"use_symmetry": True') > 0
         if (.not. use_sym) then
             if (present(iomsg)) iomsg = 'No symmetry — skipping expansion'
             return
         end if
+
+        ! Extract CIF path from cube JSON
+        call extract_json_string_by_key(line, '"cif_path"', cif_path)
 
         ! Parse fractional ranges from JSON
         call extract_json_two_reals_by_key(line, '"fx_range"', fx_range(1), fx_range(2))
         call extract_json_two_reals_by_key(line, '"fy_range"', fy_range(1), fy_range(2))
         call extract_json_two_reals_by_key(line, '"fz_range"', fz_range(1), fz_range(2))
 
-        ! Parse sym_ops from sidecar JSON if available
-        json_path = trim(scan_dir) // '/pes3d_metadata.json'
-        inquire(file=trim(json_path), exist=exists)
-        if (exists) then
-            call parse_symops_from_json(json_path, rot, trans, n_symops, MAX_SYM_OPS, ios)
-            if (ios /= 0 .or. n_symops < 1) then
-                if (present(iomsg)) iomsg = 'Failed to parse sym_ops from JSON'
-                iostat = IO_PARSE_ERROR; return
-            end if
-        else
-            if (present(iomsg)) iomsg = 'Symmetry metadata JSON not found — cannot expand'
+        ! Re-parse CIF from stored path to get sym_ops (no sidecar file needed)
+        iostat = 0  ! reset
+        if (len_trim(cif_path) == 0) then
+            if (present(iomsg)) iomsg = 'CIF path not in cube metadata — cannot expand'
             iostat = IO_FILE_NOT_FOUND; return
+        end if
+        inquire(file=trim(cif_path), exist=exists)
+        if (.not. exists) then
+            if (present(iomsg)) iomsg = 'CIF file not found: ' // trim(cif_path)
+            iostat = IO_FILE_NOT_FOUND; return
+        end if
+        call parse_cif_symops(trim(cif_path), rot, trans, n_symops, MAX_SYM_OPS, ios)
+        if (ios /= 0 .or. n_symops < 1) then
+            if (present(iomsg)) iomsg = 'Failed to extract sym_ops from CIF'
+            iostat = IO_PARSE_ERROR; return
         end if
 
         ! Read energies from cube
@@ -690,7 +797,7 @@ contains
         end do
         close(unit_in)
 
-        ! Build expanded grid
+        ! Build expanded grid (anisotropic — preserve original spacing)
         sp_x = (fx_range(2) - fx_range(1)) / max(1, nx - 1)
         sp_y = (fy_range(2) - fy_range(1)) / max(1, ny - 1)
         sp_z = (fz_range(2) - fz_range(1)) / max(1, nz - 1)
@@ -835,8 +942,9 @@ contains
     function build_metadata_json(grid, cfg) result(json)
         type(pes_grid_t), intent(in) :: grid
         type(castep_config_t), intent(in), target :: cfg
-        character(len=2048) :: json
+        character(len=4096) :: json
         character(len=128) :: lat_str, plane_l, mob_el
+        character(len=5) :: sym_str
         integer :: mi
 
         mi = grid%mobile_atom_idx
@@ -848,6 +956,11 @@ contains
             ',"beta":', cfg%cell_angle(2), ',"gamma":', cfg%cell_angle(3)
 
         plane_l = plane_name(grid)
+        if (grid%use_symmetry) then
+            sym_str = 'true '
+        else
+            sym_str = 'false'
+        end if
 
         if (grid%ndim == 2) then
             write(json, '(a,a,a,a,a,i0,a,a,a,a,f12.8,a,f12.8,a,a,f12.8,a,f12.8,a,a,a,a)') &
@@ -859,7 +972,7 @@ contains
                 '"fy_range":[', grid%frac_range(2,1), ',', grid%frac_range(2,2), '],', &
                 '"lattice":{', trim(lat_str), '}}'
         else
-            write(json, '(a,a,a,i0,a,a,a,a,f12.8,a,f12.8,a,a,f12.8,a,f12.8,a,a,f12.8,a,f12.8,a,a,a,a,a,l1,a)') &
+            write(json, '(a,a,a,i0,a,a,a,a,f12.8,a,f12.8,a,a,f12.8,a,f12.8,a,a,f12.8,a,f12.8,a,a,a,a,a,a,a,a,a,a)') &
                 '{"type":"pes_3d","scan_mode":"', trim(grid%scan_mode), &
                 '","mobile_idx":', mi - 1, &
                 ',"mobile_el":"', trim(mob_el), '",', &
@@ -867,7 +980,8 @@ contains
                 '"fy_range":[', grid%frac_range(2,1), ',', grid%frac_range(2,2), '],', &
                 '"fz_range":[', grid%frac_range(3,1), ',', grid%frac_range(3,2), '],', &
                 '"lattice":{', trim(lat_str), '},', &
-                '"use_symmetry":', grid%use_symmetry, '}'
+                '"cif_path":"', trim(cfg%cif_file_path), '",', &
+                '"use_symmetry":', trim(sym_str), '}'
         end if
     end function build_metadata_json
 
@@ -958,6 +1072,44 @@ contains
 
     ! ── Write expanded cube (symmetry expansion output) ──
 
+    subroutine patch_json_full_cell(json_in, json_out)
+        !! Patch JSON line 2 for expanded cube: set all frac ranges to [0,1]
+        !! and remove symmetry flag (already expanded).
+        character(len=*), intent(in) :: json_in
+        character(len=*), intent(out) :: json_out
+        character(len=64) :: pat
+        integer :: kp, ep
+
+        json_out = json_in
+
+        ! Replace fx_range values
+        call replace_json_array(json_out, '"fx_range"', 0.0_dp, 1.0_dp)
+        call replace_json_array(json_out, '"fy_range"', 0.0_dp, 1.0_dp)
+        call replace_json_array(json_out, '"fz_range"', 0.0_dp, 1.0_dp)
+
+        ! Change use_symmetry:true → use_symmetry:false
+        kp = index(json_out, '"use_symmetry":true')
+        if (kp > 0) json_out(kp+15:kp+18) = 'fals'  ! 'true'→'fals' (need one more)
+        if (kp > 0) json_out(kp+19:kp+19) = 'e'      ! 'true'→'false'
+    end subroutine patch_json_full_cell
+
+    subroutine replace_json_array(json, key, v1, v2)
+        !! Replace [old1, old2] with [v1, v2] for a given JSON key.
+        character(len=*), intent(inout) :: json
+        character(len=*), intent(in) :: key
+        real(dp), intent(in) :: v1, v2
+        integer :: kp, bp, ep
+        character(len=48) :: new_val
+        kp = index(json, trim(key))
+        if (kp == 0) return
+        bp = index(json(kp:), '[') + kp - 1
+        ep = index(json(kp:), ']') + kp - 1
+        if (bp <= 0 .or. ep <= bp) return
+        write(new_val, '(f12.8,a,f12.8)') v1, ',', v2
+        json(bp+1:ep-1) = trim(new_val)
+    end subroutine replace_json_array
+
+
     subroutine write_expanded_cube(exp_path, header_buf, n_header_lines, &
                                     energies, has_energy, nx, ny, nz, ios)
         character(len=*), intent(in) :: exp_path
@@ -968,7 +1120,7 @@ contains
         integer, intent(in) :: nx, ny, nz
         integer, intent(out) :: ios
 
-        integer :: unit_out, i, n_total, natom
+        integer :: unit_out, i, n_total, natom, old_nx, old_ny, old_nz
         real(dp) :: e_val, origin(3), dv(3,3)
         character(len=4096) :: line
 
@@ -977,9 +1129,11 @@ contains
         open(newunit=unit_out, file=trim(exp_path), status='replace', action='write', iostat=ios)
         if (ios /= 0) return
 
-        ! Rewrite header with updated dimensions (preserving origin, atoms)
+        ! Rewrite header with updated dimensions + full-cell JSON metadata
         write(unit_out, '(a,i0,a,i0,a,i0)') '3D PES (expanded): ', nx, 'x', ny, 'x', nz
-        write(unit_out, '(a)') trim(header_buf(2))  ! preserve line-2 metadata
+        ! Patch line-2 JSON: update fractional ranges to [0,1] (full cell)
+        call patch_json_full_cell(header_buf(2), line)
+        write(unit_out, '(a)') trim(line)
 
         ! Re-parse natom and origin from original header
         read(header_buf(3), *) natom, origin(1), origin(2), origin(3)
@@ -992,16 +1146,13 @@ contains
         write(unit_out, '(i5,3f12.6)') natom, origin(1), origin(2), origin(3)
 
         ! Read old voxel vectors and scale
-        read(header_buf(4), *) i, dv(1,1), dv(2,1), dv(3,1)
-        read(header_buf(5), *) i, dv(1,2), dv(2,2), dv(3,2)
-        read(header_buf(6), *) i, dv(1,3), dv(2,3), dv(3,3)
+        read(header_buf(4), *) old_nx, dv(1,1), dv(2,1), dv(3,1)
+        read(header_buf(5), *) old_ny, dv(1,2), dv(2,2), dv(3,2)
+        read(header_buf(6), *) old_nz, dv(1,3), dv(2,3), dv(3,3)
         ! Scale: old_n-1 new voxels cover same domain
-        ! dv_new = dv_old * (old_n-1) / (new_n-1)
-        if (i > 1) dv(:,1) = dv(:,1) * real(i-1, dp) / real(max(1, nx-1), dp)
-        read(header_buf(5), *) i
-        if (i > 1) dv(:,2) = dv(:,2) * real(i-1, dp) / real(max(1, ny-1), dp)
-        read(header_buf(6), *) i
-        if (i > 1) dv(:,3) = dv(:,3) * real(i-1, dp) / real(max(1, nz-1), dp)
+        if (old_nx > 1) dv(:,1) = dv(:,1) * real(old_nx-1, dp) / real(max(1, nx-1), dp)
+        if (old_ny > 1) dv(:,2) = dv(:,2) * real(old_ny-1, dp) / real(max(1, ny-1), dp)
+        if (old_nz > 1) dv(:,3) = dv(:,3) * real(old_nz-1, dp) / real(max(1, nz-1), dp)
 
         write(unit_out, '(i5,3f12.6)') nx, dv(1,1), dv(2,1), dv(3,1)
         write(unit_out, '(i5,3f12.6)') ny, dv(1,2), dv(2,2), dv(3,2)
@@ -1029,6 +1180,33 @@ contains
 
 
     ! ── Parse sym_ops from JSON (for symmetry_expand) ──
+
+    subroutine parse_cif_symops(cif_path, rot, trans, n_symops, max_ops, ios)
+        !! Re-parse a CIF file to extract symmetry operations.
+        !! Uses the existing parser module (parse_cif_inline).
+        character(len=*), intent(in) :: cif_path
+        integer, intent(in) :: max_ops
+        integer, intent(out) :: rot(3,3,max_ops), n_symops, ios
+        real(dp), intent(out) :: trans(3,max_ops)
+        type(cif_data_t) :: cif
+        integer :: iop
+
+        n_symops = 0; ios = 0
+        rot = 0; trans = 0.0_dp
+
+        call parse_cif_inline(trim(cif_path), cif, ios)
+        if (ios /= 0) return
+        if (cif%n_symops < 1) then
+            ios = -1; return
+        end if
+
+        n_symops = min(cif%n_symops, max_ops)
+        do iop = 1, n_symops
+            rot(:,:,iop) = cif%sym_ops(iop)%rot
+            trans(:,iop) = cif%sym_ops(iop)%trans
+        end do
+    end subroutine parse_cif_symops
+
 
     subroutine parse_symops_from_json(json_path, rot, trans, n_symops, max_ops, ios)
         character(len=*), intent(in) :: json_path
@@ -1103,6 +1281,24 @@ contains
 
 
     ! ── JSON utility helpers ──
+
+    subroutine extract_json_string_by_key(line, key, val)
+        !! Extract a quoted string value from JSON like "key":"value"
+        character(len=*), intent(in) :: line, key
+        character(len=*), intent(out) :: val
+        integer :: col, q1, q2
+        val = ''
+        col = index(line, trim(key))
+        if (col == 0) return
+        col = index(line(col:), ':') + col - 1
+        if (col <= 0) return
+        q1 = index(line(col+1:), '"') + col
+        if (q1 <= col) return
+        q2 = index(line(q1+1:), '"') + q1
+        if (q2 <= q1) return
+        val = line(q1+1:q2-1)
+    end subroutine extract_json_string_by_key
+
 
     subroutine extract_json_int(line, key, val, ios)
         character(len=*), intent(in) :: line, key

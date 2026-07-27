@@ -13,12 +13,10 @@ use ui::{AtomInfo, CrystalMeta, ui_system};
 use pes::PesData;
 use cube_reader::{CubeData, is_cube, parse_cube};
 use marching_cubes::marching_cubes_mesh;
-
+use volume_render::volume_proxy_mesh;
 use slice_plane::{generate_slice_texture, slice_plane_mesh};
 use std::f32::consts::PI;
 use std::env;
-
-static FRAC_RANGE: [[f64; 2]; 3] = [[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]];
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -829,26 +827,43 @@ fn setup(
         let lattice = cube.to_lattice();
         let e_min = cube.field.iter().cloned().fold(f32::MAX, f32::min);
         let e_max = cube.field.iter().cloned().fold(f32::MIN, f32::max);
+        // Extract actual fractional range from cube metadata (fallback to [0,1])
+        let frac_range = cube.pes_meta.as_ref()
+            .and_then(|m| {
+                let fx = m.fx_range.unwrap_or([0.0, 1.0]);
+                let fy = m.fy_range.unwrap_or([0.0, 1.0]);
+                let fz = m.fz_range.unwrap_or([0.0, 1.0]);
+                Some([fx, fy, fz])
+            })
+            .unwrap_or([[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]);
         println!("PES 3D: {}x{}x{} grid, E=[{:.4}, {:.4}], {} atoms",
             cube.nx, cube.ny, cube.nz, e_min, e_max, cube.atoms.len());
+
+        // Spawn volume proxy (mode 5)
+        let vol_mesh = meshes.add(volume_proxy_mesh(&lattice));
+        let vol_mat = materials.add(StandardMaterial {
+            base_color: Color::srgba(0.3, 0.3, 0.8, 0.15),
+            alpha_mode: AlphaMode::Blend, unlit: true, ..default()
+        });
+        commands.spawn((Mesh3d(vol_mesh), MeshMaterial3d(vol_mat), VolumeProxy, Visibility::Hidden));
 
         // Spawn MC isosurface
         let iso_value = e_min + 0.15 * (e_max - e_min);
         if let Some(mc_mesh) = marching_cubes_mesh(
             &cube.field, cube.nx, cube.ny, cube.nz,
-            &FRAC_RANGE, &lattice,
+            &frac_range, &lattice,
             iso_value, e_min, e_max,
         ) {
-            let colormap = PesData::generate_surface_static(e_min, e_max);
-            let tex_handle = materials.add(StandardMaterial {
-                base_color_texture: Some(images.add(colormap)),
+            let solid_mat = materials.add(StandardMaterial {
+                base_color: Color::srgba(0.3, 0.6, 1.0, 0.5),
                 alpha_mode: AlphaMode::Blend,
                 unlit: true,
+                cull_mode: None,
                 ..default()
             });
             commands.spawn((
                 Mesh3d(meshes.add(mc_mesh)),
-                MeshMaterial3d(tex_handle),
+                MeshMaterial3d(solid_mat),
                 IsoSurface,
             ));
         }
@@ -876,7 +891,7 @@ fn setup(
         } // end else (3D path)
     }
 
-    if cube_opt.as_ref().map_or(false, |c| c.is_pes_3d()) {
+    if cube_opt.is_some() {
         println!("PES 3D mode: {} atoms. 4:isosurface 5:volume 6:slice S:toggle -/+:iso [ ]:clip", n);
     } else if final_pes.is_some() {
         println!("PES 2D mode: {} atoms. Right-drag: rotate | Scroll: zoom | S: surface toggle.", n);
@@ -1413,6 +1428,14 @@ fn update_isosurface_mesh(
 
     let cube = match cube.as_ref() { Some(c) => c, None => return };
     let lattice = cube.0.to_lattice();
+    let frac_range = cube.0.pes_meta.as_ref()
+        .and_then(|m| {
+            let fx = m.fx_range.unwrap_or([0.0, 1.0]);
+            let fy = m.fy_range.unwrap_or([0.0, 1.0]);
+            let fz = m.fz_range.unwrap_or([0.0, 1.0]);
+            Some([fx, fy, fz])
+        })
+        .unwrap_or([[0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]);
 
     // Despawn old isosurface
     for e in iso_q.iter() { commands.entity(e).despawn(); }
@@ -1420,13 +1443,15 @@ fn update_isosurface_mesh(
     // Build new mesh
     if let Some(mc_mesh) = marching_cubes_mesh(
         &cube.0.field, cube.0.nx, cube.0.ny, cube.0.nz,
-        &FRAC_RANGE, &lattice,
+        &frac_range, &lattice,
         ps.iso_value, ps.e_min, ps.e_max,
     ) {
         let colormap = PesData::generate_surface_static(ps.e_min, ps.e_max);
         let tex = materials.add(StandardMaterial {
             base_color_texture: Some(images.add(colormap)),
-            alpha_mode: AlphaMode::Blend, unlit: true, ..default()
+            alpha_mode: AlphaMode::Blend, unlit: true,
+            cull_mode: None,
+            ..default()
         });
         let vis = if ps.show_surface { Visibility::Inherited } else { Visibility::Hidden };
         commands.spawn((Mesh3d(meshes.add(mc_mesh)), MeshMaterial3d(tex), IsoSurface, vis));

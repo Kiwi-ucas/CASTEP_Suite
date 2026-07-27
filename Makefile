@@ -22,11 +22,6 @@ all: $(TARGET)
 viewer:
 	@echo "  Building crystal-viewer..."
 	@cargo build --release --manifest-path $(VIEWER_DIR)/Cargo.toml
-	@echo "  Cleaning intermediate files..."
-	@rm -rf $(VIEWER_DIR)/target/release/deps
-	@rm -rf $(VIEWER_DIR)/target/release/build
-	@rm -rf $(VIEWER_DIR)/target/release/incremental
-	@rm -f $(VIEWER_DIR)/target/release/*.d
 	@du -sh $(VIEWER_DIR)/target/release/crystal-viewer
 
 $(OBJDIR):
