@@ -20,6 +20,7 @@ pub struct PesCubeMeta {
     pub fy_range: Option<[f64; 2]>,          // 2D fractional scan range
     pub fz_range: Option<[f64; 2]>,          // 3D fractional scan range on z
     pub lattice: Option<LatticeMeta>,        // explicit lattice params (override voxel recon)
+    #[allow(dead_code)]  // 3D feature in active development
     pub use_symmetry: Option<bool>,          // 3D only
 }
 
@@ -34,6 +35,7 @@ pub struct LatticeMeta {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]  // origin/metadata/description carried for future display/debug
 pub struct CubeData {
     pub nx: usize, pub ny: usize, pub nz: usize,
     pub origin: [f64; 3],
@@ -123,6 +125,7 @@ pub fn is_cube(path: &str) -> bool {
     }
 }
 
+#[allow(dead_code)]  // utility methods for volume render / PES features
 impl CubeData {
     /// True if this cube file represents a 2D PES scan (nz == 1 with pes_2d metadata).
     pub fn is_pes_2d(&self) -> bool {

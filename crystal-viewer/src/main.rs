@@ -1388,28 +1388,57 @@ fn toggle_pes3d_mode(
     }
 }
 
-/// Adjust isosurface isovalue with -/+ keys (continuous press, 80ms throttle).
+/// Adjust isosurface isovalue with -/+ keys.
+/// Tap → single step; hold → continuous after 400ms initial delay, then 80ms repeat.
 fn update_isosurface(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     mut pes3d_state: Option<ResMut<Pes3dState>>,
     mut contexts: EguiContexts,
-    mut last_time: Local<f32>,
+    mut hold_time: Local<f32>,
 ) {
     if contexts.ctx_mut().wants_keyboard_input() { return; }
     let ps = match pes3d_state.as_mut() { Some(ps) => ps, None => return };
     if ps.vis_mode != VisMode::Isosurface { return; }
 
-    let plus = keys.pressed(KeyCode::Equal) || keys.pressed(KeyCode::NumpadAdd);
-    let minus = keys.pressed(KeyCode::Minus) || keys.pressed(KeyCode::NumpadSubtract);
-    if !plus && !minus { return; }
-
-    *last_time += time.delta_secs();
-    if *last_time < 0.08 { return; }
-    *last_time = 0.0;
+    let just_plus  = keys.just_pressed(KeyCode::Equal) || keys.just_pressed(KeyCode::NumpadAdd);
+    let just_minus = keys.just_pressed(KeyCode::Minus) || keys.just_pressed(KeyCode::NumpadSubtract);
+    let held_plus  = keys.pressed(KeyCode::Equal) || keys.pressed(KeyCode::NumpadAdd);
+    let held_minus = keys.pressed(KeyCode::Minus) || keys.pressed(KeyCode::NumpadSubtract);
 
     let delta = (ps.e_max - ps.e_min) * 0.02;
-    ps.iso_value = (ps.iso_value + if plus { delta } else { -delta }).clamp(ps.e_min, ps.e_max);
+
+    // Instant single-step on tap
+    if just_plus {
+        ps.iso_value = (ps.iso_value + delta).min(ps.e_max);
+        *hold_time = 0.0;
+        return;
+    }
+    if just_minus {
+        ps.iso_value = (ps.iso_value - delta).max(ps.e_min);
+        *hold_time = 0.0;
+        return;
+    }
+
+    // Continuous repeat on hold (400ms initial delay, then every 80ms)
+    if !held_plus && !held_minus { *hold_time = 0.0; return; }
+
+    *hold_time += time.delta_secs();
+    let initial_delay = 0.4;  // wait 400ms before first auto-repeat
+    let repeat_interval = 0.08;  // then every 80ms
+
+    if *hold_time < initial_delay { return; }
+    let elapsed = *hold_time - initial_delay;
+    let steps = (elapsed / repeat_interval).floor() as i32;
+    if steps < 1 { return; }
+    *hold_time = initial_delay + elapsed - steps as f32 * repeat_interval;
+
+    let step_delta = delta * steps as f32;
+    if held_plus {
+        ps.iso_value = (ps.iso_value + step_delta).min(ps.e_max);
+    } else {
+        ps.iso_value = (ps.iso_value - step_delta).max(ps.e_min);
+    }
 }
 
 /// Rebuild isosurface mesh when isovalue changes.

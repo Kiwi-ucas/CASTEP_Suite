@@ -2964,7 +2964,7 @@ contains
         !! PES sub-menu 2: Collect .castep results and launch viewer
         integer, intent(out) :: iostat
 
-        character(len=MAX_LINE_LEN) :: scan_dir, json_path, cube_path, input
+        character(len=MAX_LINE_LEN) :: scan_dir, cube_path, input
         integer :: ios
         logical :: exists
 
@@ -3130,6 +3130,14 @@ contains
         write(*, '(a)', advance='no') '  Grid Nz (default 5): '
         read(*, '(a)', iostat=ios) input
         n_pts(3) = 5; if (len_trim(input) > 0) read(input, *, iostat=ios) n_pts(3)
+
+        ! Symmetry mode: orbit grid → expanded cube uses N+1 format.
+        ! Subtract 1 so that the expanded cube header matches user input.
+        if (grid%use_symmetry) then
+            n_pts(1) = max(2, n_pts(1) - 1)
+            n_pts(2) = max(2, n_pts(2) - 1)
+            n_pts(3) = max(2, n_pts(3) - 1)
+        end if
         grid%n_points = n_pts
 
         ! ── Orbit mapping for symmetry mode ──

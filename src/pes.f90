@@ -188,9 +188,8 @@ contains
         integer, intent(out) :: iostat
 
         logical, allocatable :: visited(:,:,:)
-        real(dp) :: x(3), xp(3), r8
+        real(dp) :: x(3), xp(3)
         integer :: i, j, k, s, ip, jp, kp, max_pts
-        real(dp), parameter :: TOL = 1.0e-10_dp
 
         iostat = 0; n_irred = 0
         max_pts = Na * Nb * Nc
@@ -228,10 +227,11 @@ contains
                               + sym_ops(s)%rot(3,2)*x(2) &
                               + sym_ops(s)%rot(3,3)*x(3) + sym_ops(s)%trans(3)
 
-                        ! Wrap to [0, 1)
-                        xp(1) = xp(1) - floor(xp(1))
-                        xp(2) = xp(2) - floor(xp(2))
-                        xp(3) = xp(3) - floor(xp(3))
+                        ! Wrap to [0, 1) — use floor(x+eps) for boundary safety:
+                        ! when xp ≈ 0.9999999999999, floor(xp)=0 (wrong), floor(xp+eps)=1 (correct)
+                        xp(1) = xp(1) - floor(xp(1) + 1.0d-5)
+                        xp(2) = xp(2) - floor(xp(2) + 1.0d-5)
+                        xp(3) = xp(3) - floor(xp(3) + 1.0d-5)
 
                         ! Map to nearest grid index with periodic wrap
                         ip = nint(xp(1) * Na)
@@ -428,11 +428,7 @@ contains
         integer, intent(out) :: iostat
         character(len=*), optional, intent(out) :: iomsg
 
-        integer :: i
         logical, allocatable :: has_en(:)
-
-        ! suppress unused
-        if (cif%n_symops >= 0) continue
 
         allocate(has_en(n_energies), stat=iostat)
         if (iostat /= 0) return
@@ -678,59 +674,6 @@ contains
     !  Symmetry expansion (3D only)
     ! ═══════════════════════════════════════════════════════════════════════════
 
-    subroutine fill_nan_holes(energies, filled, nx, ny, nz)
-        !! One pass: replace each unfilled cell with the average of its
-        !! filled 6-face neighbours. Cells with no filled neighbours stay NaN.
-        real(dp), intent(inout) :: energies(:)
-        logical, intent(inout) :: filled(:)
-        integer, intent(in) :: nx, ny, nz
-        real(dp) :: sum_e, new_energies(size(energies))
-        logical :: new_filled(size(energies))
-        integer :: i, j, k, idx, ni, nj, nk, nidx, nn
-
-        new_energies = energies
-        new_filled = filled
-
-        do k = 1, nz
-            do j = 1, ny
-                do i = 1, nx
-                    idx = (k-1)*nx*ny + (j-1)*nx + i
-                    if (filled(idx)) cycle
-
-                    sum_e = 0.0_dp; nn = 0
-                    ! 6 face neighbours
-                    if (i > 1) then; nidx = idx - 1
-                        if (filled(nidx)) then; sum_e = sum_e + energies(nidx); nn = nn + 1; end if
-                    end if
-                    if (i < nx) then; nidx = idx + 1
-                        if (filled(nidx)) then; sum_e = sum_e + energies(nidx); nn = nn + 1; end if
-                    end if
-                    if (j > 1) then; nidx = idx - nx
-                        if (filled(nidx)) then; sum_e = sum_e + energies(nidx); nn = nn + 1; end if
-                    end if
-                    if (j < ny) then; nidx = idx + nx
-                        if (filled(nidx)) then; sum_e = sum_e + energies(nidx); nn = nn + 1; end if
-                    end if
-                    if (k > 1) then; nidx = idx - nx*ny
-                        if (filled(nidx)) then; sum_e = sum_e + energies(nidx); nn = nn + 1; end if
-                    end if
-                    if (k < nz) then; nidx = idx + nx*ny
-                        if (filled(nidx)) then; sum_e = sum_e + energies(nidx); nn = nn + 1; end if
-                    end if
-
-                    if (nn > 0) then
-                        new_energies(idx) = sum_e / real(nn, dp)
-                        new_filled(idx) = .true.
-                    end if
-                end do
-            end do
-        end do
-
-        energies = new_energies
-        filled = new_filled
-    end subroutine fill_nan_holes
-
-
     subroutine symmetry_expand_energies(scan_dir, iostat, iomsg)
         !! Read energies from cube, apply symmetry ops to expand local grid
         !! to full [0,1)^3 cell. Writes pes3d_expanded.cube.
@@ -742,7 +685,7 @@ contains
         integer, intent(out) :: iostat
         character(len=*), optional, intent(out) :: iomsg
 
-        integer, parameter :: MAX_SYM_OPS = 256, MAX_EXP = 100
+        integer, parameter :: MAX_SYM_OPS = 256
 
         integer :: nx, ny, nz, n_local, natom
         real(dp) :: fx_range(2), fy_range(2), fz_range(2)
@@ -756,14 +699,19 @@ contains
         integer :: exp_nx, exp_ny, exp_nz, n_exp
         real(dp), allocatable :: exp_energies(:)
         logical, allocatable :: exp_filled(:)
-        real(dp) :: sp_x, sp_y, sp_z, exp_sp_x, exp_sp_y, exp_sp_z
-        real(dp) :: local_frac(3), exp_frac(3)
+        real(dp) :: exp_sp_x, exp_sp_y, exp_sp_z
+        real(dp) :: exp_frac(3)
         real(dp) :: e_min_final, e_max_final
         real(dp) :: el
 
+        ! Orbit mapping — irreducible coords
+        integer :: n_irr, unit_irr, cix, ciy, ciz, cidx, ii
+        real(dp), allocatable :: irred_coords(:,:)
+        logical :: exists_irr
+
         character(len=1024) :: cube_path, exp_path, cif_path, line
-        integer :: unit_in, ios, i, iop, iexp, ei, ej, ek, n_filled, idx
-        logical :: exists, use_sym, found_op
+        integer :: unit_in, ios, i, j, iop, iexp, ei, ej, ek, n_filled
+        logical :: exists, use_sym
         character(len=4096), allocatable :: header_buf(:)
         integer :: n_header_lines
 
@@ -845,95 +793,133 @@ contains
         do i = 1, n_header_lines
             read(unit_in, '(a)') header_buf(i)
         end do
-        do i = 1, n_local
-            read(unit_in, *, iostat=ios) el
-            if (ios /= 0) then
-                local_energies(i) = 0.0_dp
-                local_has(i) = .false.
-                ios = 0
-            else
-                local_energies(i) = el
-                local_has(i) = .not. ieee_is_nan(el)
-            end if
+        do i = 1, n_local, 6
+            read(unit_in, *, iostat=ios) local_energies(i : min(i+5, n_local))
+            do j = i, min(i+5, n_local)
+                el = local_energies(j)
+                if (ios /= 0 .or. el /= el) then
+                    local_energies(j) = 0.0_dp
+                    local_has(j) = .false.
+                else
+                    local_has(j) = .true.
+                end if
+            end do
         end do
         close(unit_in)
 
-        ! Build expanded grid (anisotropic — preserve original spacing)
-        sp_x = (fx_range(2) - fx_range(1)) / max(1, nx - 1)
-        sp_y = (fy_range(2) - fy_range(1)) / max(1, ny - 1)
-        sp_z = (fz_range(2) - fz_range(1)) / max(1, nz - 1)
-        exp_nx = min(MAX_EXP, nint(1.0_dp / sp_x) + 1)
-        exp_ny = min(MAX_EXP, nint(1.0_dp / sp_y) + 1)
-        exp_nz = min(MAX_EXP, nint(1.0_dp / sp_z) + 1)
-        n_exp = exp_nx * exp_ny * exp_nz
+        ! ═══════════════════════════════════════════════════════════════
+        !  Read irreducible coordinates from sidecar file
+        ! ═══════════════════════════════════════════════════════════════
+        inquire(file=trim(scan_dir)//'/irred_coords.dat', exist=exists_irr)
+        if (.not. exists_irr) then
+            if (present(iomsg)) iomsg = 'No irred_coords.dat — symmetry expansion already done or not applicable'
+            deallocate(local_energies, local_has, header_buf)
+            return
+        end if
 
-        ! Uniform spacing for expanded grid (covers exactly [0, 1))
-        exp_sp_x = 1.0_dp / max(1, exp_nx - 1)
-        exp_sp_y = 1.0_dp / max(1, exp_ny - 1)
-        exp_sp_z = 1.0_dp / max(1, exp_nz - 1)
+        open(newunit=unit_irr, file=trim(scan_dir)//'/irred_coords.dat', &
+             status='old', action='read', iostat=ios)
+        if (ios /= 0) then
+            deallocate(local_energies, local_has, header_buf)
+            iostat = 1; return
+        end if
+        read(unit_irr, *) n_irr
+        allocate(irred_coords(3, n_irr), stat=ios)
+        if (ios /= 0) then
+            close(unit_irr); deallocate(local_energies, local_has, header_buf)
+            iostat = 1; return
+        end if
+        do ii = 1, n_irr
+            read(unit_irr, *, iostat=ios) irred_coords(:, ii)
+            if (ios /= 0) exit
+        end do
+        close(unit_irr)
+
+        ! ═══════════════════════════════════════════════════════════════
+        !  Build expanded grid with ORBIT spacing (1/N, NOT 1/(N-1))
+        !
+        !  Three grid systems:
+        !    Cube grid:    N points, spacing = 1/(N-1)  (coords i/(N-1))
+        !    Orbit grid:   N points, spacing = 1/N      (coords i/N)
+        !    Expanded:     same as orbit grid — N points, spacing 1/N
+        !
+        !  Symmetry maps i/N → j/N exactly (rational coords),
+        !  so nint(frac * N) gives the exact grid index.
+        ! ═══════════════════════════════════════════════════════════════
+        exp_nx = nx; exp_ny = ny; exp_nz = nz
+        n_exp = exp_nx * exp_ny * exp_nz
+        exp_sp_x = 1.0_dp / exp_nx
+        exp_sp_y = 1.0_dp / exp_ny
+        exp_sp_z = 1.0_dp / exp_nz
 
         allocate(exp_energies(n_exp), exp_filled(n_exp), stat=ios)
         if (ios /= 0) then
-            deallocate(local_energies, local_has, header_buf); iostat = 1; return
+            deallocate(local_energies, local_has, irred_coords, header_buf)
+            iostat = 1; return
         end if
         exp_energies = huge(1.0_dp)
         exp_filled = .false.
 
         ! ═══════════════════════════════════════════════════════════════
-        !  FORWARD orbit expansion: for each irreducible local grid
-        !  point with CASTEP energy, apply ALL symmetry operations
-        !  to map its energy to every symmetry-equivalent position
-        !  in the expanded grid.
-        !  The union of all orbits = full expanded grid (100% fill).
+        !  FORWARD orbit expansion
+        !
+        !  For each irreducible point k with coords (fx_k, fy_k, fz_k):
+        !    1. Map to cube grid index → look up CASTEP energy E_k
+        !       cube_idx = nint(fx*(N-1)) + 1  (nearest-neighbour)
+        !    2. Apply ALL symmetry operations:
+        !       exp_frac = R * (fx_k, fy_k, fz_k) + T
+        !    3. Map to expanded grid index:
+        !       ei = nint(exp_frac * N)   (exact mapping for orbit grid)
+        !    4. expanded[iexp] = min(expanded[iexp], E_k)
+        !
+        !  The union of all orbits covers 100% of the expanded grid.
         ! ═══════════════════════════════════════════════════════════════
         n_filled = 0
-        do idx = 1, n_local
-            if (.not. local_has(idx)) cycle  ! only irreducible points
+        do ii = 1, n_irr
+            ! Step 1: map irreducible coords (i/N) to cube grid index (j/(N-1))
+            cix = nint(irred_coords(1, ii) * (nx - 1)) + 1
+            ciy = nint(irred_coords(2, ii) * (ny - 1)) + 1
+            ciz = nint(irred_coords(3, ii) * (nz - 1)) + 1
+            ! Clamp to valid range
+            cix = max(1, min(nx, cix))
+            ciy = max(1, min(ny, ciy))
+            ciz = max(1, min(nz, ciz))
+            cidx = (ciz - 1) * nx * ny + (ciy - 1) * nx + cix
+            if (cidx < 1 .or. cidx > n_local) cycle
+            if (.not. local_has(cidx)) cycle  ! no energy for this irred point
 
-            ! Compute fractional coords of this local grid point
-            block
-                integer :: li, lj, lk
-                real(dp) :: src_frac(3)
-                lk = (idx - 1) / (nx * ny)
-                lj = modulo((idx - 1) / nx, ny)
-                li = modulo(idx - 1, nx)
-                src_frac(1) = fx_range(1) + li * sp_x
-                src_frac(2) = fy_range(1) + lj * sp_y
-                src_frac(3) = fz_range(1) + lk * sp_z
+            ! Step 2-3: forward symmetry expansion
+            do iop = 1, n_symops
+                exp_frac(1) = rot(1,1,iop)*irred_coords(1,ii) &
+                            + rot(1,2,iop)*irred_coords(2,ii) &
+                            + rot(1,3,iop)*irred_coords(3,ii) + trans(1,iop)
+                exp_frac(2) = rot(2,1,iop)*irred_coords(1,ii) &
+                            + rot(2,2,iop)*irred_coords(2,ii) &
+                            + rot(2,3,iop)*irred_coords(3,ii) + trans(2,iop)
+                exp_frac(3) = rot(3,1,iop)*irred_coords(1,ii) &
+                            + rot(3,2,iop)*irred_coords(2,ii) &
+                            + rot(3,3,iop)*irred_coords(3,ii) + trans(3,iop)
+                call wrap_to_unit(exp_frac(1))
+                call wrap_to_unit(exp_frac(2))
+                call wrap_to_unit(exp_frac(3))
 
-                ! Apply all symmetry operations (forward)
-                do iop = 1, n_symops
-                    exp_frac(1) = rot(1,1,iop)*src_frac(1) &
-                                + rot(1,2,iop)*src_frac(2) &
-                                + rot(1,3,iop)*src_frac(3) + trans(1,iop)
-                    exp_frac(2) = rot(2,1,iop)*src_frac(1) &
-                                + rot(2,2,iop)*src_frac(2) &
-                                + rot(2,3,iop)*src_frac(3) + trans(2,iop)
-                    exp_frac(3) = rot(3,1,iop)*src_frac(1) &
-                                + rot(3,2,iop)*src_frac(2) &
-                                + rot(3,3,iop)*src_frac(3) + trans(3,iop)
-                    call wrap_to_unit(exp_frac(1))
-                    call wrap_to_unit(exp_frac(2))
-                    call wrap_to_unit(exp_frac(3))
+                ! Map to expanded grid using orbit spacing (nint(x * N))
+                ei = nint(exp_frac(1) * exp_nx)
+                ej = nint(exp_frac(2) * exp_ny)
+                ek = nint(exp_frac(3) * exp_nz)
+                ei = modulo(ei, exp_nx)
+                ej = modulo(ej, exp_ny)
+                ek = modulo(ek, exp_nz)
+                iexp = ek * exp_nx * exp_ny + ej * exp_nx + ei + 1
 
-                    ! Map to expanded grid index
-                    ei = nint(exp_frac(1) / exp_sp_x)
-                    ej = nint(exp_frac(2) / exp_sp_y)
-                    ek = nint(exp_frac(3) / exp_sp_z)
-                    ei = modulo(ei, exp_nx)
-                    ej = modulo(ej, exp_ny)
-                    ek = modulo(ek, exp_nz)
-                    iexp = ek * exp_nx * exp_ny + ej * exp_nx + ei + 1
-
-                    if (iexp >= 1 .and. iexp <= n_exp) then
-                        if (.not. exp_filled(iexp) .or. &
-                            local_energies(idx) < exp_energies(iexp)) then
-                            exp_energies(iexp) = local_energies(idx)
-                            exp_filled(iexp) = .true.
-                        end if
+                if (iexp >= 1 .and. iexp <= n_exp) then
+                    if (.not. exp_filled(iexp) .or. &
+                        local_energies(cidx) < exp_energies(iexp)) then
+                        exp_energies(iexp) = local_energies(cidx)
+                        exp_filled(iexp) = .true.
                     end if
-                end do
-            end block
+                end if
+            end do
         end do
 
         ! Count filled points
@@ -951,7 +937,7 @@ contains
         end do
 
         ! Summary
-        write(*, '(a)') '  ── Symmetry Expansion (reverse) ──'
+        write(*, '(a)') '  ── Symmetry Expansion (forward orbit) ──'
         write(*, '(a, i0, a, i0, a, i0, a, i0)') '  Expanded grid: ', &
             exp_nx, ' x ', exp_ny, ' x ', exp_nz, ' = ', n_exp
         write(*, '(a, i0, a, i0)') '  Filled: ', n_filled, ' / ', n_exp
@@ -969,7 +955,7 @@ contains
         call write_expanded_cube(exp_path, header_buf, n_header_lines, &
             exp_energies, exp_filled, exp_nx, exp_ny, exp_nz, ios)
 
-        deallocate(local_energies, local_has, exp_energies, exp_filled, header_buf)
+        deallocate(local_energies, local_has, irred_coords, exp_energies, exp_filled, header_buf)
     end subroutine symmetry_expand_energies
 
 
@@ -1092,11 +1078,6 @@ contains
         val = val / val   ! 0/0 → NaN on virtually all IEEE 754 systems
     end function ieee_nan
 
-    function ieee_is_nan(x) result(is_nan)
-        real(dp), intent(in) :: x
-        logical :: is_nan
-        is_nan = .not. (x == x)   ! NaN is the only value not equal to itself
-    end function ieee_is_nan
 
 
     ! ── Cube header parser ──
@@ -1174,8 +1155,7 @@ contains
         !! and remove symmetry flag (already expanded).
         character(len=*), intent(in) :: json_in
         character(len=*), intent(out) :: json_out
-        character(len=64) :: pat
-        integer :: kp, ep
+        integer :: kp
 
         json_out = json_in
 
@@ -1218,10 +1198,11 @@ contains
         integer, intent(out) :: ios
 
         integer :: unit_out, i, n_total, natom, old_nx, old_ny, old_nz
+        integer :: ix, iy, iz, idx, counter
         real(dp) :: e_val, origin(3), dv(3,3)
         character(len=4096) :: line
 
-        n_total = nx * ny * nz
+        n_total = (nx + 1) * (ny + 1) * (nz + 1)
 
         open(newunit=unit_out, file=trim(exp_path), status='replace', action='write', iostat=ios)
         if (ios /= 0) return
@@ -1234,41 +1215,48 @@ contains
 
         ! Re-parse natom and origin from original header
         read(header_buf(3), *) natom, origin(1), origin(2), origin(3)
-
-        ! Recompute voxel vectors for expanded grid
-        ! Read original dv from header_buf(4-6), scale by (old_n-1)/(new_n-1)
-        ! ...complex. For now, write the header with placeholder voxel info
-        ! and let the metadata JSON carry the lattice.
-        read(header_buf(3), *) natom, origin(1), origin(2), origin(3)
         write(unit_out, '(i5,3f12.6)') natom, origin(1), origin(2), origin(3)
 
-        ! Read old voxel vectors and scale
+        ! Read old voxel vectors and scale: dv_new = dv_old * (old_n-1) / new_n
+        !   old cube: N points,  spacing 1/(N-1),  dv_old = lattice/(N-1)
+        !   new cube: N+1 points, spacing 1/N,      dv_new = lattice/N
+        !   ratio: dv_new/dv_old = (lattice/N) / (lattice/(N-1)) = (N-1)/N
         read(header_buf(4), *) old_nx, dv(1,1), dv(2,1), dv(3,1)
         read(header_buf(5), *) old_ny, dv(1,2), dv(2,2), dv(3,2)
         read(header_buf(6), *) old_nz, dv(1,3), dv(2,3), dv(3,3)
-        ! Scale: old_n-1 new voxels cover same domain
-        if (old_nx > 1) dv(:,1) = dv(:,1) * real(old_nx-1, dp) / real(max(1, nx-1), dp)
-        if (old_ny > 1) dv(:,2) = dv(:,2) * real(old_ny-1, dp) / real(max(1, ny-1), dp)
-        if (old_nz > 1) dv(:,3) = dv(:,3) * real(old_nz-1, dp) / real(max(1, nz-1), dp)
+        if (old_nx > 1) dv(:,1) = dv(:,1) * real(old_nx - 1, dp) / real(nx, dp)
+        if (old_ny > 1) dv(:,2) = dv(:,2) * real(old_ny - 1, dp) / real(ny, dp)
+        if (old_nz > 1) dv(:,3) = dv(:,3) * real(old_nz - 1, dp) / real(nz, dp)
 
-        write(unit_out, '(i5,3f12.6)') nx, dv(1,1), dv(2,1), dv(3,1)
-        write(unit_out, '(i5,3f12.6)') ny, dv(1,2), dv(2,2), dv(3,2)
-        write(unit_out, '(i5,3f12.6)') nz, dv(1,3), dv(2,3), dv(3,3)
+        ! N+1 format: write nx+1 (N intervals of width 1/N covering [0,1])
+        write(unit_out, '(i5,3f12.6)') nx + 1, dv(1,1), dv(2,1), dv(3,1)
+        write(unit_out, '(i5,3f12.6)') ny + 1, dv(1,2), dv(2,2), dv(3,2)
+        write(unit_out, '(i5,3f12.6)') nz + 1, dv(1,3), dv(2,3), dv(3,3)
 
         ! Atom lines unchanged (lines 7..6+natom)
         do i = 7, n_header_lines
             write(unit_out, '(a)') trim(header_buf(i))
         end do
 
-        ! Energy data
-        do i = 1, n_total
-            if (has_energy(i)) then
-                e_val = energies(i)
-            else
-                e_val = ieee_nan()
-            end if
-            write(unit_out, '(es13.5)', advance='no') e_val
-            if (mod(i, 6) == 0 .or. i == n_total) write(unit_out, '(a)') ''
+        ! Energy data: (nx+1)*(ny+1)*(nz+1) = N+1 format with boundary wrap
+        ! Boundary point (idx=nx) wraps to idx=0 → periodic consistency
+        counter = 0
+        do iz = 1, nz + 1
+            do iy = 1, ny + 1
+                do ix = 1, nx + 1
+                    idx = modulo(iz - 1, nz) * nx * ny &
+                        + modulo(iy - 1, ny) * nx &
+                        + modulo(ix - 1, nx) + 1
+                    if (has_energy(idx)) then
+                        e_val = energies(idx)
+                    else
+                        e_val = ieee_nan()
+                    end if
+                    counter = counter + 1
+                    write(unit_out, '(es13.5)', advance='no') e_val
+                    if (mod(counter, 6) == 0 .or. counter == n_total) write(unit_out, '(a)') ''
+                end do
+            end do
         end do
 
         close(unit_out)
@@ -1305,77 +1293,6 @@ contains
     end subroutine parse_cif_symops
 
 
-    subroutine parse_symops_from_json(json_path, rot, trans, n_symops, max_ops, ios)
-        character(len=*), intent(in) :: json_path
-        integer, intent(in) :: max_ops
-        integer, intent(out) :: rot(3,3,max_ops), n_symops, ios
-        real(dp), intent(out) :: trans(3,max_ops)
-        character(len=4096) :: line
-        integer :: unit, iop
-
-        n_symops = 0; ios = 0
-        rot = 0; trans = 0.0_dp
-
-        open(newunit=unit, file=trim(json_path), status='old', action='read', iostat=ios)
-        if (ios /= 0) return
-
-        iop = 0
-        do
-            read(unit, '(a)', iostat=ios) line
-            if (ios /= 0) exit
-            if (index(line, '"rot"') > 0) then
-                iop = iop + 1
-                if (iop > max_ops) exit
-                call parse_symop_block(unit, line, rot(:,:,iop), trans(:,iop), ios)
-            end if
-        end do
-        close(unit)
-        n_symops = iop
-    end subroutine parse_symops_from_json
-
-
-    subroutine parse_symop_block(unit, first_line, rot_mat, trans_vec, ios)
-        integer, intent(in) :: unit
-        character(len=*), intent(in) :: first_line
-        integer, intent(out) :: rot_mat(3,3), ios
-        real(dp), intent(out) :: trans_vec(3)
-        character(len=4096) :: line
-
-        ios = 0
-        call parse_rot_row(first_line, rot_mat(1,:))
-        read(unit, '(a)', iostat=ios) line
-        if (ios == 0) call parse_rot_row(line, rot_mat(2,:))
-        read(unit, '(a)', iostat=ios) line
-        if (ios == 0) call parse_rot_row(line, rot_mat(3,:))
-        call parse_trans_from_line(line, trans_vec)
-        if (all(abs(trans_vec) < 1.0e-10_dp)) call parse_trans_from_line(first_line, trans_vec)
-    end subroutine parse_symop_block
-
-
-    subroutine parse_rot_row(line, row)
-        character(len=*), intent(in) :: line
-        integer, intent(out) :: row(3)
-        integer :: p1, p2, ios
-        row = 0
-        p1 = index(line, '[')
-        p2 = index(line, ']')
-        if (p1 > 0 .and. p2 > p1) read(line(p1+1:p2-1), *, iostat=ios) row(1), row(2), row(3)
-    end subroutine parse_rot_row
-
-
-    subroutine parse_trans_from_line(line, trans)
-        character(len=*), intent(in) :: line
-        real(dp), intent(out) :: trans(3)
-        integer :: p1, p2, ios
-        trans = 0.0_dp
-        p1 = index(line, '"trans":')
-        if (p1 > 0) then
-            p1 = index(line(p1:), '[') + p1
-            p2 = index(line(p1:), ']') + p1 - 1
-            if (p1 > 0 .and. p2 > p1) read(line(p1:p2-1), *, iostat=ios) trans(1), trans(2), trans(3)
-        end if
-    end subroutine parse_trans_from_line
-
 
     ! ── JSON utility helpers ──
 
@@ -1396,17 +1313,6 @@ contains
         val = line(q1+1:q2-1)
     end subroutine extract_json_string_by_key
 
-
-    subroutine extract_json_int(line, key, val, ios)
-        character(len=*), intent(in) :: line, key
-        integer, intent(out) :: val, ios
-        integer :: kp, cp
-        kp = index(line, trim(key))
-        if (kp == 0) then; ios = 1; return; end if
-        cp = index(line(kp:), ':')
-        if (cp == 0) then; ios = 1; return; end if
-        read(line(kp+cp:), *, iostat=ios) val
-    end subroutine extract_json_int
 
 
     subroutine extract_json_two_reals(line, r1, r2)
@@ -1554,7 +1460,8 @@ contains
 
     pure subroutine wrap_to_unit(x)
         real(dp), intent(inout) :: x
-        x = x - floor(x)
+        real(dp), parameter :: EPS = 1.0d-5
+        x = x - floor(x + EPS)
         if (x < 0.0_dp) x = x + 1.0_dp
         if (x >= 1.0_dp .or. x < 0.0_dp) x = x - aint(x)
     end subroutine wrap_to_unit

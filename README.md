@@ -306,7 +306,7 @@ CASTEP_Suite/
 │   ├── poscastep_menu.f90   # PosCASTEP post-processing + viewer integration
 │   ├── crystal_json.f90     # JSON bridge for Rust crystal-viewer
 │   ├── polarizability.f90   # Static polarizability (AIMD fluctuation method)
-│   ├── pes_scan.f90         # PES scan: batch generation + result collection
+│   ├── pes.f90              # Unified PES scan (2D/3D), orbit mapping, symmetry expansion
 │   ├── drift_analysis.f90   # Drift rate diagnostics (not compiled, dev artifact)
 │   └── main.f90             # Entry point, suite menu dispatcher
 └── crystal-viewer/          # Rust/Bevy 3D viewer subproject

@@ -9,6 +9,7 @@ use bevy::render::render_asset::RenderAssetUsages;
 use crate::crystal::Lattice;
 
 /// Upload the 3D energy field as a GPU 3D texture.
+#[allow(dead_code)]  // volume render placeholder (under development)
 pub fn upload_volume_texture(
     field: &[f32], nx: usize, ny: usize, nz: usize,
 ) -> Image {
