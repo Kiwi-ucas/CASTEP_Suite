@@ -262,18 +262,25 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
 
 ### 9. PES Scan (Potential Energy Surface)
 
-2D potential energy surface scan with constrained geometry optimization and 3D visualization:
+2D/3D potential energy surface scan with symmetry reduction and isosurface visualization:
 
-- **Batch generation**: select a mobile atom, scan plane (XY/XZ/YZ), fractional coordinate range, and grid size → generates `grid_001_001/` … `grid_Nx_Ny/` subdirectories, each with `scan.cell` + `scan.param` + `IONIC_CONSTRAINTS`
-- **PreCASTEP integration**: user configures CASTEP parameters (task, XC, cutoff, etc.) via the standard PreCASTEP menu before generation
-- **Result collection**: parses all `.castep` files for "Final energy", writes `pes_metadata.json` with energy grid
-- **3D surface visualization**: launches crystal-viewer with energy surface rendered as a colored mesh
-  - Jet colormap: blue (low energy) → cyan → green → yellow → red (high energy)
-  - Surface height proportional to energy along the plane normal
-  - Double-sided rendering visible from any angle
-  - S key toggles surface visibility
-  - Right-drag to rotate, scroll to zoom, standard viewer controls
-- **No-energies mode**: viewer shows structure atoms + cell frame before CASTEP runs
+**2D PES**: single-atom constrained scan on a plane → colored energy surface mesh in viewer.
+
+**3D PES** with **orbit mapping** symmetry reduction:
+- Automatically detects space group symmetry from CIF files
+- Lays full uniform grid over the unit cell, groups symmetry-equivalent points into orbits
+- Each orbit contributes exactly one irreducible representative — the minimal CASTEP scan set
+- e.g., Li6PS5Cl (F-43m) with 5×5×5 grid: 125 → 9 irreducible points (93% reduction)
+- Generates `irred_NNNNN` subdirectories (or `grid_III_JJJ_KKK` for non-symmetry scans)
+- Forward orbit expansion fills the full-cell output grid at 100% coverage
+- **Collection**: auto-detects directory format, reads `irred_coords.dat` sidecar for mapping
+- **3D viewer**: MC isosurface (Mode 4), volume render (5), slice planes (6); `-/+` adjust isovalue; semi-transparent rendering
+
+**2D PES**:
+- Select mobile atom, scan plane (XY/XZ/YZ), fractional coordinate range, and grid size
+- Generates `grid_001_001/` … `grid_Nx_Ny/` subdirectories with CASTEP input + constraints
+- Result collection parses `.castep` files, writes `scan.cube` with energy grid
+- 3D viewer: colored surface mesh (jet colormap), S toggles visibility, -/+ adjusts color clip
 
 ## Project structure
 

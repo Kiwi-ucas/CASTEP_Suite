@@ -14,7 +14,7 @@ module pes
 
     ! ── Public types and constants ──
     public :: pes_grid_t
-    public :: compute_local_grid_bounds
+    public :: get_irreducible_grid
     public :: generate_pes_grid_points
     public :: write_pes_cube
     public :: collect_pes_energies
@@ -42,6 +42,8 @@ module pes
         logical  :: use_symmetry = .false.          ! whether space-group symmetry is used
         real(dp) :: ref_frac(3) = 0.0_dp            ! reference atom original fractional coords
         real(dp) :: half_dist(3) = 0.0_dp           ! symmetry half-distance per axis
+        integer  :: n_irred = 0                     ! number of irreducible grid points
+        real(dp), allocatable :: irred_coords(:,:)   ! (3, n_irred) irreducible coords
     end type pes_grid_t
 
 contains
@@ -172,69 +174,84 @@ contains
     !  Symmetry-aware local grid bounds (3D only)
     ! ═══════════════════════════════════════════════════════════════════════════
 
-    subroutine compute_local_grid_bounds(ref_idx, atoms, n_atoms, sym_ops, n_symops, &
-                                          half_dist, iostat, iomsg)
-        !! For the selected reference atom, compute the half-distance along each
-        !! fractional axis to the nearest space-group-equivalent atom.
-        !! Uses minimum-image convention. Clamps to [1/MAX_GRID_3D, 0.3].
-        integer, intent(in) :: ref_idx
-        type(atom_t), intent(in) :: atoms(:)
-        integer, intent(in) :: n_atoms
+    subroutine get_irreducible_grid(Na, Nb, Nc, sym_ops, n_symops, &
+                                     n_irred, irred_coords, iostat)
+        !! Grid symmetry reduction via orbit mapping.
+        !! Lays a uniform Na×Nb×Nc grid over the full cell [0,1)^3,
+        !! then uses symmetry operations to group equivalent points
+        !! into orbits.  Each orbit contributes exactly one irreducible
+        !! representative — the minimal set of CASTEP scan points.
+        integer, intent(in) :: Na, Nb, Nc, n_symops
         type(sym_op_t), intent(in) :: sym_ops(:)
-        integer, intent(in) :: n_symops
-        real(dp), intent(out) :: half_dist(3)
+        integer, intent(out) :: n_irred
+        real(dp), allocatable, intent(out) :: irred_coords(:,:)
         integer, intent(out) :: iostat
-        character(len=*), optional, intent(out) :: iomsg
 
-        real(dp) :: frac0(3), new_frac(3), delta(3), min_dist(3)
-        integer :: iop
-        logical :: found_other
-        real(dp), parameter :: TOL = 1.0e-5_dp, MAX_HALF = 0.3_dp
+        logical, allocatable :: visited(:,:,:)
+        real(dp) :: x(3), xp(3), r8
+        integer :: i, j, k, s, ip, jp, kp, max_pts
+        real(dp), parameter :: TOL = 1.0e-10_dp
 
-        iostat = 0
-        half_dist = MAX_HALF
+        iostat = 0; n_irred = 0
+        max_pts = Na * Nb * Nc
 
-        if (ref_idx < 1 .or. ref_idx > n_atoms) then
-            iostat = 1
-            if (present(iomsg)) iomsg = 'Reference atom index out of range'
-            return
+        allocate(visited(0:Na-1, 0:Nb-1, 0:Nc-1), stat=iostat)
+        if (iostat /= 0) return
+        visited = .false.
+
+        allocate(irred_coords(3, max_pts), stat=iostat)
+        if (iostat /= 0) then
+            deallocate(visited); return
         end if
 
-        frac0 = [atoms(ref_idx)%x, atoms(ref_idx)%y, atoms(ref_idx)%z]
-        min_dist = 1.0_dp
+        do k = 0, Nc - 1
+            do j = 0, Nb - 1
+                do i = 0, Na - 1
+                    if (visited(i, j, k)) cycle
 
-        if (n_symops <= 1) return  ! P1: no symmetry → keep default MAX_HALF
+                    ! Record irreducible representative
+                    n_irred = n_irred + 1
+                    irred_coords(1, n_irred) = real(i, dp) / real(Na, dp)
+                    irred_coords(2, n_irred) = real(j, dp) / real(Nb, dp)
+                    irred_coords(3, n_irred) = real(k, dp) / real(Nc, dp)
+                    x = irred_coords(:, n_irred)
 
-        do iop = 1, n_symops
-            new_frac(1) = sym_ops(iop)%rot(1,1)*frac0(1) &
-                        + sym_ops(iop)%rot(1,2)*frac0(2) &
-                        + sym_ops(iop)%rot(1,3)*frac0(3) + sym_ops(iop)%trans(1)
-            new_frac(2) = sym_ops(iop)%rot(2,1)*frac0(1) &
-                        + sym_ops(iop)%rot(2,2)*frac0(2) &
-                        + sym_ops(iop)%rot(2,3)*frac0(3) + sym_ops(iop)%trans(2)
-            new_frac(3) = sym_ops(iop)%rot(3,1)*frac0(1) &
-                        + sym_ops(iop)%rot(3,2)*frac0(2) &
-                        + sym_ops(iop)%rot(3,3)*frac0(3) + sym_ops(iop)%trans(3)
+                    ! Mark entire symmetry orbit as visited
+                    do s = 1, n_symops
+                        xp(1) = sym_ops(s)%rot(1,1)*x(1) &
+                              + sym_ops(s)%rot(1,2)*x(2) &
+                              + sym_ops(s)%rot(1,3)*x(3) + sym_ops(s)%trans(1)
+                        xp(2) = sym_ops(s)%rot(2,1)*x(1) &
+                              + sym_ops(s)%rot(2,2)*x(2) &
+                              + sym_ops(s)%rot(2,3)*x(3) + sym_ops(s)%trans(2)
+                        xp(3) = sym_ops(s)%rot(3,1)*x(1) &
+                              + sym_ops(s)%rot(3,2)*x(2) &
+                              + sym_ops(s)%rot(3,3)*x(3) + sym_ops(s)%trans(3)
 
-            call wrap_to_unit(new_frac(1))
-            call wrap_to_unit(new_frac(2))
-            call wrap_to_unit(new_frac(3))
+                        ! Wrap to [0, 1)
+                        xp(1) = xp(1) - floor(xp(1))
+                        xp(2) = xp(2) - floor(xp(2))
+                        xp(3) = xp(3) - floor(xp(3))
 
-            delta = new_frac - frac0
-            delta = delta - anint(delta)   ! minimum image
+                        ! Map to nearest grid index with periodic wrap
+                        ip = nint(xp(1) * Na)
+                        jp = nint(xp(2) * Nb)
+                        kp = nint(xp(3) * Nc)
+                        ip = modulo(ip, Na)
+                        jp = modulo(jp, Nb)
+                        kp = modulo(kp, Nc)
 
-            found_other = abs(delta(1)) > TOL .or. abs(delta(2)) > TOL .or. abs(delta(3)) > TOL
-            if (found_other) then
-                if (abs(delta(1)) > TOL .and. abs(delta(1)) < min_dist(1)) min_dist(1) = abs(delta(1))
-                if (abs(delta(2)) > TOL .and. abs(delta(2)) < min_dist(2)) min_dist(2) = abs(delta(2))
-                if (abs(delta(3)) > TOL .and. abs(delta(3)) < min_dist(3)) min_dist(3) = abs(delta(3))
-            end if
+                        visited(ip, jp, kp) = .true.
+                    end do
+                end do
+            end do
         end do
 
-        if (min_dist(1) < 1.0_dp) half_dist(1) = max(1.0_dp/MAX_GRID_3D, min(MAX_HALF, min_dist(1)*0.45_dp))
-        if (min_dist(2) < 1.0_dp) half_dist(2) = max(1.0_dp/MAX_GRID_3D, min(MAX_HALF, min_dist(2)*0.45_dp))
-        if (min_dist(3) < 1.0_dp) half_dist(3) = max(1.0_dp/MAX_GRID_3D, min(MAX_HALF, min_dist(3)*0.45_dp))
-    end subroutine compute_local_grid_bounds
+        deallocate(visited)
+        write(*, '(a, i0, a, i0, a)') '  ── Orbit Mapping ──'
+        write(*, '(a, i0, a, i0)') '  Full grid: ', max_pts, &
+            '  →  Irreducible: ', n_irred
+    end subroutine get_irreducible_grid
 
 
     ! ═══════════════════════════════════════════════════════════════════════════
@@ -523,29 +540,73 @@ contains
                 end do
             end do
         else
-            do k = 1, nz
-                do j = 1, ny
-                    do i = 1, nx
-                        write(grid_dir, '(a,a,i3.3,a,i3.3,a,i3.3)') &
-                            trim(scan_dir), '/grid_', i, '_', j, '_', k
-                        castep_file = find_castep_in_dir(grid_dir)
-                        if (len_trim(castep_file) == 0) then
-                            missing = missing + 1; cycle
-                        end if
-                        e_val = parse_castep_energy(castep_file, ios)
-                        idx = (k-1)*nx*ny + (j-1)*nx + i
-                        if (ios == 0) then
-                            energies(idx) = e_val
-                            has_energy(idx) = .true.
-                            collected = collected + 1
-                            if (e_val < e_min) e_min = e_val
-                            if (e_val > e_max) e_max = e_val
-                        else
-                            missing = missing + 1
-                        end if
+            ! Detect format: irred_coords.dat (orbit mapping) or grid_III_JJJ_KKK
+            inquire(file=trim(scan_dir)//'/irred_coords.dat', exist=exists)
+            if (exists) then
+                ! Orbit-mapping format: read irred coords, map to cube indices
+                block
+                    integer :: unit_irr, n_irr, ii, ix, iy, iz, cidx
+                    real(dp) :: fx, fy, fz
+                    open(newunit=unit_irr, file=trim(scan_dir)//'/irred_coords.dat', &
+                         status='old', action='read', iostat=ios)
+                    if (ios == 0) then
+                        read(unit_irr, *) n_irr
+                        do ii = 1, n_irr
+                            read(unit_irr, *, iostat=ios) fx, fy, fz
+                            if (ios /= 0) exit
+                            ! Map fractional coords to cube grid index
+                            ix = nint(fx * (nx - 1)) + 1
+                            iy = nint(fy * (ny - 1)) + 1
+                            iz = nint(fz * (nz - 1)) + 1
+                            cidx = (iz - 1) * nx * ny + (iy - 1) * nx + ix
+                            if (cidx < 1 .or. cidx > n_total) cycle
+                            ! Look for .castep in irred_NNNNN
+                            write(grid_dir, '(a,a,i5.5)') trim(scan_dir), '/irred_', ii
+                            castep_file = find_castep_in_dir(grid_dir)
+                            if (len_trim(castep_file) > 0) then
+                                e_val = parse_castep_energy(castep_file, ios)
+                                if (ios == 0) then
+                                    energies(cidx) = e_val
+                                    has_energy(cidx) = .true.
+                                    collected = collected + 1
+                                    if (e_val < e_min) e_min = e_val
+                                    if (e_val > e_max) e_max = e_val
+                                else
+                                    missing = missing + 1
+                                end if
+                            else
+                                missing = missing + 1
+                            end if
+                        end do
+                        close(unit_irr)
+                    end if
+                end block
+            else
+                ! Rectangular grid format
+                do k = 1, nz
+                    do j = 1, ny
+                        do i = 1, nx
+                            write(grid_dir, '(a,a,i3.3,a,i3.3,a,i3.3)') &
+                                trim(scan_dir), '/grid_', i, '_', j, '_', k
+                            castep_file = find_castep_in_dir(grid_dir)
+                            if (len_trim(castep_file) == 0) then
+                                missing = missing + 1; cycle
+                            end if
+                            e_val = parse_castep_energy(castep_file, ios)
+                            idx = (k-1)*nx*ny + (j-1)*nx + i
+                            if (ios == 0) then
+                                energies(idx) = e_val
+                                has_energy(idx) = .true.
+                                collected = collected + 1
+                                if (e_val < e_min) e_min = e_val
+                                if (e_val > e_max) e_max = e_val
+                            else
+                                missing = missing + 1
+                            end if
+                        end do
                     end do
                 end do
-            end do
+            end if
         end if
 
         ! Summary
@@ -695,14 +756,14 @@ contains
         integer :: exp_nx, exp_ny, exp_nz, n_exp
         real(dp), allocatable :: exp_energies(:)
         logical, allocatable :: exp_filled(:)
-        real(dp) :: sp_x, sp_y, sp_z, sp_uniform
+        real(dp) :: sp_x, sp_y, sp_z, exp_sp_x, exp_sp_y, exp_sp_z
         real(dp) :: local_frac(3), exp_frac(3)
         real(dp) :: e_min_final, e_max_final
         real(dp) :: el
 
         character(len=1024) :: cube_path, exp_path, cif_path, line
-        integer :: unit_in, ios, i, j, k, idx, iop, iexp, ei, ej, ek, iter, n_filled
-        logical :: exists, use_sym
+        integer :: unit_in, ios, i, iop, iexp, ei, ej, ek, n_filled, idx
+        logical :: exists, use_sym, found_op
         character(len=4096), allocatable :: header_buf(:)
         integer :: n_header_lines
 
@@ -806,6 +867,11 @@ contains
         exp_nz = min(MAX_EXP, nint(1.0_dp / sp_z) + 1)
         n_exp = exp_nx * exp_ny * exp_nz
 
+        ! Uniform spacing for expanded grid (covers exactly [0, 1))
+        exp_sp_x = 1.0_dp / max(1, exp_nx - 1)
+        exp_sp_y = 1.0_dp / max(1, exp_ny - 1)
+        exp_sp_z = 1.0_dp / max(1, exp_nz - 1)
+
         allocate(exp_energies(n_exp), exp_filled(n_exp), stat=ios)
         if (ios /= 0) then
             deallocate(local_energies, local_has, header_buf); iostat = 1; return
@@ -813,41 +879,66 @@ contains
         exp_energies = huge(1.0_dp)
         exp_filled = .false.
 
-        ! Apply FORWARD symmetry ops to each local grid point
-        do iop = 1, n_symops
-            do k = 0, nz - 1
-                local_frac(3) = fz_range(1) + k * sp_z
-                do j = 0, ny - 1
-                    local_frac(2) = fy_range(1) + j * sp_y
-                    do i = 0, nx - 1
-                        local_frac(1) = fx_range(1) + i * sp_x
-                        exp_frac(1) = rot(1,1,iop)*local_frac(1) + rot(1,2,iop)*local_frac(2) &
-                                    + rot(1,3,iop)*local_frac(3) + trans(1,iop)
-                        exp_frac(2) = rot(2,1,iop)*local_frac(1) + rot(2,2,iop)*local_frac(2) &
-                                    + rot(2,3,iop)*local_frac(3) + trans(2,iop)
-                        exp_frac(3) = rot(3,1,iop)*local_frac(1) + rot(3,2,iop)*local_frac(2) &
-                                    + rot(3,3,iop)*local_frac(3) + trans(3,iop)
-                        call wrap_to_unit(exp_frac(1))
-                        call wrap_to_unit(exp_frac(2))
-                        call wrap_to_unit(exp_frac(3))
-                        ei = nint(exp_frac(1) / sp_x)
-                        ej = nint(exp_frac(2) / sp_y)
-                        ek = nint(exp_frac(3) / sp_z)
-                        ei = modulo(ei, exp_nx)
-                        ej = modulo(ej, exp_ny)
-                        ek = modulo(ek, exp_nz)
-                        idx = k * nx * ny + j * nx + i + 1
-                        iexp = ek * exp_nx * exp_ny + ej * exp_nx + ei + 1
-                        if (iexp >= 1 .and. iexp <= n_exp) then
-                            if (local_has(idx) .and. &
-                                (.not. exp_filled(iexp) .or. local_energies(idx) < exp_energies(iexp))) then
-                                exp_energies(iexp) = local_energies(idx)
-                                exp_filled(iexp) = .true.
-                            end if
+        ! ═══════════════════════════════════════════════════════════════
+        !  FORWARD orbit expansion: for each irreducible local grid
+        !  point with CASTEP energy, apply ALL symmetry operations
+        !  to map its energy to every symmetry-equivalent position
+        !  in the expanded grid.
+        !  The union of all orbits = full expanded grid (100% fill).
+        ! ═══════════════════════════════════════════════════════════════
+        n_filled = 0
+        do idx = 1, n_local
+            if (.not. local_has(idx)) cycle  ! only irreducible points
+
+            ! Compute fractional coords of this local grid point
+            block
+                integer :: li, lj, lk
+                real(dp) :: src_frac(3)
+                lk = (idx - 1) / (nx * ny)
+                lj = modulo((idx - 1) / nx, ny)
+                li = modulo(idx - 1, nx)
+                src_frac(1) = fx_range(1) + li * sp_x
+                src_frac(2) = fy_range(1) + lj * sp_y
+                src_frac(3) = fz_range(1) + lk * sp_z
+
+                ! Apply all symmetry operations (forward)
+                do iop = 1, n_symops
+                    exp_frac(1) = rot(1,1,iop)*src_frac(1) &
+                                + rot(1,2,iop)*src_frac(2) &
+                                + rot(1,3,iop)*src_frac(3) + trans(1,iop)
+                    exp_frac(2) = rot(2,1,iop)*src_frac(1) &
+                                + rot(2,2,iop)*src_frac(2) &
+                                + rot(2,3,iop)*src_frac(3) + trans(2,iop)
+                    exp_frac(3) = rot(3,1,iop)*src_frac(1) &
+                                + rot(3,2,iop)*src_frac(2) &
+                                + rot(3,3,iop)*src_frac(3) + trans(3,iop)
+                    call wrap_to_unit(exp_frac(1))
+                    call wrap_to_unit(exp_frac(2))
+                    call wrap_to_unit(exp_frac(3))
+
+                    ! Map to expanded grid index
+                    ei = nint(exp_frac(1) / exp_sp_x)
+                    ej = nint(exp_frac(2) / exp_sp_y)
+                    ek = nint(exp_frac(3) / exp_sp_z)
+                    ei = modulo(ei, exp_nx)
+                    ej = modulo(ej, exp_ny)
+                    ek = modulo(ek, exp_nz)
+                    iexp = ek * exp_nx * exp_ny + ej * exp_nx + ei + 1
+
+                    if (iexp >= 1 .and. iexp <= n_exp) then
+                        if (.not. exp_filled(iexp) .or. &
+                            local_energies(idx) < exp_energies(iexp)) then
+                            exp_energies(iexp) = local_energies(idx)
+                            exp_filled(iexp) = .true.
                         end if
-                    end do
+                    end if
                 end do
-            end do
+            end block
+        end do
+
+        ! Count filled points
+        do iexp = 1, n_exp
+            if (exp_filled(iexp)) n_filled = n_filled + 1
         end do
 
         ! Compute final energy range
@@ -859,18 +950,24 @@ contains
             end if
         end do
 
-        ! Write expanded cube (header from original, with updated dims)
-        exp_path = trim(scan_dir) // '/pes3d_expanded.cube'
-        call write_expanded_cube(exp_path, header_buf, n_header_lines, &
-            exp_energies, exp_filled, exp_nx, exp_ny, exp_nz, ios)
-
-        write(*, '(a)') '  ── Symmetry Expansion ──'
+        ! Summary
+        write(*, '(a)') '  ── Symmetry Expansion (reverse) ──'
         write(*, '(a, i0, a, i0, a, i0, a, i0)') '  Expanded grid: ', &
             exp_nx, ' x ', exp_ny, ' x ', exp_nz, ' = ', n_exp
+        write(*, '(a, i0, a, i0)') '  Filled: ', n_filled, ' / ', n_exp
         if (e_min_final < huge(1.0_dp)) then
             write(*, '(a, f18.8)') '  E min (expanded): ', e_min_final
             write(*, '(a, f18.8)') '  E max (expanded): ', e_max_final
         end if
+        if (n_filled < n_exp) then
+            write(*, '(a, i0, a)') '  WARNING: ', n_exp - n_filled, &
+                ' points have no symmetry-equivalent in scan region'
+        end if
+
+        ! Write expanded cube (header from original, with updated dims)
+        exp_path = trim(scan_dir) // '/pes3d_expanded.cube'
+        call write_expanded_cube(exp_path, header_buf, n_header_lines, &
+            exp_energies, exp_filled, exp_nx, exp_ny, exp_nz, ios)
 
         deallocate(local_energies, local_has, exp_energies, exp_filled, header_buf)
     end subroutine symmetry_expand_energies

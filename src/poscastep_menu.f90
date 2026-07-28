@@ -34,7 +34,7 @@ module poscastep_menu
     use cell_writer, only: write_cell_file
     use param_writer, only: write_param_file
     use cli_menu, only: run_main_menu
-    use pes, only: pes_grid_t, compute_local_grid_bounds, generate_pes_grid_points, &
+    use pes, only: pes_grid_t, get_irreducible_grid, generate_pes_grid_points, &
         write_pes_cube, collect_pes_energies, symmetry_expand_energies
     implicit none
     private
@@ -2940,7 +2940,7 @@ contains
             plane_str = 'YZ'
         end if
 
-        deallocate(frac_points)
+        if (allocated(frac_points)) deallocate(frac_points)
         deallocate(cfg%atom_type, cfg%atom_x, cfg%atom_y, cfg%atom_z)
 
         write(*, '(a)') ''
@@ -3121,35 +3121,6 @@ contains
         grid%ref_frac = [cfg%atom_x(mi), cfg%atom_y(mi), cfg%atom_z(mi)]
 
         ! ── Grid parameters ──
-        if (grid%use_symmetry) then
-            ! Symmetry mode: auto-compute sub-volume bounds
-            call compute_local_grid_bounds(mi, cif%atoms, cif%n_atoms, &
-                cif%sym_ops, cif%n_symops, grid%half_dist, ios)
-            if (ios /= 0) then
-                write(*, '(a)') '  Warning: could not compute symmetry bounds, using defaults.'
-                grid%half_dist = 0.3_dp
-            end if
-
-            write(*, '(a)') ''
-            write(*, '(a)') '  ── Asymmetric Sub-Volume (auto-computed) ──'
-            write(*, '(a,3f10.6)') '  Reference atom frac: ', grid%ref_frac
-            write(*, '(a,3f10.6)') '  Half-distance:       ', grid%half_dist
-            grid%frac_range(1,1) = max(0.0_dp, grid%ref_frac(1) - grid%half_dist(1))
-            grid%frac_range(1,2) = min(1.0_dp, grid%ref_frac(1) + grid%half_dist(1))
-            grid%frac_range(2,1) = max(0.0_dp, grid%ref_frac(2) - grid%half_dist(2))
-            grid%frac_range(2,2) = min(1.0_dp, grid%ref_frac(2) + grid%half_dist(2))
-            grid%frac_range(3,1) = max(0.0_dp, grid%ref_frac(3) - grid%half_dist(3))
-            grid%frac_range(3,2) = min(1.0_dp, grid%ref_frac(3) + grid%half_dist(3))
-            write(*, '(a, 2f10.6)') '  fx range: ', grid%frac_range(1,:)
-            write(*, '(a, 2f10.6)') '  fy range: ', grid%frac_range(2,:)
-            write(*, '(a, 2f10.6)') '  fz range: ', grid%frac_range(3,:)
-        else
-            ! No symmetry: user inputs grid range manually
-            grid%frac_range(1,1) = 0.0_dp; grid%frac_range(1,2) = 1.0_dp
-            grid%frac_range(2,1) = 0.0_dp; grid%frac_range(2,2) = 1.0_dp
-            grid%frac_range(3,1) = 0.0_dp; grid%frac_range(3,2) = 1.0_dp
-        end if
-
         write(*, '(a)', advance='no') '  Grid Nx (default 5): '
         read(*, '(a)', iostat=ios) input
         n_pts(1) = 5; if (len_trim(input) > 0) read(input, *, iostat=ios) n_pts(1)
@@ -3161,7 +3132,27 @@ contains
         n_pts(3) = 5; if (len_trim(input) > 0) read(input, *, iostat=ios) n_pts(3)
         grid%n_points = n_pts
 
-        if (.not. grid%use_symmetry) then
+        ! ── Orbit mapping for symmetry mode ──
+        if (grid%use_symmetry) then
+            if (cif%n_symops > 1) then
+                call get_irreducible_grid(n_pts(1), n_pts(2), n_pts(3), &
+                    cif%sym_ops, cif%n_symops, grid%n_irred, grid%irred_coords, ios)
+                if (ios /= 0) then
+                    write(*, '(a)') '  Error in orbit mapping; falling back to full grid.'
+                    grid%use_symmetry = .false.
+                end if
+            else
+                write(*, '(a)') '  No symmetry operations found; using full grid.'
+                grid%use_symmetry = .false.
+            end if
+        end if
+
+        if (grid%use_symmetry) then
+            ! Orbit mapping: full cell
+            grid%frac_range(1,1) = 0.0_dp; grid%frac_range(1,2) = 1.0_dp
+            grid%frac_range(2,1) = 0.0_dp; grid%frac_range(2,2) = 1.0_dp
+            grid%frac_range(3,1) = 0.0_dp; grid%frac_range(3,2) = 1.0_dp
+        else
             write(*, '(a)', advance='no') '  fx range (min max, default 0 1): '
             read(*, '(a)', iostat=ios) input
             range_vals(1) = 0.0_dp; range_vals(2) = 1.0_dp
@@ -3217,9 +3208,13 @@ contains
 
         ! ── Generate grid points ──
         grid%ndim = 3
-        call generate_pes_grid_points(grid, frac_points, n_total, ios)
-        if (ios /= 0) then
-            write(*, '(a)') '  Error generating grid.'; return
+        if (grid%use_symmetry .and. allocated(grid%irred_coords)) then
+            n_total = grid%n_irred
+        else
+            call generate_pes_grid_points(grid, frac_points, n_total, ios)
+            if (ios /= 0) then
+                write(*, '(a)') '  Error generating grid.'; return
+            end if
         end if
 
         ! ── Create output directory ──
@@ -3230,19 +3225,29 @@ contains
         ! ── Generate files ──
         write(*, '(a,i0,a)') '  Generating ', n_total, ' grid points...'
         do i = 1, n_total
-            fx = frac_points(i, 1)
-            fy = frac_points(i, 2)
-            fz = frac_points(i, 3)
+            if (grid%use_symmetry .and. allocated(grid%irred_coords)) then
+                fx = grid%irred_coords(1, i)
+                fy = grid%irred_coords(2, i)
+                fz = grid%irred_coords(3, i)
+            else
+                fx = frac_points(i, 1)
+                fy = frac_points(i, 2)
+                fz = frac_points(i, 3)
+            end if
 
             ! Set mobile atom to grid point fractional coords
             cfg%atom_x(mi) = fx
             cfg%atom_y(mi) = fy
             cfg%atom_z(mi) = fz
 
-            write(sub_dir, '(a, a, i3.3, a, i3.3, a, i3.3)') trim(scan_dir), '/grid_', &
-                modulo(i-1, grid%n_points(1)) + 1, '_', &
-                modulo((i-1)/grid%n_points(1), grid%n_points(2)) + 1, '_', &
-                (i-1) / (grid%n_points(1)*grid%n_points(2)) + 1
+            if (grid%use_symmetry .and. allocated(grid%irred_coords)) then
+                write(sub_dir, '(a, a, i5.5)') trim(scan_dir), '/irred_', i
+            else
+                write(sub_dir, '(a, a, i3.3, a, i3.3, a, i3.3)') trim(scan_dir), '/grid_', &
+                    modulo(i-1, grid%n_points(1)) + 1, '_', &
+                    modulo((i-1)/grid%n_points(1), grid%n_points(2)) + 1, '_', &
+                    (i-1) / (grid%n_points(1)*grid%n_points(2)) + 1
+            end if
 
             call execute_command_line('mkdir -p "' // trim(sub_dir) // '"', exitstat=ios)
 
@@ -3263,11 +3268,27 @@ contains
         end block
         deallocate(dummy_energies)
 
+        ! ── Write irreducible coordinates sidecar (for collection) ──
+        if (grid%use_symmetry .and. allocated(grid%irred_coords)) then
+            block
+                integer :: unit_irr, ii
+                open(newunit=unit_irr, file=trim(scan_dir)//'/irred_coords.dat', &
+                     status='replace', action='write', iostat=ios)
+                if (ios == 0) then
+                    write(unit_irr, '(i0)') grid%n_irred
+                    do ii = 1, grid%n_irred
+                        write(unit_irr, '(3f20.15)') grid%irred_coords(:, ii)
+                    end do
+                    close(unit_irr)
+                end if
+            end block
+        end if
+
         ! Save element before deallocation (cif is still valid here)
         mobile_elem = trim(clean_element_symbol(cif%atoms(mi)%element))
 
         ! ── Cleanup ──
-        deallocate(frac_points)
+        if (allocated(frac_points)) deallocate(frac_points)
         deallocate(cfg%atom_type, cfg%atom_x, cfg%atom_y, cfg%atom_z)
         call free_cif_data(cif)
 
