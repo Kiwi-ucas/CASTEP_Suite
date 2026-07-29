@@ -8,7 +8,6 @@ module pes
     !! describes the scan plane, mobile atom, lattice, and symmetry info.
     use castep_config, only: dp, castep_config_t, cif_data_t, atom_t, sym_op_t, &
         IO_WRITE_FAIL, IO_PARSE_ERROR, IO_FILE_NOT_FOUND
-    use parser, only: parse_cif_inline
     implicit none
     private
 
@@ -18,8 +17,7 @@ module pes
     public :: generate_pes_grid_points
     public :: write_pes_cube
     public :: collect_pes_energies
-    public :: symmetry_expand_energies
-    public :: write_symops_json
+    public :: symops_translation_lcm
 
     ! Legacy wrappers — kept for backward compatibility with poscastep_menu.f90
     public :: write_pes_metadata_json   ! deprecated: use write_pes_cube
@@ -181,6 +179,9 @@ contains
         !! then uses symmetry operations to group equivalent points
         !! into orbits.  Each orbit contributes exactly one irreducible
         !! representative — the minimal set of CASTEP scan points.
+        !!
+        !! IMPORTANT: Axis-swapping symmetry operations require Na == Nb == Nc.
+        !! The caller must enforce cubic grids when the space group has such operations.
         integer, intent(in) :: Na, Nb, Nc, n_symops
         type(sym_op_t), intent(in) :: sym_ops(:)
         integer, intent(out) :: n_irred
@@ -193,6 +194,13 @@ contains
 
         iostat = 0; n_irred = 0
         max_pts = Na * Nb * Nc
+
+        ! Defensive check: axis-swapping operations require cubic grids
+        if (Na /= Nb .or. Nb /= Nc) then
+            write(*, '(a)') '  ERROR: orbit mapping requires Na == Nb == Nc for axis-swapping operations.'
+            iostat = IO_PARSE_ERROR
+            return
+        end if
 
         allocate(visited(0:Na-1, 0:Nb-1, 0:Nc-1), stat=iostat)
         if (iostat /= 0) return
@@ -255,14 +263,79 @@ contains
 
 
     ! ═══════════════════════════════════════════════════════════════════════════
+    !  Symmetry translation commensurability check
+    ! ═══════════════════════════════════════════════════════════════════════════
+
+    integer function symops_translation_lcm(sym_ops, n_symops) result(m)
+        !! Computes the smallest integer m such that every symmetry translation
+        !! component t satisfies t*m == integer (within 1e-6 tolerance).
+        !!
+        !! A grid with N divisible by m is commensurate with the space group:
+        !! every symmetry image of a grid point lands exactly on another grid point.
+        !!
+        !! Returns 0 if any translation component cannot be represented by a
+        !! crystallographic denominator (1, 2, 3, 4, 6), indicating the space
+        !! group is incompatible with a uniform grid.
+        type(sym_op_t), intent(in) :: sym_ops(:)
+        integer, intent(in) :: n_symops
+        integer :: s, d, denom
+        real(dp) :: t
+        integer, parameter :: CAND(5) = [1, 2, 3, 4, 6]  ! crystallographic denominators
+        logical :: found
+
+        m = 1
+        do s = 1, n_symops
+            do d = 1, 3
+                t = sym_ops(s)%trans(d)
+                ! Find smallest candidate denominator that makes t*denom ~ integer
+                found = .false.
+                do denom = 1, size(CAND)
+                    if (abs(t * CAND(denom) - nint(t * CAND(denom))) < 1.0d-6) then
+                        m = lcm(m, CAND(denom))
+                        found = .true.
+                        exit
+                    end if
+                end do
+                if (.not. found) then
+                    m = 0  ! non-crystallographic translation
+                    return
+                end if
+            end do
+        end do
+    end function symops_translation_lcm
+
+
+    integer function lcm(a, b) result(res)
+        !! Least common multiple of two positive integers.
+        integer, intent(in) :: a, b
+        res = (a * b) / gcd(a, b)
+    end function lcm
+
+
+    integer function gcd(a, b) result(res)
+        !! Greatest common divisor via Euclidean algorithm.
+        integer, intent(in) :: a, b
+        integer :: x, y, r
+        x = a; y = b
+        do while (y /= 0)
+            r = mod(x, y)
+            x = y
+            y = r
+        end do
+        res = x
+    end function gcd
+
+
+    ! ═══════════════════════════════════════════════════════════════════════════
     !  Gaussian Cube file output (unified 2D / 3D)
     ! ═══════════════════════════════════════════════════════════════════════════
 
-    subroutine write_pes_cube(cube_path, grid, cfg, energies, has_energy, iostat, iomsg)
+    subroutine write_pes_cube(cube_path, grid, cfg, energies, has_energy, iostat, iomsg, &
+                              sym_ops, n_symops_stored)
         !! Write a Gaussian Cube file for 2D or 3D PES scalar field.
         !!
         !! Line 1: description string
-        !! Line 2: compact JSON metadata (plane, mobile atom, lattice, ranges)
+        !! Line 2: compact JSON metadata (plane, mobile atom, lattice, ranges, sym_ops)
         !! Lines 3-6: standard cube header (natom, origin, nx/dv_x, ny/dv_y, nz/dv_z)
         !! Atom lines: Z 0.0  cart_x  cart_y  cart_z
         !! Volumetric data: 6 values per line, NaN for missing points
@@ -273,6 +346,8 @@ contains
         type(castep_config_t), intent(in), target :: cfg
         real(dp), intent(in) :: energies(:)
         logical,  intent(in) :: has_energy(:)
+        type(sym_op_t), intent(in), optional :: sym_ops(:)
+        integer, intent(in), optional :: n_symops_stored
         integer, intent(out) :: iostat
         character(len=*), optional, intent(out) :: iomsg
 
@@ -281,7 +356,7 @@ contains
         real(dp) :: scan_domain_1, scan_domain_2
         integer :: unit, ios, i, nx, ny, nz, n_total, pa0, pa1, pa2
         real(dp) :: e_val
-        character(len=4096) :: meta_json
+        character(len=16384) :: meta_json
         character(len=64) :: desc, plane_label
         integer :: z_num
         character(len=8) :: el
@@ -328,7 +403,7 @@ contains
             write(desc, '(a,i0,a,i0,a,i0)') '3D PES: ', nx, 'x', ny, 'x', nz
         end if
 
-        meta_json = build_metadata_json(grid, cfg)
+        meta_json = build_metadata_json(grid, cfg, sym_ops, n_symops_stored)
 
         ! ── Write file ──
         open(newunit=unit, file=trim(cube_path), status='replace', action='write', iostat=ios)
@@ -457,9 +532,26 @@ contains
         logical, allocatable :: has_energy(:)
         logical :: exists, is_2d
         real(dp) :: e_val, e_min, e_max
-        ! Buffer for header + atom lines
-        character(len=4096), allocatable :: header_buf(:)
+        character(len=16384), allocatable :: header_buf(:)
         integer :: n_header_lines
+
+        ! Symmetry expansion locals
+        integer, parameter :: MAX_SYM_OPS = 256
+        integer :: n_irr, unit_irr, ii
+        logical :: was_expanded, coords_are_exact
+        real(dp), allocatable :: irred_energies(:), irred_coords(:,:)
+        integer, allocatable :: irred_idx(:,:)
+        integer :: na_f, nb_f, nc_f
+        integer :: n_symops, rot(3,3,MAX_SYM_OPS)
+        real(dp) :: trans(3,MAX_SYM_OPS), fx, fy, fz
+        integer :: exp_nx, exp_ny, exp_nz, n_exp, iexp, ei, ej, ek, n_filled, n_holes
+        real(dp), allocatable :: exp_energies(:)
+        logical, allocatable :: exp_filled(:)
+        real(dp) :: exp_frac(3)
+        character(len=16384) :: json_line
+        character(len=128) :: first_line
+        integer :: ix, iy, iz, isrc, idst, old_nx, old_ny, old_nz, ti, tj, tk, n_face_bad
+        real(dp) :: dv(3,3)
 
         iostat = 0
         collected = 0; missing = 0
@@ -539,44 +631,257 @@ contains
             ! Detect format: irred_coords.dat (orbit mapping) or grid_III_JJJ_KKK
             inquire(file=trim(scan_dir)//'/irred_coords.dat', exist=exists)
             if (exists) then
-                ! Orbit-mapping format: read irred coords, map to cube indices
-                block
-                    integer :: unit_irr, n_irr, ii, ix, iy, iz, cidx
-                    real(dp) :: fx, fy, fz
-                    open(newunit=unit_irr, file=trim(scan_dir)//'/irred_coords.dat', &
-                         status='old', action='read', iostat=ios)
-                    if (ios == 0) then
-                        read(unit_irr, *) n_irr
+                ! ═══════════════════════════════════════════════════════════
+                !  Symmetry mode: collect → expand in memory → full-cell cube
+                ! ═══════════════════════════════════════════════════════════
+                ! Step 1: Read irreducible coordinates (dual format support)
+
+                open(newunit=unit_irr, file=trim(scan_dir)//'/irred_coords.dat', &
+                     status='old', action='read', iostat=ios)
+                if (ios /= 0) then
+                    deallocate(energies, has_energy, header_buf)
+                    iostat = IO_PARSE_ERROR; return
+                end if
+
+                read(unit_irr, '(a)') first_line
+                if (index(first_line, '# irred_index_v2') > 0) then
+                    ! New format: integer indices
+                    read(unit_irr, *) n_irr, na_f, nb_f, nc_f
+                    allocate(irred_idx(3, n_irr), irred_energies(n_irr), stat=ios)
+                    if (ios /= 0) then
+                        close(unit_irr); deallocate(energies, has_energy, header_buf)
+                        iostat = 1; return
+                    end if
+                    do ii = 1, n_irr
+                        read(unit_irr, *, iostat=ios) irred_idx(:, ii)
+                        if (ios /= 0) exit
+                    end do
+                    coords_are_exact = .true.
+                else
+                    ! Legacy format: floating-point fractional coordinates
+                    read(first_line, *) n_irr
+                    allocate(irred_coords(3, n_irr), irred_energies(n_irr), stat=ios)
+                    if (ios /= 0) then
+                        close(unit_irr); deallocate(energies, has_energy, header_buf)
+                        iostat = 1; return
+                    end if
+                    do ii = 1, n_irr
+                        read(unit_irr, *, iostat=ios) irred_coords(:, ii)
+                        if (ios /= 0) exit
+                    end do
+                    coords_are_exact = .false.
+                    write(*, '(a)') '  NOTE: legacy irred_coords.dat — regenerate scan for exact expansion'
+                end if
+                close(unit_irr)
+
+                ! Step 2: Collect CASTEP energies per irreducible point
+                collected = 0; missing = 0
+                do ii = 1, n_irr
+                    write(grid_dir, '(a,a,i5.5)') trim(scan_dir), '/irred_', ii
+                    castep_file = find_castep_in_dir(grid_dir)
+                    if (len_trim(castep_file) > 0) then
+                        e_val = parse_castep_energy(castep_file, ios)
+                        if (ios == 0) then
+                            irred_energies(ii) = e_val
+                            collected = collected + 1
+                            if (e_val < e_min) e_min = e_val
+                            if (e_val > e_max) e_max = e_val
+                        else
+                            irred_energies(ii) = huge(1.0_dp)
+                            missing = missing + 1
+                        end if
+                    else
+                        irred_energies(ii) = huge(1.0_dp)
+                        missing = missing + 1
+                    end if
+                end do
+
+                ! Step 3: Parse sym_ops from cube line-2 JSON
+                json_line = header_buf(2)
+                if (index(json_line, '"expanded":true') > 0) then
+                    write(*, '(a)') '  ── Already expanded — skipping'
+                    deallocate(irred_energies)
+                    if (allocated(irred_coords)) deallocate(irred_coords)
+                    if (allocated(irred_idx)) deallocate(irred_idx)
+                    ! Fall through to non-symmetry rewrite (data already complete)
+                    collected = n_total; missing = 0
+                    goto 999  ! skip expansion, go to rewrite
+                end if
+                n_symops = 0; rot = 0; trans = 0.0_dp
+                call parse_sym_ops_from_json_str(json_line, rot, trans, n_symops, MAX_SYM_OPS, ios)
+                if (ios /= 0 .or. n_symops < 1) then
+                    write(*, '(a)') '  WARNING: Cannot parse sym_ops from cube JSON — writing partial energies only'
+                else
+                    ! Step 4: Forward orbit expansion
+                    exp_nx = nx; exp_ny = ny; exp_nz = nz
+                    n_exp = (exp_nx + 1) * (exp_ny + 1) * (exp_nz + 1)
+                    allocate(exp_energies(n_exp), exp_filled(n_exp), stat=ios)
+                    if (ios /= 0) then
+                        deallocate(energies, has_energy, irred_energies, header_buf)
+                        if (allocated(irred_coords)) deallocate(irred_coords)
+                        if (allocated(irred_idx)) deallocate(irred_idx)
+                        iostat = 1; return
+                    end if
+                    exp_energies = huge(1.0_dp)
+                    exp_filled = .false.
+
+                    ! Forward orbit expansion
+                    if (coords_are_exact) then
+                        ! New format: integer arithmetic, zero floating-point error
                         do ii = 1, n_irr
-                            read(unit_irr, *, iostat=ios) fx, fy, fz
-                            if (ios /= 0) exit
-                            ! Map fractional coords to cube grid index
-                            ix = nint(fx * (nx - 1)) + 1
-                            iy = nint(fy * (ny - 1)) + 1
-                            iz = nint(fz * (nz - 1)) + 1
-                            cidx = (iz - 1) * nx * ny + (iy - 1) * nx + ix
-                            if (cidx < 1 .or. cidx > n_total) cycle
-                            ! Look for .castep in irred_NNNNN
-                            write(grid_dir, '(a,a,i5.5)') trim(scan_dir), '/irred_', ii
-                            castep_file = find_castep_in_dir(grid_dir)
-                            if (len_trim(castep_file) > 0) then
-                                e_val = parse_castep_energy(castep_file, ios)
-                                if (ios == 0) then
-                                    energies(cidx) = e_val
-                                    has_energy(cidx) = .true.
-                                    collected = collected + 1
-                                    if (e_val < e_min) e_min = e_val
-                                    if (e_val > e_max) e_max = e_val
-                                else
-                                    missing = missing + 1
+                            if (irred_energies(ii) > huge(1.0_dp) * 0.5_dp) cycle  ! missing
+                            do i = 1, n_symops
+                                ! Integer rotation + translation (trans*N is guaranteed integer)
+                                ti = nint(trans(1,i) * exp_nx)
+                                tj = nint(trans(2,i) * exp_ny)
+                                tk = nint(trans(3,i) * exp_nz)
+                                ei = rot(1,1,i)*irred_idx(1,ii) + rot(1,2,i)*irred_idx(2,ii) &
+                                   + rot(1,3,i)*irred_idx(3,ii) + ti
+                                ej = rot(2,1,i)*irred_idx(1,ii) + rot(2,2,i)*irred_idx(2,ii) &
+                                   + rot(2,3,i)*irred_idx(3,ii) + tj
+                                ek = rot(3,1,i)*irred_idx(1,ii) + rot(3,2,i)*irred_idx(2,ii) &
+                                   + rot(3,3,i)*irred_idx(3,ii) + tk
+                                ei = modulo(ei, exp_nx)
+                                ej = modulo(ej, exp_ny)
+                                ek = modulo(ek, exp_nz)
+                                iexp = ek * (exp_nx+1) * (exp_ny+1) + ej * (exp_nx+1) + ei + 1
+                                if (.not. exp_filled(iexp) .or. irred_energies(ii) < exp_energies(iexp)) then
+                                    exp_energies(iexp) = irred_energies(ii)
+                                    exp_filled(iexp) = .true.
                                 end if
-                            else
-                                missing = missing + 1
+                            end do
+                        end do
+                    else
+                        ! Legacy format: floating-point with rounding errors
+                        do ii = 1, n_irr
+                            if (irred_energies(ii) > huge(1.0_dp) * 0.5_dp) cycle  ! missing
+                            fx = irred_coords(1, ii)
+                            fy = irred_coords(2, ii)
+                            fz = irred_coords(3, ii)
+                            do i = 1, n_symops
+                                exp_frac(1) = rot(1,1,i)*fx + rot(1,2,i)*fy + rot(1,3,i)*fz + trans(1,i)
+                                exp_frac(2) = rot(2,1,i)*fx + rot(2,2,i)*fy + rot(2,3,i)*fz + trans(2,i)
+                                exp_frac(3) = rot(3,1,i)*fx + rot(3,2,i)*fy + rot(3,3,i)*fz + trans(3,i)
+                                call wrap_to_unit(exp_frac(1))
+                                call wrap_to_unit(exp_frac(2))
+                                call wrap_to_unit(exp_frac(3))
+                                ei = nint(exp_frac(1) * exp_nx)
+                                ej = nint(exp_frac(2) * exp_ny)
+                                ek = nint(exp_frac(3) * exp_nz)
+                                ei = modulo(ei, exp_nx)
+                                ej = modulo(ej, exp_ny)
+                                ek = modulo(ek, exp_nz)
+                                iexp = ek * (exp_nx+1) * (exp_ny+1) + ej * (exp_nx+1) + ei + 1
+                                if (iexp >= 1 .and. iexp <= n_exp) then
+                                    if (.not. exp_filled(iexp) .or. irred_energies(ii) < exp_energies(iexp)) then
+                                        exp_energies(iexp) = irred_energies(ii)
+                                        exp_filled(iexp) = .true.
+                                    end if
+                                end if
+                            end do
+                        end do
+                    end if
+
+                    ! Periodic boundary: explicit copy layer N from layer 0
+                    do iz = 0, exp_nz
+                        do iy = 0, exp_ny
+                            do ix = 0, exp_nx
+                                if (ix < exp_nx .and. iy < exp_ny .and. iz < exp_nz) cycle
+                                isrc = modulo(iz, exp_nz) * (exp_nx+1) * (exp_ny+1) &
+                                     + modulo(iy, exp_ny) * (exp_nx+1) + modulo(ix, exp_nx) + 1
+                                idst = iz * (exp_nx+1) * (exp_ny+1) + iy * (exp_nx+1) + ix + 1
+                                exp_energies(idst) = exp_energies(isrc)
+                                exp_filled(idst) = exp_filled(isrc)
+                            end do
+                        end do
+                    end do
+
+                    ! Count fill and check for holes
+                    n_filled = 0; n_holes = 0
+                    do iexp = 1, n_exp
+                        if (exp_energies(iexp) < huge(1.0_dp) * 0.5_dp) then
+                            n_filled = n_filled + 1
+                        else
+                            n_holes = n_holes + 1
+                        end if
+                    end do
+
+                    write(*, '(a)') '  ── Symmetry Expansion (in-line) ──'
+                    write(*, '(a, i0, a, i0)') '  Irreducible: ', collected, ' / ', n_irr
+                    write(*, '(a, i0, a, i0, a, i0, a, i0)') '  Orbit grid: ', &
+                        exp_nx, 'x', exp_ny, 'x', exp_nz, ' = ', exp_nx*exp_ny*exp_nz
+                    write(*, '(a, i0, a, i0, a, i0, a, i0)') '  N+1 cube:   ', &
+                        exp_nx+1, 'x', exp_ny+1, 'x', exp_nz+1, ' = ', n_exp
+                    write(*, '(a, i0, a, i0)') '  Filled: ', n_filled, ' / ', n_exp
+
+                    if (n_holes > 0) then
+                        write(*, '(a)') '  ── Expansion Diagnostics ──'
+                        write(*, '(a,i0,a,i0)') '  ERROR: ', n_holes, &
+                            ' grid points have no symmetry image from the irreducible set, out of ', n_exp
+                        write(*, '(a)') '  This indicates the orbit grid is not commensurate with ' // &
+                            'the space group translations, or CASTEP results are missing.'
+                        write(*, '(a)') '  Energies at these points are left as NaN (not interpolated).'
+                    end if
+
+                    ! Periodic boundary self-check (x-face only as representative)
+                    n_face_bad = 0
+                    do iz = 0, exp_nz - 1
+                        do iy = 0, exp_ny - 1
+                            isrc = iz * (exp_nx+1) * (exp_ny+1) + iy * (exp_nx+1) + 1
+                            idst = isrc + exp_nx
+                            if (abs(exp_energies(idst) - exp_energies(isrc)) > 1.0d-9) then
+                                n_face_bad = n_face_bad + 1
                             end if
                         end do
-                        close(unit_irr)
+                    end do
+                    write(*, '(a,i0)') '  Periodic boundary check (x-face mismatches): ', n_face_bad
+
+                    ! Replace energies/has_energy with expanded arrays
+                    deallocate(energies, has_energy)
+                    allocate(energies(n_exp), has_energy(n_exp), stat=ios)
+                    if (ios /= 0) then
+                        deallocate(exp_energies, exp_filled, irred_energies, header_buf)
+                        if (allocated(irred_coords)) deallocate(irred_coords)
+                        if (allocated(irred_idx)) deallocate(irred_idx)
+                        iostat = 1; return
                     end if
-                end block
+                    ! Set has_energy from actual values
+                    do iexp = 1, n_exp
+                        has_energy(iexp) = (exp_energies(iexp) < huge(1.0_dp) * 0.5_dp)
+                    end do
+                    energies = exp_energies
+                    deallocate(exp_energies, exp_filled)
+
+                    ! Update header for N+1 format
+                    n_total = n_exp
+                    ! Patch header_buf line 4-6: N+1, dv scaled to lattice/N
+                    read(header_buf(4), *) old_nx, dv(1,1), dv(2,1), dv(3,1)
+                    read(header_buf(5), *) old_ny, dv(1,2), dv(2,2), dv(3,2)
+                    read(header_buf(6), *) old_nz, dv(1,3), dv(2,3), dv(3,3)
+                    if (old_nx > 1) dv(:,1) = dv(:,1) * real(old_nx-1, dp) / real(exp_nx, dp)
+                    if (old_ny > 1) dv(:,2) = dv(:,2) * real(old_ny-1, dp) / real(exp_ny, dp)
+                    if (old_nz > 1) dv(:,3) = dv(:,3) * real(old_nz-1, dp) / real(exp_nz, dp)
+                    write(header_buf(4), '(i5,3f12.6)') exp_nx+1, dv(1,1), dv(2,1), dv(3,1)
+                    write(header_buf(5), '(i5,3f12.6)') exp_ny+1, dv(1,2), dv(2,2), dv(3,2)
+                    write(header_buf(6), '(i5,3f12.6)') exp_nz+1, dv(1,3), dv(2,3), dv(3,3)
+                    nx = exp_nx + 1; ny = exp_ny + 1; nz = exp_nz + 1
+
+                    ! Patch line 1 description
+                    write(header_buf(1), '(a,i0,a,i0,a,i0)') '3D PES (expanded): ', exp_nx, 'x', exp_ny, 'x', exp_nz
+                    ! Patch line 2 JSON: set frac ranges to [0,1], use_symmetry:false, mark expanded
+                    call patch_json_full_cell(header_buf(2), json_line)
+                    ! Append expanded flag before the closing }
+                    i = len_trim(json_line)
+                    if (json_line(i:i) == '}') then
+                        json_line(i:i) = ','
+                        json_line = trim(json_line) // '"expanded":true}'
+                    end if
+                    header_buf(2) = trim(json_line)
+                    was_expanded = .true.
+                end if  ! sym_ops parsed
+                deallocate(irred_energies)
+                if (allocated(irred_coords)) deallocate(irred_coords)
+                if (allocated(irred_idx)) deallocate(irred_idx)
             else
                 ! Rectangular grid format
                 do k = 1, nz
@@ -605,15 +910,18 @@ contains
             end if
         end if
 
-        ! Summary
-        write(*, '(a)') '  ── Collection Summary ──'
-        write(*, '(a, i0, a, i0)') '  Collected: ', collected, ' / ', n_total
-        if (missing > 0) write(*, '(a, i0)') '  Missing:   ', missing
-        if (collected > 0) then
-            write(*, '(a, f18.8)') '  E min (eV): ', e_min
-            write(*, '(a, f18.8)') '  E max (eV): ', e_max
+        ! Summary (skip if expansion already printed its own summary)
+        if (.not. was_expanded) then
+            write(*, '(a)') '  ── Collection Summary ──'
+            write(*, '(a, i0, a, i0)') '  Collected: ', collected, ' / ', n_total
+            if (missing > 0) write(*, '(a, i0)') '  Missing:   ', missing
+            if (collected > 0) then
+                write(*, '(a, f18.8)') '  E min (eV): ', e_min
+                write(*, '(a, f18.8)') '  E max (eV): ', e_max
+            end if
         end if
 
+999     continue
         ! Rewrite cube with collected energies
         call rewrite_cube_with_energies(cube_path, header_buf, n_header_lines, &
             energies, has_energy, nx, ny, nz, ios)
@@ -624,339 +932,61 @@ contains
 
         deallocate(energies, has_energy, header_buf)
     end subroutine collect_pes_energies
+    ! ── Parse sym_ops from JSON string (for inline expansion) ──
 
+    subroutine parse_sym_ops_from_json_str(json, rot, trans, n_symops, max_ops, ios)
+        !! Parse sym_ops from cube line-2 JSON: {"sym_ops":[{"rot":[...],"trans":[...]},...]}
+        character(len=*), intent(in) :: json
+        integer, intent(in) :: max_ops
+        integer, intent(out) :: rot(3,3,max_ops), n_symops, ios
+        real(dp), intent(out) :: trans(3,max_ops)
+        integer :: p, q, p1, p2, iop
 
-    ! ═══════════════════════════════════════════════════════════════════════════
-    !  Symmetry operations JSON writer
-    ! ═══════════════════════════════════════════════════════════════════════════
-
-    subroutine write_symops_json(json_path, sym_ops, n_symops, iostat, iomsg)
-        !! Write symmetry operations to a compact JSON file for use by
-        !! symmetry_expand_energies during result collection.
-        character(len=*), intent(in) :: json_path
-        type(sym_op_t), intent(in) :: sym_ops(:)
-        integer, intent(in) :: n_symops
-        integer, intent(out) :: iostat
-        character(len=*), optional, intent(out) :: iomsg
-
-        integer :: unit, iop
-        character(len=64) :: rot_str
-
-        iostat = 0
-        open(newunit=unit, file=trim(json_path), status='replace', action='write', iostat=iostat)
-        if (iostat /= 0) then
-            if (present(iomsg)) iomsg = 'Cannot write: ' // trim(json_path)
-            return
-        end if
-
-        write(unit, '(a)') '{"sym_ops":['
-        do iop = 1, n_symops
-            write(rot_str, '(i2,a,i2,a,i2,a,i2,a,i2,a,i2,a,i2,a,i2,a,i2)') &
-                sym_ops(iop)%rot(1,1), ',', sym_ops(iop)%rot(1,2), ',', sym_ops(iop)%rot(1,3), ',', &
-                sym_ops(iop)%rot(2,1), ',', sym_ops(iop)%rot(2,2), ',', sym_ops(iop)%rot(2,3), ',', &
-                sym_ops(iop)%rot(3,1), ',', sym_ops(iop)%rot(3,2), ',', sym_ops(iop)%rot(3,3)
-            if (iop < n_symops) then
-                write(unit, '(a,a,a,f10.8,a,f10.8,a,f10.8,a)') &
-                    '{"rot":[', trim(rot_str), '],"trans":[', &
-                    sym_ops(iop)%trans(1), ',', sym_ops(iop)%trans(2), ',', sym_ops(iop)%trans(3), ']},'
-            else
-                write(unit, '(a,a,a,f10.8,a,f10.8,a,f10.8,a)') &
-                    '{"rot":[', trim(rot_str), '],"trans":[', &
-                    sym_ops(iop)%trans(1), ',', sym_ops(iop)%trans(2), ',', sym_ops(iop)%trans(3), ']}'
-            end if
-        end do
-        write(unit, '(a)') ']}'
-        close(unit)
-    end subroutine write_symops_json
-
-
-    ! ═══════════════════════════════════════════════════════════════════════════
-    !  Symmetry expansion (3D only)
-    ! ═══════════════════════════════════════════════════════════════════════════
-
-    subroutine symmetry_expand_energies(scan_dir, iostat, iomsg)
-        !! Read energies from cube, apply symmetry ops to expand local grid
-        !! to full [0,1)^3 cell. Writes pes3d_expanded.cube.
-        !!
-        !! Currently works with the older JSON metadata path for sym_ops.
-        !! The cube line 2 carries n_symops for flagging, but sym_ops matrices
-        !! are parsed from pes3d_metadata.json if present.
-        character(len=*), intent(in) :: scan_dir
-        integer, intent(out) :: iostat
-        character(len=*), optional, intent(out) :: iomsg
-
-        integer, parameter :: MAX_SYM_OPS = 256
-
-        integer :: nx, ny, nz, n_local, natom
-        real(dp) :: fx_range(2), fy_range(2), fz_range(2)
-        real(dp), allocatable :: local_energies(:)
-        logical, allocatable :: local_has(:)
-
-        integer :: n_symops
-        integer :: rot(3,3,MAX_SYM_OPS)
-        real(dp) :: trans(3,MAX_SYM_OPS)
-
-        integer :: exp_nx, exp_ny, exp_nz, n_exp
-        real(dp), allocatable :: exp_energies(:)
-        logical, allocatable :: exp_filled(:)
-        real(dp) :: exp_sp_x, exp_sp_y, exp_sp_z
-        real(dp) :: exp_frac(3)
-        real(dp) :: e_min_final, e_max_final
-        real(dp) :: el
-
-        ! Orbit mapping — irreducible coords
-        integer :: n_irr, unit_irr, cix, ciy, ciz, cidx, ii
-        real(dp), allocatable :: irred_coords(:,:)
-        logical :: exists_irr
-
-        character(len=1024) :: cube_path, exp_path, cif_path, line
-        integer :: unit_in, ios, i, j, iop, iexp, ei, ej, ek, n_filled
-        logical :: exists, use_sym
-        character(len=4096), allocatable :: header_buf(:)
-        integer :: n_header_lines
-
-        iostat = 0
-        n_symops = 0
+        n_symops = 0; ios = 0
         rot = 0; trans = 0.0_dp
-        fx_range = [0.0_dp, 1.0_dp]
-        fy_range = [0.0_dp, 1.0_dp]
-        fz_range = [0.0_dp, 1.0_dp]
-        use_sym = .false.
 
-        cube_path = trim(scan_dir) // '/scan.cube'
-        inquire(file=trim(cube_path), exist=exists)
-        if (.not. exists) then
-            cube_path = trim(scan_dir) // '/pes3d.cube'
-            inquire(file=trim(cube_path), exist=exists)
-        end if
-        if (.not. exists) then
-            iostat = IO_FILE_NOT_FOUND
-            if (present(iomsg)) iomsg = 'Cube file not found in: ' // trim(scan_dir)
-            return
-        end if
+        ! Find "sym_ops"
+        p = index(json, '"sym_ops"')
+        if (p == 0) then; ios = 1; return; end if
+        ! Find first '[' after sym_ops
+        p = index(json(p:), '[') + p - 1
+        if (p <= 0) then; ios = 1; return; end if
 
-        ! Parse cube header for dims + line 2 JSON for use_symmetry
-        call parse_cube_header(cube_path, natom, nx, ny, nz, ios)
-        if (ios /= 0 .or. nz == 1) then
-            if (present(iomsg)) iomsg = 'Symmetry expansion requires 3D cube (nz>1)'
-            if (ios == 0) iostat = 1
-            if (ios /= 0) iostat = ios
-            return
-        end if
-
-        ! Read line 2 to check use_symmetry
-        open(newunit=unit_in, file=trim(cube_path), status='old', action='read', iostat=ios)
-        read(unit_in, '(a)') line   ! line 1: skip
-        read(unit_in, '(a)') line   ! line 2: metadata JSON
-        close(unit_in)
-        use_sym = index(line, '"use_symmetry":true')  > 0 &
-             .or. index(line, '"use_symmetry":T')     > 0 &
-             .or. index(line, '"use_symmetry": True') > 0
-        if (.not. use_sym) then
-            if (present(iomsg)) iomsg = 'No symmetry — skipping expansion'
-            return
-        end if
-
-        ! Extract CIF path from cube JSON
-        call extract_json_string_by_key(line, '"cif_path"', cif_path)
-
-        ! Parse fractional ranges from JSON
-        call extract_json_two_reals_by_key(line, '"fx_range"', fx_range(1), fx_range(2))
-        call extract_json_two_reals_by_key(line, '"fy_range"', fy_range(1), fy_range(2))
-        call extract_json_two_reals_by_key(line, '"fz_range"', fz_range(1), fz_range(2))
-
-        ! Re-parse CIF from stored path to get sym_ops (no sidecar file needed)
-        iostat = 0  ! reset
-        if (len_trim(cif_path) == 0) then
-            if (present(iomsg)) iomsg = 'CIF path not in cube metadata — cannot expand'
-            iostat = IO_FILE_NOT_FOUND; return
-        end if
-        inquire(file=trim(cif_path), exist=exists)
-        if (.not. exists) then
-            if (present(iomsg)) iomsg = 'CIF file not found: ' // trim(cif_path)
-            iostat = IO_FILE_NOT_FOUND; return
-        end if
-        call parse_cif_symops(trim(cif_path), rot, trans, n_symops, MAX_SYM_OPS, ios)
-        if (ios /= 0 .or. n_symops < 1) then
-            if (present(iomsg)) iomsg = 'Failed to extract sym_ops from CIF'
-            iostat = IO_PARSE_ERROR; return
-        end if
-
-        ! Read energies from cube
-        n_local = nx * ny * nz
-        n_header_lines = 6 + natom
-        allocate(local_energies(n_local), local_has(n_local), header_buf(n_header_lines), stat=ios)
-        if (ios /= 0) then; iostat = 1; return; end if
-        local_has = .true.
-
-        open(newunit=unit_in, file=trim(cube_path), status='old', action='read', iostat=ios)
-        do i = 1, n_header_lines
-            read(unit_in, '(a)') header_buf(i)
+        ! Parse each {"rot":[...],"trans":[...]} object
+        iop = 0
+        q = p + 1
+        do while (iop < max_ops)
+            p1 = index(json(q:), '"rot"')
+            if (p1 == 0) exit
+            p1 = p1 + q - 1
+            p1 = index(json(p1:), '[') + p1
+            p2 = index(json(p1:), ']') + p1 - 2
+            if (p1 <= 0 .or. p2 <= p1) exit
+            iop = iop + 1
+            read(json(p1:p2), *, iostat=ios) &
+                rot(1,1,iop), rot(1,2,iop), rot(1,3,iop), &
+                rot(2,1,iop), rot(2,2,iop), rot(2,3,iop), &
+                rot(3,1,iop), rot(3,2,iop), rot(3,3,iop)
+            ! Find trans array
+            p1 = index(json(p2:), '"trans"')
+            if (p1 == 0) exit
+            p1 = p1 + p2 - 1
+            p1 = index(json(p1:), '[') + p1
+            p2 = index(json(p1:), ']') + p1 - 2
+            if (p1 <= 0 .or. p2 <= p1) exit
+            read(json(p1:p2), *, iostat=ios) trans(1,iop), trans(2,iop), trans(3,iop)
+            q = p2 + 2
         end do
-        do i = 1, n_local, 6
-            read(unit_in, *, iostat=ios) local_energies(i : min(i+5, n_local))
-            do j = i, min(i+5, n_local)
-                el = local_energies(j)
-                if (ios /= 0 .or. el /= el) then
-                    local_energies(j) = 0.0_dp
-                    local_has(j) = .false.
-                else
-                    local_has(j) = .true.
-                end if
-            end do
-        end do
-        close(unit_in)
+        n_symops = iop
+    end subroutine parse_sym_ops_from_json_str
 
-        ! ═══════════════════════════════════════════════════════════════
-        !  Read irreducible coordinates from sidecar file
-        ! ═══════════════════════════════════════════════════════════════
-        inquire(file=trim(scan_dir)//'/irred_coords.dat', exist=exists_irr)
-        if (.not. exists_irr) then
-            if (present(iomsg)) iomsg = 'No irred_coords.dat — symmetry expansion already done or not applicable'
-            deallocate(local_energies, local_has, header_buf)
-            return
-        end if
 
-        open(newunit=unit_irr, file=trim(scan_dir)//'/irred_coords.dat', &
-             status='old', action='read', iostat=ios)
-        if (ios /= 0) then
-            deallocate(local_energies, local_has, header_buf)
-            iostat = 1; return
-        end if
-        read(unit_irr, *) n_irr
-        allocate(irred_coords(3, n_irr), stat=ios)
-        if (ios /= 0) then
-            close(unit_irr); deallocate(local_energies, local_has, header_buf)
-            iostat = 1; return
-        end if
-        do ii = 1, n_irr
-            read(unit_irr, *, iostat=ios) irred_coords(:, ii)
-            if (ios /= 0) exit
-        end do
-        close(unit_irr)
 
-        ! ═══════════════════════════════════════════════════════════════
-        !  Build expanded grid with ORBIT spacing (1/N, NOT 1/(N-1))
-        !
-        !  Three grid systems:
-        !    Cube grid:    N points, spacing = 1/(N-1)  (coords i/(N-1))
-        !    Orbit grid:   N points, spacing = 1/N      (coords i/N)
-        !    Expanded:     same as orbit grid — N points, spacing 1/N
-        !
-        !  Symmetry maps i/N → j/N exactly (rational coords),
-        !  so nint(frac * N) gives the exact grid index.
-        ! ═══════════════════════════════════════════════════════════════
-        exp_nx = nx; exp_ny = ny; exp_nz = nz
-        n_exp = exp_nx * exp_ny * exp_nz
-        exp_sp_x = 1.0_dp / exp_nx
-        exp_sp_y = 1.0_dp / exp_ny
-        exp_sp_z = 1.0_dp / exp_nz
 
-        allocate(exp_energies(n_exp), exp_filled(n_exp), stat=ios)
-        if (ios /= 0) then
-            deallocate(local_energies, local_has, irred_coords, header_buf)
-            iostat = 1; return
-        end if
-        exp_energies = huge(1.0_dp)
-        exp_filled = .false.
+    ! ═══════════════════════════════════════════════════════════════════════════
 
-        ! ═══════════════════════════════════════════════════════════════
-        !  FORWARD orbit expansion
-        !
-        !  For each irreducible point k with coords (fx_k, fy_k, fz_k):
-        !    1. Map to cube grid index → look up CASTEP energy E_k
-        !       cube_idx = nint(fx*(N-1)) + 1  (nearest-neighbour)
-        !    2. Apply ALL symmetry operations:
-        !       exp_frac = R * (fx_k, fy_k, fz_k) + T
-        !    3. Map to expanded grid index:
-        !       ei = nint(exp_frac * N)   (exact mapping for orbit grid)
-        !    4. expanded[iexp] = min(expanded[iexp], E_k)
-        !
-        !  The union of all orbits covers 100% of the expanded grid.
-        ! ═══════════════════════════════════════════════════════════════
-        n_filled = 0
-        do ii = 1, n_irr
-            ! Step 1: map irreducible coords (i/N) to cube grid index (j/(N-1))
-            cix = nint(irred_coords(1, ii) * (nx - 1)) + 1
-            ciy = nint(irred_coords(2, ii) * (ny - 1)) + 1
-            ciz = nint(irred_coords(3, ii) * (nz - 1)) + 1
-            ! Clamp to valid range
-            cix = max(1, min(nx, cix))
-            ciy = max(1, min(ny, ciy))
-            ciz = max(1, min(nz, ciz))
-            cidx = (ciz - 1) * nx * ny + (ciy - 1) * nx + cix
-            if (cidx < 1 .or. cidx > n_local) cycle
-            if (.not. local_has(cidx)) cycle  ! no energy for this irred point
 
-            ! Step 2-3: forward symmetry expansion
-            do iop = 1, n_symops
-                exp_frac(1) = rot(1,1,iop)*irred_coords(1,ii) &
-                            + rot(1,2,iop)*irred_coords(2,ii) &
-                            + rot(1,3,iop)*irred_coords(3,ii) + trans(1,iop)
-                exp_frac(2) = rot(2,1,iop)*irred_coords(1,ii) &
-                            + rot(2,2,iop)*irred_coords(2,ii) &
-                            + rot(2,3,iop)*irred_coords(3,ii) + trans(2,iop)
-                exp_frac(3) = rot(3,1,iop)*irred_coords(1,ii) &
-                            + rot(3,2,iop)*irred_coords(2,ii) &
-                            + rot(3,3,iop)*irred_coords(3,ii) + trans(3,iop)
-                call wrap_to_unit(exp_frac(1))
-                call wrap_to_unit(exp_frac(2))
-                call wrap_to_unit(exp_frac(3))
-
-                ! Map to expanded grid using orbit spacing (nint(x * N))
-                ei = nint(exp_frac(1) * exp_nx)
-                ej = nint(exp_frac(2) * exp_ny)
-                ek = nint(exp_frac(3) * exp_nz)
-                ei = modulo(ei, exp_nx)
-                ej = modulo(ej, exp_ny)
-                ek = modulo(ek, exp_nz)
-                iexp = ek * exp_nx * exp_ny + ej * exp_nx + ei + 1
-
-                if (iexp >= 1 .and. iexp <= n_exp) then
-                    if (.not. exp_filled(iexp) .or. &
-                        local_energies(cidx) < exp_energies(iexp)) then
-                        exp_energies(iexp) = local_energies(cidx)
-                        exp_filled(iexp) = .true.
-                    end if
-                end if
-            end do
-        end do
-
-        ! Count filled points
-        do iexp = 1, n_exp
-            if (exp_filled(iexp)) n_filled = n_filled + 1
-        end do
-
-        ! Compute final energy range
-        e_min_final = huge(1.0_dp); e_max_final = -huge(1.0_dp)
-        do iexp = 1, n_exp
-            if (exp_filled(iexp)) then
-                if (exp_energies(iexp) < e_min_final) e_min_final = exp_energies(iexp)
-                if (exp_energies(iexp) > e_max_final) e_max_final = exp_energies(iexp)
-            end if
-        end do
-
-        ! Summary
-        write(*, '(a)') '  ── Symmetry Expansion (forward orbit) ──'
-        write(*, '(a, i0, a, i0, a, i0, a, i0)') '  Expanded grid: ', &
-            exp_nx, ' x ', exp_ny, ' x ', exp_nz, ' = ', n_exp
-        write(*, '(a, i0, a, i0)') '  Filled: ', n_filled, ' / ', n_exp
-        if (e_min_final < huge(1.0_dp)) then
-            write(*, '(a, f18.8)') '  E min (expanded): ', e_min_final
-            write(*, '(a, f18.8)') '  E max (expanded): ', e_max_final
-        end if
-        if (n_filled < n_exp) then
-            write(*, '(a, i0, a)') '  WARNING: ', n_exp - n_filled, &
-                ' points have no symmetry-equivalent in scan region'
-        end if
-
-        ! Write expanded cube (header from original, with updated dims)
-        exp_path = trim(scan_dir) // '/pes3d_expanded.cube'
-        call write_expanded_cube(exp_path, header_buf, n_header_lines, &
-            exp_energies, exp_filled, exp_nx, exp_ny, exp_nz, ios)
-
-        deallocate(local_energies, local_has, irred_coords, exp_energies, exp_filled, header_buf)
-    end subroutine symmetry_expand_energies
+    ! ═══════════════════════════════════════════════════════════════════════════
 
 
     ! ═══════════════════════════════════════════════════════════════════════════
@@ -1022,13 +1052,15 @@ contains
 
     ! ── Build line-2 metadata JSON ──
 
-    function build_metadata_json(grid, cfg) result(json)
+    function build_metadata_json(grid, cfg, sym_ops, n_symops_stored) result(json)
         type(pes_grid_t), intent(in) :: grid
         type(castep_config_t), intent(in), target :: cfg
-        character(len=4096) :: json
-        character(len=128) :: lat_str, plane_l, mob_el
+        type(sym_op_t), intent(in), optional :: sym_ops(:)
+        integer, intent(in), optional :: n_symops_stored
+        character(len=16384) :: json
+        character(len=128) :: lat_str, plane_l, mob_el, sym_buf
         character(len=5) :: sym_str
-        integer :: mi
+        integer :: mi, iop, n_sym
 
         mi = grid%mobile_atom_idx
         mob_el = trim(cfg%atom_type(mi))
@@ -1055,16 +1087,50 @@ contains
                 '"fy_range":[', grid%frac_range(2,1), ',', grid%frac_range(2,2), '],', &
                 '"lattice":{', trim(lat_str), '}}'
         else
-            write(json, '(a,a,a,i0,a,a,a,a,f12.8,a,f12.8,a,a,f12.8,a,f12.8,a,a,f12.8,a,f12.8,a,a,a,a,a,a,a,a,a,a)') &
-                '{"type":"pes_3d","scan_mode":"', trim(grid%scan_mode), &
-                '","mobile_idx":', mi - 1, &
-                ',"mobile_el":"', trim(mob_el), '",', &
-                '"fx_range":[', grid%frac_range(1,1), ',', grid%frac_range(1,2), '],', &
-                '"fy_range":[', grid%frac_range(2,1), ',', grid%frac_range(2,2), '],', &
-                '"fz_range":[', grid%frac_range(3,1), ',', grid%frac_range(3,2), '],', &
-                '"lattice":{', trim(lat_str), '},', &
-                '"cif_path":"', trim(cfg%cif_file_path), '",', &
-                '"use_symmetry":', trim(sym_str), '}'
+            ! 3D: include sym_ops in JSON for self-contained expansion
+            n_sym = 0
+            if (present(sym_ops) .and. present(n_symops_stored)) n_sym = n_symops_stored
+            if (n_sym > 0) then
+                ! Build sym_ops JSON array inline
+                sym_buf = ' '
+                write(json, '(a,a,a,i0,a,a,a,a,f12.8,a,f12.8,a,a,f12.8,a,f12.8,a,a,f12.8,a,f12.8,a,a,a,a,a,a,a,i0,a)') &
+                    '{"type":"pes_3d","scan_mode":"', trim(grid%scan_mode), &
+                    '","mobile_idx":', mi - 1, &
+                    ',"mobile_el":"', trim(mob_el), '",', &
+                    '"fx_range":[', grid%frac_range(1,1), ',', grid%frac_range(1,2), '],', &
+                    '"fy_range":[', grid%frac_range(2,1), ',', grid%frac_range(2,2), '],', &
+                    '"fz_range":[', grid%frac_range(3,1), ',', grid%frac_range(3,2), '],', &
+                    '"lattice":{', trim(lat_str), '},', &
+                    '"use_symmetry":', trim(sym_str), ',"n_symops":', n_sym, ',"sym_ops":['
+                ! Append each sym_op
+                do iop = 1, n_sym
+                    if (iop < n_sym) then
+                        write(sym_buf, '(a,i2,a,i2,a,i2,a,i2,a,i2,a,i2,a,i2,a,i2,a,i2,a,f10.8,a,f10.8,a,f10.8,a)') &
+                            '{"rot":[', sym_ops(iop)%rot(1,1), ',', sym_ops(iop)%rot(1,2), ',', sym_ops(iop)%rot(1,3), ',', &
+                            sym_ops(iop)%rot(2,1), ',', sym_ops(iop)%rot(2,2), ',', sym_ops(iop)%rot(2,3), ',', &
+                            sym_ops(iop)%rot(3,1), ',', sym_ops(iop)%rot(3,2), ',', sym_ops(iop)%rot(3,3), &
+                            '],"trans":[', sym_ops(iop)%trans(1), ',', sym_ops(iop)%trans(2), ',', sym_ops(iop)%trans(3), ']},'
+                        json = trim(json) // trim(sym_buf)
+                    else
+                        write(sym_buf, '(a,i2,a,i2,a,i2,a,i2,a,i2,a,i2,a,i2,a,i2,a,i2,a,f10.8,a,f10.8,a,f10.8,a)') &
+                            '{"rot":[', sym_ops(iop)%rot(1,1), ',', sym_ops(iop)%rot(1,2), ',', sym_ops(iop)%rot(1,3), ',', &
+                            sym_ops(iop)%rot(2,1), ',', sym_ops(iop)%rot(2,2), ',', sym_ops(iop)%rot(2,3), ',', &
+                            sym_ops(iop)%rot(3,1), ',', sym_ops(iop)%rot(3,2), ',', sym_ops(iop)%rot(3,3), &
+                            '],"trans":[', sym_ops(iop)%trans(1), ',', sym_ops(iop)%trans(2), ',', sym_ops(iop)%trans(3), ']}]}'
+                        json = trim(json) // trim(sym_buf)
+                    end if
+                end do
+            else
+                write(json, '(a,a,a,i0,a,a,a,a,f12.8,a,f12.8,a,a,f12.8,a,f12.8,a,a,f12.8,a,f12.8,a,a,a,a,a,a,a)') &
+                    '{"type":"pes_3d","scan_mode":"', trim(grid%scan_mode), &
+                    '","mobile_idx":', mi - 1, &
+                    ',"mobile_el":"', trim(mob_el), '",', &
+                    '"fx_range":[', grid%frac_range(1,1), ',', grid%frac_range(1,2), '],', &
+                    '"fy_range":[', grid%frac_range(2,1), ',', grid%frac_range(2,2), '],', &
+                    '"fz_range":[', grid%frac_range(3,1), ',', grid%frac_range(3,2), '],', &
+                    '"lattice":{', trim(lat_str), '},', &
+                    '"use_symmetry":', trim(sym_str), '}'
+            end if
         end if
     end function build_metadata_json
 
@@ -1187,163 +1253,6 @@ contains
     end subroutine replace_json_array
 
 
-    subroutine write_expanded_cube(exp_path, header_buf, n_header_lines, &
-                                    energies, has_energy, nx, ny, nz, ios)
-        character(len=*), intent(in) :: exp_path
-        character(len=*), intent(in) :: header_buf(:)
-        integer, intent(in) :: n_header_lines
-        real(dp), intent(in) :: energies(:)
-        logical, intent(in) :: has_energy(:)
-        integer, intent(in) :: nx, ny, nz
-        integer, intent(out) :: ios
-
-        integer :: unit_out, i, n_total, natom, old_nx, old_ny, old_nz
-        integer :: ix, iy, iz, idx, counter
-        real(dp) :: e_val, origin(3), dv(3,3)
-        character(len=4096) :: line
-
-        n_total = (nx + 1) * (ny + 1) * (nz + 1)
-
-        open(newunit=unit_out, file=trim(exp_path), status='replace', action='write', iostat=ios)
-        if (ios /= 0) return
-
-        ! Rewrite header with updated dimensions + full-cell JSON metadata
-        write(unit_out, '(a,i0,a,i0,a,i0)') '3D PES (expanded): ', nx, 'x', ny, 'x', nz
-        ! Patch line-2 JSON: update fractional ranges to [0,1] (full cell)
-        call patch_json_full_cell(header_buf(2), line)
-        write(unit_out, '(a)') trim(line)
-
-        ! Re-parse natom and origin from original header
-        read(header_buf(3), *) natom, origin(1), origin(2), origin(3)
-        write(unit_out, '(i5,3f12.6)') natom, origin(1), origin(2), origin(3)
-
-        ! Read old voxel vectors and scale: dv_new = dv_old * (old_n-1) / new_n
-        !   old cube: N points,  spacing 1/(N-1),  dv_old = lattice/(N-1)
-        !   new cube: N+1 points, spacing 1/N,      dv_new = lattice/N
-        !   ratio: dv_new/dv_old = (lattice/N) / (lattice/(N-1)) = (N-1)/N
-        read(header_buf(4), *) old_nx, dv(1,1), dv(2,1), dv(3,1)
-        read(header_buf(5), *) old_ny, dv(1,2), dv(2,2), dv(3,2)
-        read(header_buf(6), *) old_nz, dv(1,3), dv(2,3), dv(3,3)
-        if (old_nx > 1) dv(:,1) = dv(:,1) * real(old_nx - 1, dp) / real(nx, dp)
-        if (old_ny > 1) dv(:,2) = dv(:,2) * real(old_ny - 1, dp) / real(ny, dp)
-        if (old_nz > 1) dv(:,3) = dv(:,3) * real(old_nz - 1, dp) / real(nz, dp)
-
-        ! N+1 format: write nx+1 (N intervals of width 1/N covering [0,1])
-        write(unit_out, '(i5,3f12.6)') nx + 1, dv(1,1), dv(2,1), dv(3,1)
-        write(unit_out, '(i5,3f12.6)') ny + 1, dv(1,2), dv(2,2), dv(3,2)
-        write(unit_out, '(i5,3f12.6)') nz + 1, dv(1,3), dv(2,3), dv(3,3)
-
-        ! Atom lines unchanged (lines 7..6+natom)
-        do i = 7, n_header_lines
-            write(unit_out, '(a)') trim(header_buf(i))
-        end do
-
-        ! Energy data: (nx+1)*(ny+1)*(nz+1) = N+1 format with boundary wrap
-        ! Boundary point (idx=nx) wraps to idx=0 → periodic consistency
-        counter = 0
-        do iz = 1, nz + 1
-            do iy = 1, ny + 1
-                do ix = 1, nx + 1
-                    idx = modulo(iz - 1, nz) * nx * ny &
-                        + modulo(iy - 1, ny) * nx &
-                        + modulo(ix - 1, nx) + 1
-                    if (has_energy(idx)) then
-                        e_val = energies(idx)
-                    else
-                        e_val = ieee_nan()
-                    end if
-                    counter = counter + 1
-                    write(unit_out, '(es13.5)', advance='no') e_val
-                    if (mod(counter, 6) == 0 .or. counter == n_total) write(unit_out, '(a)') ''
-                end do
-            end do
-        end do
-
-        close(unit_out)
-        write(*, '(a)') '  Expanded cube written: ' // trim(exp_path)
-    end subroutine write_expanded_cube
-
-
-    ! ── Parse sym_ops from JSON (for symmetry_expand) ──
-
-    subroutine parse_cif_symops(cif_path, rot, trans, n_symops, max_ops, ios)
-        !! Re-parse a CIF file to extract symmetry operations.
-        !! Uses the existing parser module (parse_cif_inline).
-        character(len=*), intent(in) :: cif_path
-        integer, intent(in) :: max_ops
-        integer, intent(out) :: rot(3,3,max_ops), n_symops, ios
-        real(dp), intent(out) :: trans(3,max_ops)
-        type(cif_data_t) :: cif
-        integer :: iop
-
-        n_symops = 0; ios = 0
-        rot = 0; trans = 0.0_dp
-
-        call parse_cif_inline(trim(cif_path), cif, ios)
-        if (ios /= 0) return
-        if (cif%n_symops < 1) then
-            ios = -1; return
-        end if
-
-        n_symops = min(cif%n_symops, max_ops)
-        do iop = 1, n_symops
-            rot(:,:,iop) = cif%sym_ops(iop)%rot
-            trans(:,iop) = cif%sym_ops(iop)%trans
-        end do
-    end subroutine parse_cif_symops
-
-
-
-    ! ── JSON utility helpers ──
-
-    subroutine extract_json_string_by_key(line, key, val)
-        !! Extract a quoted string value from JSON like "key":"value"
-        character(len=*), intent(in) :: line, key
-        character(len=*), intent(out) :: val
-        integer :: col, q1, q2
-        val = ''
-        col = index(line, trim(key))
-        if (col == 0) return
-        col = index(line(col:), ':') + col - 1
-        if (col <= 0) return
-        q1 = index(line(col+1:), '"') + col
-        if (q1 <= col) return
-        q2 = index(line(q1+1:), '"') + q1
-        if (q2 <= q1) return
-        val = line(q1+1:q2-1)
-    end subroutine extract_json_string_by_key
-
-
-
-    subroutine extract_json_two_reals(line, r1, r2)
-        character(len=*), intent(in) :: line
-        real(dp), intent(out) :: r1, r2
-        integer :: bp, ep, ios
-        character(len=256) :: sub
-        bp = index(line, '[')
-        ep = index(line, ']')
-        r1 = 0.0_dp; r2 = 1.0_dp
-        if (bp > 0 .and. ep > bp) then
-            sub = line(bp+1:ep-1)
-            read(sub, *, iostat=ios) r1, r2
-        end if
-    end subroutine extract_json_two_reals
-
-
-    subroutine extract_json_two_reals_by_key(line, key, r1, r2)
-        !! Like extract_json_two_reals but searches for a specific key first.
-        character(len=*), intent(in) :: line, key
-        real(dp), intent(out) :: r1, r2
-        integer :: kp
-        character(len=512) :: sub
-        kp = index(line, trim(key))
-        if (kp > 0) then
-            sub = line(kp:)
-            call extract_json_two_reals(sub, r1, r2)
-        else
-            r1 = 0.0_dp; r2 = 1.0_dp
-        end if
-    end subroutine extract_json_two_reals_by_key
 
 
     ! ── Element symbol → atomic number ──

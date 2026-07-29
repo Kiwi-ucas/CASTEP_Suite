@@ -35,7 +35,7 @@ module poscastep_menu
     use param_writer, only: write_param_file
     use cli_menu, only: run_main_menu
     use pes, only: pes_grid_t, get_irreducible_grid, generate_pes_grid_points, &
-        write_pes_cube, collect_pes_energies, symmetry_expand_energies
+        write_pes_cube, collect_pes_energies, symops_translation_lcm
     implicit none
     private
 
@@ -3028,7 +3028,7 @@ contains
         character(len=MAX_LINE_LEN) :: cell_path, param_path
         real(dp), allocatable :: frac_points(:,:)
         real(dp), allocatable :: dummy_energies(:)
-        integer :: ios, i, n_total, mi, n_pts(3)
+        integer :: ios, i, n_total, mi, n_pts(3), m, n_user, n_orb
         real(dp) :: fx, fy, fz, range_vals(6)
         character(len=8) :: mode_choice, sym_choice
         character(len=8) :: mobile_elem
@@ -3121,22 +3121,61 @@ contains
         grid%ref_frac = [cfg%atom_x(mi), cfg%atom_y(mi), cfg%atom_z(mi)]
 
         ! ── Grid parameters ──
-        write(*, '(a)', advance='no') '  Grid Nx (default 5): '
-        read(*, '(a)', iostat=ios) input
-        n_pts(1) = 5; if (len_trim(input) > 0) read(input, *, iostat=ios) n_pts(1)
-        write(*, '(a)', advance='no') '  Grid Ny (default 5): '
-        read(*, '(a)', iostat=ios) input
-        n_pts(2) = 5; if (len_trim(input) > 0) read(input, *, iostat=ios) n_pts(2)
-        write(*, '(a)', advance='no') '  Grid Nz (default 5): '
-        read(*, '(a)', iostat=ios) input
-        n_pts(3) = 5; if (len_trim(input) > 0) read(input, *, iostat=ios) n_pts(3)
-
-        ! Symmetry mode: orbit grid → expanded cube uses N+1 format.
-        ! Subtract 1 so that the expanded cube header matches user input.
         if (grid%use_symmetry) then
-            n_pts(1) = max(2, n_pts(1) - 1)
-            n_pts(2) = max(2, n_pts(2) - 1)
-            n_pts(3) = max(2, n_pts(3) - 1)
+            ! Symmetry mode: single cubic grid input with commensurability check
+            m = symops_translation_lcm(cif%sym_ops, cif%n_symops)
+            if (m < 1) then
+                write(*, '(a)') '  WARNING: symmetry translations are not commensurate ' // &
+                    'with any standard grid; falling back to full grid.'
+                grid%use_symmetry = .false.
+            else
+                write(*, '(a)') ''
+                write(*, '(a)') '  ── Grid size (periodic full-cell scan) ──'
+                write(*, '(a)') '  Symmetry operations may swap axes, so the grid must be cubic (Nx = Ny = Nz).'
+                if (m == 1) then
+                    write(*, '(a)') '  Any grid size N >= 2 is allowed for this space group.'
+                else
+                    write(*, '(a,i0,a)') '  This space group has fractional translations with denominator ', m, '.'
+                    write(*, '(a,i0,a)') '  The output cube grid N must satisfy: (N-1) is a multiple of ', m, '.'
+                    call print_allowed_grid_hint(m)
+                end if
+                do
+                    write(*, '(a)', advance='no') '  Grid N (single value, default 5): '
+                    read(*, '(a)', iostat=ios) input
+                    n_user = 5
+                    if (len_trim(input) > 0) read(input, *, iostat=ios) n_user
+                    if (n_user < 2) then
+                        write(*, '(a)') '  N must be >= 2. Please re-enter.'
+                        cycle
+                    end if
+                    n_orb = n_user - 1
+                    if (modulo(n_orb, m) /= 0) then
+                        write(*, '(a,i0,a,i0,a)') '  Rejected: N-1 = ', n_orb, &
+                            ' is not a multiple of ', m, '.'
+                        write(*, '(a,i0,a,i0)') '  Nearest allowed values: ', &
+                            (n_orb / m) * m + 1, '  or  ', ((n_orb / m) + 1) * m + 1
+                        write(*, '(a)') '  Please re-enter.'
+                        cycle
+                    end if
+                    exit
+                end do
+                n_pts = n_orb  ! all three axes equal
+                write(*, '(a,i0,a,i0,a,i0)') '  Orbit grid:  ', n_pts(1), 'x', n_pts(2), 'x', n_pts(3)
+                write(*, '(a,i0,a,i0,a,i0)') '  Output cube: ', n_pts(1)+1, 'x', n_pts(2)+1, 'x', n_pts(3)+1
+            end if
+        end if
+
+        if (.not. grid%use_symmetry) then
+            ! Non-symmetric mode: independent Nx / Ny / Nz (unchanged)
+            write(*, '(a)', advance='no') '  Grid Nx (default 5): '
+            read(*, '(a)', iostat=ios) input
+            n_pts(1) = 5; if (len_trim(input) > 0) read(input, *, iostat=ios) n_pts(1)
+            write(*, '(a)', advance='no') '  Grid Ny (default 5): '
+            read(*, '(a)', iostat=ios) input
+            n_pts(2) = 5; if (len_trim(input) > 0) read(input, *, iostat=ios) n_pts(2)
+            write(*, '(a)', advance='no') '  Grid Nz (default 5): '
+            read(*, '(a)', iostat=ios) input
+            n_pts(3) = 5; if (len_trim(input) > 0) read(input, *, iostat=ios) n_pts(3)
         end if
         grid%n_points = n_pts
 
@@ -3271,7 +3310,8 @@ contains
             allocate(dummy_energies(n_total), dummy_h(n_total))
             dummy_energies = 0.0_dp; dummy_h = .false.
             call write_pes_cube(trim(scan_dir)//'/scan.cube', &
-                grid, cfg, dummy_energies, dummy_h, ios)
+                grid, cfg, dummy_energies, dummy_h, ios, &
+                sym_ops=cif%sym_ops, n_symops_stored=cif%n_symops)
             deallocate(dummy_h)
         end block
         deallocate(dummy_energies)
@@ -3279,13 +3319,19 @@ contains
         ! ── Write irreducible coordinates sidecar (for collection) ──
         if (grid%use_symmetry .and. allocated(grid%irred_coords)) then
             block
-                integer :: unit_irr, ii
+                integer :: unit_irr, ii, ix, iy, iz
                 open(newunit=unit_irr, file=trim(scan_dir)//'/irred_coords.dat', &
                      status='replace', action='write', iostat=ios)
                 if (ios == 0) then
-                    write(unit_irr, '(i0)') grid%n_irred
+                    write(unit_irr, '(a)') '# irred_index_v2'
+                    write(unit_irr, '(4(i0,1x))') grid%n_irred, grid%n_points(1), &
+                                                  grid%n_points(2), grid%n_points(3)
                     do ii = 1, grid%n_irred
-                        write(unit_irr, '(3f20.15)') grid%irred_coords(:, ii)
+                        ! Convert fractional coords back to 0-based integer indices
+                        ix = nint(grid%irred_coords(1, ii) * grid%n_points(1))
+                        iy = nint(grid%irred_coords(2, ii) * grid%n_points(2))
+                        iz = nint(grid%irred_coords(3, ii) * grid%n_points(3))
+                        write(unit_irr, '(3(i0,1x))') ix, iy, iz
                     end do
                     close(unit_irr)
                 end if
@@ -3324,6 +3370,22 @@ contains
     end subroutine handle_pes3d_generate
 
 
+    subroutine print_allowed_grid_hint(m)
+        !! Prints the first few admissible cube grid sizes N where (N-1) is divisible by m.
+        integer, intent(in) :: m
+        character(len=128) :: buf
+        integer :: k, n, pos
+        buf = '  Allowed N: '
+        pos = len_trim(buf) + 1
+        do k = 1, 8
+            n = k * m + 1
+            write(buf(pos:), '(i0,a)') n, ', '
+            pos = len_trim(buf) + 1
+        end do
+        write(*, '(a,a)') trim(buf), '...'
+    end subroutine print_allowed_grid_hint
+
+
     subroutine handle_pes3d_collect(iostat)
         !! PES 3D sub-menu: Collect .castep results from 3D grid, optionally
         !! symmetry-expand, and launch viewer.
@@ -3360,21 +3422,12 @@ contains
             return
         end if
 
-        ! Symmetry expansion (reads use_symmetry from cube line 2 JSON)
-        call symmetry_expand_energies(trim(scan_dir), ios)
-
         ! Launch viewer
         write(*, '(a)') ''
         write(*, '(a)', advance='no') '  Launch 3D viewer? (y/n): '
         read(*, '(a)', iostat=ios) input
         if (ios == 0 .and. (input(1:1) == 'y' .or. input(1:1) == 'Y')) then
-            ! Launch expanded cube if available, otherwise local cube
-            inquire(file=trim(scan_dir)//'/pes3d_expanded.cube', exist=exists)
-            if (exists) then
-                call launch_viewer(trim(scan_dir)//'/pes3d_expanded.cube')
-            else
-                call launch_viewer(trim(scan_dir)//'/scan.cube')
-            end if
+            call launch_viewer(trim(scan_dir)//'/scan.cube')
         end if
     end subroutine handle_pes3d_collect
 
