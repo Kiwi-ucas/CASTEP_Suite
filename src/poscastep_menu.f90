@@ -3307,7 +3307,14 @@ contains
         ! ── Write cube file with placeholder energies ──
         block
             logical, allocatable :: dummy_h(:)
-            allocate(dummy_energies(n_total), dummy_h(n_total))
+            integer :: n_cube_total
+            ! Compute actual cube grid size (N+1 format for symmetry mode)
+            if (grid%use_symmetry) then
+                n_cube_total = (grid%n_points(1) + 1) * (grid%n_points(2) + 1) * (grid%n_points(3) + 1)
+            else
+                n_cube_total = n_total
+            end if
+            allocate(dummy_energies(n_cube_total), dummy_h(n_cube_total))
             dummy_energies = 0.0_dp; dummy_h = .false.
             call write_pes_cube(trim(scan_dir)//'/scan.cube', &
                 grid, cfg, dummy_energies, dummy_h, ios, &
