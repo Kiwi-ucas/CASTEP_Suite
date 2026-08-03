@@ -700,12 +700,11 @@ contains
                 json_line = header_buf(2)
                 if (index(json_line, '"expanded":true') > 0) then
                     write(*, '(a)') '  ── Already expanded — skipping'
-                    deallocate(irred_energies)
+                    deallocate(energies, has_energy, header_buf, irred_energies)
                     if (allocated(irred_coords)) deallocate(irred_coords)
                     if (allocated(irred_idx)) deallocate(irred_idx)
-                    ! Fall through to non-symmetry rewrite (data already complete)
-                    collected = n_total; missing = 0
-                    goto 999  ! skip expansion, go to rewrite
+                    iostat = 0
+                    return  ! Direct return to protect already-expanded data
                 end if
                 n_symops = 0; rot = 0; trans = 0.0_dp
                 call parse_sym_ops_from_json_str(json_line, rot, trans, n_symops, MAX_SYM_OPS, ios)
@@ -921,7 +920,18 @@ contains
             end if
         end if
 
-999     continue
+        ! Convert to relative energies (E - E_min) for better isosurface visualization
+        if (collected > 0 .and. e_min < huge(1.0_dp)) then
+            do i = 1, n_total
+                if (has_energy(i)) then
+                    energies(i) = energies(i) - e_min
+                end if
+            end do
+            write(*, '(a)') '  ── Energy converted to relative (E - E_min) ──'
+            write(*, '(a, f18.8)') '  Reference (E_min): ', e_min
+            write(*, '(a, f18.8, a)') '  New range: 0.00 to ', e_max - e_min, ' eV'
+        end if
+
         ! Rewrite cube with collected energies
         call rewrite_cube_with_energies(cube_path, header_buf, n_header_lines, &
             energies, has_energy, nx, ny, nz, ios)

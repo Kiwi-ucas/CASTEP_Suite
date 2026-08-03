@@ -13,6 +13,7 @@ use crate::PanelRects;
 use crate::PesState;
 use crate::Pes3dState;
 use crate::VisMode;
+use crate::IsoMaterial;
 use crate::resources;
 
 #[derive(Resource)]
@@ -47,7 +48,7 @@ pub fn ui_system(
     mut rotate_state: ResMut<RotateState>,
     mut panel_rects: ResMut<PanelRects>,
     pes_state: Option<Res<PesState>>,
-    pes3d_state: Option<Res<Pes3dState>>,
+    mut pes3d_state: Option<ResMut<Pes3dState>>,
 ) {
     let ctx = contexts.ctx_mut();
 
@@ -230,6 +231,119 @@ pub fn ui_system(
                     ui.label(format!("Mode: {}", mode_str));
                 } else {
                     ui.label("No energies (run CASTEP first)");
+                }
+            }
+
+            // ── Isosurface controls (only when in isosurface mode) ──
+            if let Some(ref mut ps) = pes3d_state {
+                if ps.has_energies && ps.vis_mode == VisMode::Isosurface {
+                    ui.horizontal(|ui| {
+                        ui.label("Isosurface step");
+                        ui.add(egui::DragValue::new(&mut ps.iso_step)
+                            .speed(0.1)
+                            .range(0.01..=1000.0)
+                            .suffix(" eV"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Material");
+                        egui::ComboBox::from_id_salt("iso_material")
+                            .selected_text(ps.iso_material.name())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut ps.iso_material, IsoMaterial::Opaque, "Opaque");
+                                ui.selectable_value(&mut ps.iso_material, IsoMaterial::SemiTransparent, "Semi-transparent");
+                                ui.selectable_value(&mut ps.iso_material, IsoMaterial::Transparent, "Transparent");
+                            });
+                    });
+                }
+            }
+
+            // ── Color mapping range (for all 3D PES modes) ──
+            if let Some(ref mut ps) = pes3d_state {
+                if ps.has_energies {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Color Mapping").strong());
+                    let e_min = ps.e_min;
+                    let e_max = ps.e_max;
+                    let color_min = ps.color_min;
+                    let color_max = ps.color_max;
+                    ui.horizontal(|ui| {
+                        ui.label("Min");
+                        ui.add(egui::DragValue::new(&mut ps.color_min)
+                            .speed(1.0)
+                            .range(e_min..=color_max)
+                            .suffix(" eV"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Max");
+                        ui.add(egui::DragValue::new(&mut ps.color_max)
+                            .speed(1.0)
+                            .range(color_min..=e_max)
+                            .suffix(" eV"));
+                    });
+                    if ui.button("Reset to full range").clicked() {
+                        ps.color_min = ps.e_min;
+                        ps.color_max = ps.e_max;
+                    }
+                }
+            }
+
+            // ── Spatial clipping (XYZ ranges) ──
+            if let Some(ref mut ps) = pes3d_state {
+                if ps.has_energies && ps.vis_mode == VisMode::Isosurface {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Spatial Clipping").strong());
+
+                    let clip_x = ps.clip_x;
+                    let clip_y = ps.clip_y;
+                    let clip_z = ps.clip_z;
+
+                    // X axis
+                    ui.horizontal(|ui| {
+                        ui.label("X min");
+                        ui.add(egui::DragValue::new(&mut ps.clip_x[0])
+                            .speed(0.01)
+                            .range(0.0..=clip_x[1]));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("X max");
+                        ui.add(egui::DragValue::new(&mut ps.clip_x[1])
+                            .speed(0.01)
+                            .range(clip_x[0]..=1.0));
+                    });
+
+                    // Y axis
+                    ui.horizontal(|ui| {
+                        ui.label("Y min");
+                        ui.add(egui::DragValue::new(&mut ps.clip_y[0])
+                            .speed(0.01)
+                            .range(0.0..=clip_y[1]));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Y max");
+                        ui.add(egui::DragValue::new(&mut ps.clip_y[1])
+                            .speed(0.01)
+                            .range(clip_y[0]..=1.0));
+                    });
+
+                    // Z axis
+                    ui.horizontal(|ui| {
+                        ui.label("Z min");
+                        ui.add(egui::DragValue::new(&mut ps.clip_z[0])
+                            .speed(0.01)
+                            .range(0.0..=clip_z[1]));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Z max");
+                        ui.add(egui::DragValue::new(&mut ps.clip_z[1])
+                            .speed(0.01)
+                            .range(clip_z[0]..=1.0));
+                    });
+
+                    if ui.button("Reset clipping").clicked() {
+                        ps.clip_x = [0.0, 1.0];
+                        ps.clip_y = [0.0, 1.0];
+                        ps.clip_z = [0.0, 1.0];
+                    }
                 }
             }
 

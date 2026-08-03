@@ -307,6 +307,7 @@ pub fn marching_cubes_mesh(
     field: &[f32], nx: usize, ny: usize, nz: usize,
     frac_range: &[[f64; 2]; 3], lattice: &Lattice,
     iso_value: f32, e_min: f32, e_max: f32,
+    clip_x: [f32; 2], clip_y: [f32; 2], clip_z: [f32; 2],  // fractional clipping ranges
 ) -> Option<Mesh> {
     if nx < 2 || ny < 2 || nz < 2 { return None; }
     let vecs = lattice.to_vectors();
@@ -328,6 +329,17 @@ pub fn marching_cubes_mesh(
             let fy = fy0 + j as f32 * dy;
             for i in 0..nx - 1 {
                 let fx = fx0 + i as f32 * dx;
+
+                // Skip cells outside clipping region (check cube center)
+                let cube_center_x = fx + dx * 0.5;
+                let cube_center_y = fy + dy * 0.5;
+                let cube_center_z = fz + dz * 0.5;
+                if cube_center_x < clip_x[0] || cube_center_x > clip_x[1] ||
+                   cube_center_y < clip_y[0] || cube_center_y > clip_y[1] ||
+                   cube_center_z < clip_z[0] || cube_center_z > clip_z[1] {
+                    continue;
+                }
+
                 let raw = |di, dj, dk| {
                     let idx = (k + dk) * ny * nx + (j + dj) * nx + (i + di);
                     if idx < field.len() { field[idx] } else { f32::MAX }

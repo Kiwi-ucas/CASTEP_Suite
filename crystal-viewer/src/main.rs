@@ -122,14 +122,43 @@ struct PesSurface;
 #[derive(Clone, PartialEq)]
 pub enum VisMode { Isosurface, Volume, Slice }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum IsoMaterial {
+    Opaque,           // alpha = 1.0, no transparency
+    SemiTransparent,  // alpha = 0.7, light transparency
+    Transparent,      // alpha = 0.3, heavy transparency
+}
+
+impl IsoMaterial {
+    pub fn alpha(&self) -> f32 {
+        match self {
+            IsoMaterial::Opaque => 1.0,
+            IsoMaterial::SemiTransparent => 0.7,
+            IsoMaterial::Transparent => 0.3,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            IsoMaterial::Opaque => "Opaque",
+            IsoMaterial::SemiTransparent => "Semi-transparent",
+            IsoMaterial::Transparent => "Transparent",
+        }
+    }
+}
+
 #[derive(Resource, Clone)]
 #[allow(dead_code)]
 pub struct Pes3dState {
     pub nx: usize, pub ny: usize, pub nz: usize,
     pub e_min: f32, pub e_max: f32,
+    pub color_min: f32, pub color_max: f32,  // user-configurable color mapping range
+    pub clip_x: [f32; 2], pub clip_y: [f32; 2], pub clip_z: [f32; 2],  // fractional clipping ranges [0,1]
     pub has_energies: bool, pub has_expanded: bool,
     pub show_surface: bool, pub vis_mode: VisMode,
     pub color_clip: f32, pub iso_value: f32,
+    pub iso_step: f32,  // user-configurable isosurface step size (eV)
+    pub iso_material: IsoMaterial,  // material preset
     pub slice_axis: u8, pub slice_pos: f32,
 }
 #[derive(Resource)] struct CubeResource(CubeData);
@@ -853,6 +882,7 @@ fn setup(
             &cube.field, cube.nx, cube.ny, cube.nz,
             &frac_range, &lattice,
             iso_value, e_min, e_max,
+            [0.0, 1.0], [0.0, 1.0], [0.0, 1.0],  // no clipping at startup
         ) {
             let solid_mat = materials.add(StandardMaterial {
                 base_color: Color::srgba(0.3, 0.6, 1.0, 0.5),
@@ -880,12 +910,17 @@ fn setup(
         }
 
         commands.insert_resource(CubeResource(cube.clone()));
+        let default_iso_step = (e_max - e_min) * 0.02;  // 2% of range as default
         commands.insert_resource(Pes3dState {
             nx: cube.nx, ny: cube.ny, nz: cube.nz,
             e_min, e_max,
+            color_min: e_min, color_max: e_max,  // default to full range
+            clip_x: [0.0, 1.0], clip_y: [0.0, 1.0], clip_z: [0.0, 1.0],  // default: no clipping
             has_energies: true, has_expanded: false,
             show_surface: true, vis_mode: VisMode::Isosurface,
             color_clip: 1.0, iso_value,
+            iso_step: default_iso_step,
+            iso_material: IsoMaterial::SemiTransparent,
             slice_axis: 2, slice_pos: 0.5,
         });
         } // end else (3D path)
@@ -1406,7 +1441,7 @@ fn update_isosurface(
     let held_plus  = keys.pressed(KeyCode::Equal) || keys.pressed(KeyCode::NumpadAdd);
     let held_minus = keys.pressed(KeyCode::Minus) || keys.pressed(KeyCode::NumpadSubtract);
 
-    let delta = (ps.e_max - ps.e_min) * 0.02;
+    let delta = ps.iso_step;
 
     // Instant single-step on tap
     if just_plus {
@@ -1473,12 +1508,16 @@ fn update_isosurface_mesh(
     if let Some(mc_mesh) = marching_cubes_mesh(
         &cube.0.field, cube.0.nx, cube.0.ny, cube.0.nz,
         &frac_range, &lattice,
-        ps.iso_value, ps.e_min, ps.e_max,
+        ps.iso_value, ps.color_min, ps.color_max,
+        ps.clip_x, ps.clip_y, ps.clip_z,
     ) {
-        let colormap = PesData::generate_surface_static(ps.e_min, ps.e_max);
+        let colormap = PesData::generate_surface_static(ps.color_min, ps.color_max);
+        let alpha = ps.iso_material.alpha();
         let tex = materials.add(StandardMaterial {
             base_color_texture: Some(images.add(colormap)),
-            alpha_mode: AlphaMode::Blend, unlit: true,
+            base_color: Color::srgba(1.0, 1.0, 1.0, alpha),  // apply alpha from material preset
+            alpha_mode: if alpha < 1.0 { AlphaMode::Blend } else { AlphaMode::Opaque },
+            unlit: true,
             cull_mode: None,
             ..default()
         });
@@ -1509,7 +1548,7 @@ fn update_slices_inner(
         let sm = meshes.add(slice_plane_mesh(&lattice, axis, pos));
         let tex = generate_slice_texture(
             &cube.0.field, cube.0.nx, cube.0.ny, cube.0.nz,
-            axis, pos, ps.e_min, ps.e_max, ps.color_clip,
+            axis, pos, ps.color_min, ps.color_max, ps.color_clip,
         );
         let mat = materials.add(StandardMaterial {
             base_color_texture: Some(images.add(tex)),
