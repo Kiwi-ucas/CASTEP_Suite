@@ -346,6 +346,12 @@ pub fn marching_cubes_mesh(
                 };
                 let cv = [raw(0, 0, 0), raw(1, 0, 0), raw(1, 1, 0), raw(0, 1, 0),
                           raw(0, 0, 1), raw(1, 0, 1), raw(1, 1, 1), raw(0, 1, 1)];
+                // Skip cells touching NaN holes (rejected atom-overlap points).
+                // NaN corners would be classified as "above iso" (NaN < x is
+                // false), producing ghost surfaces at hole edges whose UV is
+                // NaN → texture sample at (0,0) → constant deep blue,
+                // independent of iso_value.
+                if cv.iter().any(|v| !v.is_finite()) { continue; }
                 let mut ci = 0usize;
                 for (b, v) in cv.iter().enumerate() { if *v < iso_value { ci |= 1 << b } }
                 let em = tbl.edge[ci] as usize;

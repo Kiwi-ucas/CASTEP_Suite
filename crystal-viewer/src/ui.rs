@@ -225,7 +225,7 @@ pub fn ui_system(
                     ui.label(format!("E range: {:.2} – {:.2} eV", ps.e_min, ps.e_max));
                     let mode_str = match ps.vis_mode {
                         VisMode::Isosurface => format!("Isosurface (4) iso={:.2}", ps.iso_value),
-                        VisMode::Volume => "Volume (5)".to_string(),
+                        VisMode::Volume => format!("Volume (5) layer={:.1}", ps.vol_iso_ref),
                         VisMode::Slice => format!("Slice (6) axis={} pos={:.2}", ps.slice_axis, ps.slice_pos),
                     };
                     ui.label(format!("Mode: {}", mode_str));
@@ -252,6 +252,42 @@ pub fn ui_system(
                                 ui.selectable_value(&mut ps.iso_material, IsoMaterial::Opaque, "Opaque");
                                 ui.selectable_value(&mut ps.iso_material, IsoMaterial::SemiTransparent, "Semi-transparent");
                                 ui.selectable_value(&mut ps.iso_material, IsoMaterial::Transparent, "Transparent");
+                            });
+                    });
+                }
+            }
+
+            // ── Volume render controls (only when in volume mode) ──
+            if let Some(ref mut ps) = pes3d_state {
+                if ps.has_energies && ps.vis_mode == VisMode::Volume {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Volume").strong());
+                    ui.horizontal(|ui| {
+                        ui.label("Opacity");
+                        ui.add(egui::Slider::new(&mut ps.alpha_scale, 0.1..=2.0)
+                            .logarithmic(true));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Falloff");
+                        ui.add(egui::Slider::new(&mut ps.alpha_falloff, 0.05..=1.0));
+                    });
+                    let e_min = ps.e_min;
+                    let e_max = ps.e_max;
+                    ui.horizontal(|ui| {
+                        ui.label("Layer (eV)");
+                        ui.add(egui::DragValue::new(&mut ps.vol_iso_ref)
+                            .speed(1.0)
+                            .range(e_min..=e_max)
+                            .suffix(" eV"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Quality");
+                        egui::ComboBox::from_id_salt("vol_quality")
+                            .selected_text(format!("{} steps", ps.vol_steps))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut ps.vol_steps, 64u32, "64 steps");
+                                ui.selectable_value(&mut ps.vol_steps, 128u32, "128 steps");
+                                ui.selectable_value(&mut ps.vol_steps, 192u32, "192 steps");
                             });
                     });
                 }
@@ -287,9 +323,9 @@ pub fn ui_system(
                 }
             }
 
-            // ── Spatial clipping (XYZ ranges) ──
+            // ── Spatial clipping (XYZ ranges) — compact: one row per axis ──
             if let Some(ref mut ps) = pes3d_state {
-                if ps.has_energies && ps.vis_mode == VisMode::Isosurface {
+                if ps.has_energies && matches!(ps.vis_mode, VisMode::Isosurface | VisMode::Volume) {
                     ui.separator();
                     ui.label(egui::RichText::new("Spatial Clipping").strong());
 
@@ -297,46 +333,34 @@ pub fn ui_system(
                     let clip_y = ps.clip_y;
                     let clip_z = ps.clip_z;
 
-                    // X axis
+                    // Each row: axis label + "min"/"max" labels OUTSIDE the
+                    // DragValue (labels are not part of the editable value)
                     ui.horizontal(|ui| {
-                        ui.label("X min");
+                        ui.label("X");
+                        ui.label("min");
                         ui.add(egui::DragValue::new(&mut ps.clip_x[0])
-                            .speed(0.01)
-                            .range(0.0..=clip_x[1]));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("X max");
+                            .speed(0.01).range(0.0..=clip_x[1]));
+                        ui.label("max");
                         ui.add(egui::DragValue::new(&mut ps.clip_x[1])
-                            .speed(0.01)
-                            .range(clip_x[0]..=1.0));
+                            .speed(0.01).range(clip_x[0]..=1.0));
                     });
-
-                    // Y axis
                     ui.horizontal(|ui| {
-                        ui.label("Y min");
+                        ui.label("Y");
+                        ui.label("min");
                         ui.add(egui::DragValue::new(&mut ps.clip_y[0])
-                            .speed(0.01)
-                            .range(0.0..=clip_y[1]));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Y max");
+                            .speed(0.01).range(0.0..=clip_y[1]));
+                        ui.label("max");
                         ui.add(egui::DragValue::new(&mut ps.clip_y[1])
-                            .speed(0.01)
-                            .range(clip_y[0]..=1.0));
+                            .speed(0.01).range(clip_y[0]..=1.0));
                     });
-
-                    // Z axis
                     ui.horizontal(|ui| {
-                        ui.label("Z min");
+                        ui.label("Z");
+                        ui.label("min");
                         ui.add(egui::DragValue::new(&mut ps.clip_z[0])
-                            .speed(0.01)
-                            .range(0.0..=clip_z[1]));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Z max");
+                            .speed(0.01).range(0.0..=clip_z[1]));
+                        ui.label("max");
                         ui.add(egui::DragValue::new(&mut ps.clip_z[1])
-                            .speed(0.01)
-                            .range(clip_z[0]..=1.0));
+                            .speed(0.01).range(clip_z[0]..=1.0));
                     });
 
                     if ui.button("Reset clipping").clicked() {

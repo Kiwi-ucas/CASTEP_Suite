@@ -3,7 +3,7 @@ module poscastep_menu
     !! Structure: top-level menu -> property-specific sub-menus
     !! Currently implements: Plot Band Structure
     use castep_config, only: dp, pi, HARTREE_TO_EV, bands_data_t, pdos_data_t, &
-        cif_data_t, atom_t, castep_config_t, MAX_LINE_LEN, &
+        cif_data_t, atom_t, castep_config_t, sym_op_t, MAX_LINE_LEN, &
         IO_INVALID_INPUT, IO_SUCCESS, IO_USER_QUIT, &
         IO_FILE_NOT_FOUND, IO_PARSE_ERROR, IO_WRITE_ERROR, IO_PRECASTEP_LAUNCH, &
         TASK_ENERGY, TASK_GEOMETRY_OPT, PSEUDO_C19MK2, KPOINT_GAMMA, &
@@ -3187,6 +3187,12 @@ contains
                 if (ios /= 0) then
                     write(*, '(a)') '  Error in orbit mapping; falling back to full grid.'
                     grid%use_symmetry = .false.
+                else
+                    ! Filter points that overlap fixed atoms + force-include the
+                    ! mobile atom's own site (equilibrium position). Without this,
+                    ! orbit merging assigns the mobile site the energy of a
+                    ! doubly-occupied neighbouring Li site (see design notes).
+                    call filter_irred_points(grid, cfg, mi, cif%sym_ops, cif%n_symops)
                 end if
             else
                 write(*, '(a)') '  No symmetry operations found; using full grid.'
@@ -3272,6 +3278,12 @@ contains
         ! ── Generate files ──
         write(*, '(a,i0,a)') '  Generating ', n_total, ' grid points...'
         do i = 1, n_total
+            ! Skip rejected points (overlap fixed atoms) — no directory,
+            ! no CASTEP run; expansion leaves them as NaN holes.
+            if (grid%use_symmetry .and. allocated(grid%irred_flags)) then
+                if (grid%irred_flags(i) == 2) cycle
+            end if
+
             if (grid%use_symmetry .and. allocated(grid%irred_coords)) then
                 fx = grid%irred_coords(1, i)
                 fy = grid%irred_coords(2, i)
@@ -3324,13 +3336,16 @@ contains
         deallocate(dummy_energies)
 
         ! ── Write irreducible coordinates sidecar (for collection) ──
+        ! Format v3: one line per point "ix iy iz flag"
+        !   flag 0 = normal (symmetry-expanded), 1 = special (mobile site,
+        !   fill own grid point only), 2 = rejected (no energy, NaN hole)
         if (grid%use_symmetry .and. allocated(grid%irred_coords)) then
             block
-                integer :: unit_irr, ii, ix, iy, iz
+                integer :: unit_irr, ii, ix, iy, iz, iflag
                 open(newunit=unit_irr, file=trim(scan_dir)//'/irred_coords.dat', &
                      status='replace', action='write', iostat=ios)
                 if (ios == 0) then
-                    write(unit_irr, '(a)') '# irred_index_v2'
+                    write(unit_irr, '(a)') '# irred_index_v3'
                     write(unit_irr, '(4(i0,1x))') grid%n_irred, grid%n_points(1), &
                                                   grid%n_points(2), grid%n_points(3)
                     do ii = 1, grid%n_irred
@@ -3338,7 +3353,9 @@ contains
                         ix = nint(grid%irred_coords(1, ii) * grid%n_points(1))
                         iy = nint(grid%irred_coords(2, ii) * grid%n_points(2))
                         iz = nint(grid%irred_coords(3, ii) * grid%n_points(3))
-                        write(unit_irr, '(3(i0,1x))') ix, iy, iz
+                        iflag = 0
+                        if (allocated(grid%irred_flags)) iflag = grid%irred_flags(ii)
+                        write(unit_irr, '(4(i0,1x))') ix, iy, iz, iflag
                     end do
                     close(unit_irr)
                 end if
@@ -3375,6 +3392,190 @@ contains
         write(*, '(a,a)')   '  Directory:    ', trim(scan_dir)
         write(*, '(a)') ''
     end subroutine handle_pes3d_generate
+
+
+    subroutine filter_irred_points(grid, cfg, mobile_idx, sym_ops, n_symops)
+        !! Assign per-point flags to the irreducible grid:
+        !!   flag 0 = normal point (expanded by all symmetry ops)
+        !!   flag 1 = mobile atom's own site (equilibrium position) — filled
+        !!            ONLY at its own grid point, never expanded. The scan
+        !!            structure (23 fixed Li + 1 mobile Li, vacancy at the
+        !!            mobile site) breaks space-group symmetry: the mobile
+        !!            site is NOT equivalent to other sites in its symmetry
+        !!            orbit (those are doubly-occupied → very high energy).
+        !!            Orbit merging would assign the mobile site the high
+        !!            energy of a neighbour site, hiding the true minimum.
+        !!   flag 2 = rejected: closer than MIN_DIST to a fixed atom —
+        !!            overlapping configurations are DFT artifacts
+        !!            (CASTEP "Overlapping atoms" warning), no energy.
+        !!   flag 3 = mobile-site well (single-particle-potential approx.):
+        !!            computed individually, then expanded by symmetry to the
+        !!            other Li sites, giving the Li potential wells at every
+        !!            equivalent site. The scan structure's broken symmetry
+        !!            makes the orbit representative unrepresentative for
+        !!            points near the mobile site, so the well points that
+        !!            belong to rejected orbits are computed explicitly.
+        type(pes_grid_t), intent(inout) :: grid
+        type(castep_config_t), intent(in) :: cfg
+        integer, intent(in) :: mobile_idx
+        type(sym_op_t), intent(in) :: sym_ops(:)
+        integer, intent(in) :: n_symops
+
+        real(dp), parameter :: MIN_DIST = 1.0_dp   ! Å rejection threshold
+        integer, parameter :: A_RADIUS = 6          ! grid steps around mobile
+                                                    ! site: covers the Voronoi
+                                                    ! cell of the mobile site
+                                                    ! (6/50·a ≈ 1.23 Å for
+                                                    ! a = 10.28 Å, Li–Li half
+                                                    ! distance ≈ 1.17 Å)
+        real(dp) :: lat(3,3), p(3), df(3), dmin, d, a_frac(3)
+        integer :: i, j, ii, n_irr, n_rej, n_special, n_reloc
+        integer :: a_ix, a_iy, a_iz, qx, qy, qz
+        integer :: best_px, best_py, best_pz, ei, ej, ek, ti, tj, tk, io
+        real(dp) :: best_da, da
+        logical :: a_present
+        real(dp), allocatable :: tmp_coords(:,:)
+        integer, allocatable :: tmp_flags(:)
+
+        n_irr = grid%n_irred
+        if (n_irr < 1) return
+        if (.not. allocated(grid%irred_flags)) allocate(grid%irred_flags(n_irr))
+        grid%irred_flags = 0
+
+        ! Only meaningful for fractional input (CIF). For Cartesian input the
+        ! periodic-image distance check below would be wrong — skip filtering.
+        if (cfg%cartesian_coords) then
+            write(*, '(a)') '  WARNING: Cartesian input — skipping atom-overlap filter.'
+            return
+        end if
+
+        lat = compute_cartesian_lattice(cfg%cell_length(1), cfg%cell_length(2), &
+                                        cfg%cell_length(3), cfg%cell_angle(1), &
+                                        cfg%cell_angle(2), cfg%cell_angle(3))
+
+        ! ── Pass 1: reject points too close to any fixed atom ──
+        n_rej = 0
+        do i = 1, n_irr
+            p = grid%irred_coords(:, i)
+            dmin = huge(1.0_dp)
+            do j = 1, cfg%num_atoms
+                if (j == mobile_idx) cycle
+                df(1) = p(1) - cfg%atom_x(j)
+                df(2) = p(2) - cfg%atom_y(j)
+                df(3) = p(3) - cfg%atom_z(j)
+                df = df - nint(df)          ! nearest periodic image
+                d = norm2(matmul(lat, df))  ! Cartesian distance (Å)
+                dmin = min(dmin, d)
+            end do
+            if (dmin < MIN_DIST) then
+                grid%irred_flags(i) = 2
+                n_rej = n_rej + 1
+            end if
+        end do
+
+        ! ── Pass 3: orbit-representative relocation (single-particle approx.) ──
+        ! For each REJECTED representative Q, search its symmetry orbit for a
+        ! SAFE grid point P (distance to all fixed atoms >= MIN_DIST),
+        ! preferring the mobile site A itself. If found, RELOCATE the
+        ! representative to P (flag=0): the well energy is computed ONCE and
+        ! expanded to the whole orbit (the single-particle-potential
+        ! approximation — every Li site then shows its well), and overlap
+        ! points inside the orbit are later NaN'd by the per-grid-point
+        ! distance filter in collect. No extra calculations are needed: the
+        ! orbit still has exactly one representative.
+        n_irr = grid%n_irred
+        a_ix = nint(a_frac(1) * grid%n_points(1))
+        a_iy = nint(a_frac(2) * grid%n_points(2))
+        a_iz = nint(a_frac(3) * grid%n_points(3))
+        do ii = 1, n_irr
+            if (grid%irred_flags(ii) /= 2) cycle
+            ! Search the orbit of representative ii for a safe point
+            best_px = -1; best_py = -1; best_pz = -1
+            best_da = huge(1.0_dp)   ! distance to mobile site A (grid steps)
+            qx = nint(grid%irred_coords(1, ii) * grid%n_points(1))
+            qy = nint(grid%irred_coords(2, ii) * grid%n_points(2))
+            qz = nint(grid%irred_coords(3, ii) * grid%n_points(3))
+            do io = 1, n_symops
+                ti = nint(sym_ops(io)%trans(1) * grid%n_points(1))
+                tj = nint(sym_ops(io)%trans(2) * grid%n_points(2))
+                tk = nint(sym_ops(io)%trans(3) * grid%n_points(3))
+                ei = sym_ops(io)%rot(1,1)*qx + sym_ops(io)%rot(1,2)*qy &
+                   + sym_ops(io)%rot(1,3)*qz + ti
+                ej = sym_ops(io)%rot(2,1)*qx + sym_ops(io)%rot(2,2)*qy &
+                   + sym_ops(io)%rot(2,3)*qz + tj
+                ek = sym_ops(io)%rot(3,1)*qx + sym_ops(io)%rot(3,2)*qy &
+                   + sym_ops(io)%rot(3,3)*qz + tk
+                ei = modulo(ei, grid%n_points(1))
+                ej = modulo(ej, grid%n_points(2))
+                ek = modulo(ek, grid%n_points(3))
+                ! Distance to nearest fixed atom
+                dmin = huge(1.0_dp)
+                do j = 1, cfg%num_atoms
+                    if (j == mobile_idx) cycle
+                    df(1) = real(ei, dp)/real(grid%n_points(1), dp) - cfg%atom_x(j)
+                    df(2) = real(ej, dp)/real(grid%n_points(2), dp) - cfg%atom_y(j)
+                    df(3) = real(ek, dp)/real(grid%n_points(3), dp) - cfg%atom_z(j)
+                    df = df - nint(df)
+                    d = norm2(matmul(lat, df))
+                    dmin = min(dmin, d)
+                end do
+                if (dmin >= MIN_DIST) then
+                    ! Safe point — prefer the one closest to mobile site A
+                    da = hypot(real(ei - a_ix, dp), real(ej - a_iy, dp)) &
+                       + abs(real(ek - a_iz, dp))
+                    if (da < best_da) then
+                        best_da = da
+                        best_px = ei; best_py = ej; best_pz = ek
+                    end if
+                end if
+            end do
+            if (best_px >= 0) then
+                ! Relocate: well point becomes the representative
+                grid%irred_coords(1, ii) = real(best_px, dp) / real(grid%n_points(1), dp)
+                grid%irred_coords(2, ii) = real(best_py, dp) / real(grid%n_points(2), dp)
+                grid%irred_coords(3, ii) = real(best_pz, dp) / real(grid%n_points(3), dp)
+                grid%irred_flags(ii) = 0
+                n_reloc = n_reloc + 1
+            end if
+        end do
+        ! ── Pass 2 (after relocation): force-include the mobile atom's own
+        ! site A. If relocation already made A an orbit representative
+        ! (flag=0), it is computed and expanded normally — no special
+        ! handling needed. Otherwise append it as flag=1 (filled at its own
+        ! grid point only; its equilibrium energy must be exact).
+        a_frac = [cfg%atom_x(mobile_idx), cfg%atom_y(mobile_idx), cfg%atom_z(mobile_idx)]
+        a_present = .false.
+        do i = 1, n_irr
+            if (maxval(abs(grid%irred_coords(:, i) - a_frac)) < 1.0e-6_dp) then
+                a_present = .true.
+                exit
+            end if
+        end do
+        if (.not. a_present) then
+            ! Append the mobile site (its equilibrium energy must be computed)
+            allocate(tmp_coords(3, n_irr), tmp_flags(n_irr))
+            tmp_coords = grid%irred_coords(:, 1:n_irr)
+            tmp_flags = grid%irred_flags
+            deallocate(grid%irred_coords, grid%irred_flags)
+            allocate(grid%irred_coords(3, n_irr + 1), grid%irred_flags(n_irr + 1))
+            grid%irred_coords(:, 1:n_irr) = tmp_coords
+            grid%irred_flags(1:n_irr) = tmp_flags
+            grid%irred_coords(:, n_irr + 1) = a_frac
+            grid%irred_flags(n_irr + 1) = 1
+            grid%n_irred = n_irr + 1
+            deallocate(tmp_coords, tmp_flags)
+        end if
+
+        n_special = count(grid%irred_flags == 1)
+        write(*, '(a)') '  ── Atom-overlap filter ──'
+        write(*, '(a, f4.1, a, i0)') '  Rejected (dist < ', MIN_DIST, &
+            ' Å to fixed atom): ', n_rej
+        write(*, '(a, i0, a)') '  Relocated representatives (safe well point, computed + expanded): ', &
+            n_reloc
+        write(*, '(a, i0, a)') '  Mobile-site special points (flag 1): ', &
+            count(grid%irred_flags == 1)
+        write(*, '(a, i0)') '  Effective scan points: ', grid%n_irred - n_rej
+    end subroutine filter_irred_points
 
 
     subroutine print_allowed_grid_hint(m)

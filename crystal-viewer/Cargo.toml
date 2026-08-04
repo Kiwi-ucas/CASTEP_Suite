@@ -23,6 +23,7 @@ bevy = { version = "0.15", default-features = false, features = [
 bevy_egui = "0.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+half = "2"   # f32 → f16 conversion for R16Float volume texture
 
 [profile.release]
 lto = true

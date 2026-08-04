@@ -42,6 +42,11 @@ module pes
         real(dp) :: half_dist(3) = 0.0_dp           ! symmetry half-distance per axis
         integer  :: n_irred = 0                     ! number of irreducible grid points
         real(dp), allocatable :: irred_coords(:,:)   ! (3, n_irred) irreducible coords
+        ! Per-point flag: 0 = normal (symmetry-expanded), 1 = special (mobile
+        ! atom's own site — fill only its own grid point, do NOT expand; its
+        ! energy is the equilibrium value, different from the rest of its
+        ! symmetry orbit), 2 = rejected (too close to a fixed atom, no energy).
+        integer, allocatable :: irred_flags(:)
     end type pes_grid_t
 
 contains
@@ -541,10 +546,12 @@ contains
         logical :: was_expanded, coords_are_exact
         real(dp), allocatable :: irred_energies(:), irred_coords(:,:)
         integer, allocatable :: irred_idx(:,:)
+        integer, allocatable :: irred_flags(:)   ! 0=normal, 1=mobile-site special, 2=rejected
         integer :: na_f, nb_f, nc_f
         integer :: n_symops, rot(3,3,MAX_SYM_OPS)
         real(dp) :: trans(3,MAX_SYM_OPS), fx, fy, fz
         integer :: exp_nx, exp_ny, exp_nz, n_exp, iexp, ei, ej, ek, n_filled, n_holes
+        integer :: n_holes_extra
         real(dp), allocatable :: exp_energies(:)
         logical, allocatable :: exp_filled(:)
         real(dp) :: exp_frac(3)
@@ -644,14 +651,33 @@ contains
                 end if
 
                 read(unit_irr, '(a)') first_line
-                if (index(first_line, '# irred_index_v2') > 0) then
-                    ! New format: integer indices
+                if (index(first_line, '# irred_index_v3') > 0) then
+                    ! v3: integer indices + per-point flag (ix iy iz flag)
+                    !   flag 0 = normal, 1 = mobile-site special (own grid
+                    !   point only), 2 = rejected (overlap, no energy)
                     read(unit_irr, *) n_irr, na_f, nb_f, nc_f
-                    allocate(irred_idx(3, n_irr), irred_energies(n_irr), stat=ios)
+                    allocate(irred_idx(3, n_irr), irred_energies(n_irr), &
+                             irred_flags(n_irr), stat=ios)
                     if (ios /= 0) then
                         close(unit_irr); deallocate(energies, has_energy, header_buf)
                         iostat = 1; return
                     end if
+                    irred_flags = 0
+                    do ii = 1, n_irr
+                        read(unit_irr, *, iostat=ios) irred_idx(:, ii), irred_flags(ii)
+                        if (ios /= 0) exit
+                    end do
+                    coords_are_exact = .true.
+                else if (index(first_line, '# irred_index_v2') > 0) then
+                    ! v2: integer indices only (all points normal)
+                    read(unit_irr, *) n_irr, na_f, nb_f, nc_f
+                    allocate(irred_idx(3, n_irr), irred_energies(n_irr), &
+                             irred_flags(n_irr), stat=ios)
+                    if (ios /= 0) then
+                        close(unit_irr); deallocate(energies, has_energy, header_buf)
+                        iostat = 1; return
+                    end if
+                    irred_flags = 0
                     do ii = 1, n_irr
                         read(unit_irr, *, iostat=ios) irred_idx(:, ii)
                         if (ios /= 0) exit
@@ -677,6 +703,13 @@ contains
                 ! Step 2: Collect CASTEP energies per irreducible point
                 collected = 0; missing = 0
                 do ii = 1, n_irr
+                    ! Rejected points (flag=2) are NEVER collected — even if a
+                    ! stale directory exists (e.g. copied from an old scan),
+                    ! their energies are overlap artifacts and would corrupt
+                    ! the E_min reference (relative-energy zero).
+                    if (allocated(irred_flags)) then
+                        if (irred_flags(ii) == 2) cycle
+                    end if
                     write(grid_dir, '(a,a,i5.5)') trim(scan_dir), '/irred_', ii
                     castep_file = find_castep_in_dir(grid_dir)
                     if (len_trim(castep_file) > 0) then
@@ -726,8 +759,15 @@ contains
 
                     ! Forward orbit expansion
                     if (coords_are_exact) then
-                        ! New format: integer arithmetic, zero floating-point error
+                        ! ── Pass 1: normal points (flag=0) expanded by all
+                        ! symmetry ops. Rejected points (flag=2) are skipped
+                        ! unconditionally — their grid points stay NaN (holes)
+                        ! even if a stale directory happens to exist.
                         do ii = 1, n_irr
+                            if (allocated(irred_flags)) then
+                                if (irred_flags(ii) == 2) cycle  ! rejected
+                                if (irred_flags(ii) == 1) cycle  ! special — pass 2
+                            end if
                             if (irred_energies(ii) > huge(1.0_dp) * 0.5_dp) cycle  ! missing
                             do i = 1, n_symops
                                 ! Integer rotation + translation (trans*N is guaranteed integer)
@@ -750,6 +790,27 @@ contains
                                 end if
                             end do
                         end do
+
+                        ! ── Pass 2: special points (flag=1) — the mobile atom's
+                        ! own site. Its equilibrium energy is NOT symmetry-
+                        ! equivalent to the other sites of its orbit (those are
+                        ! doubly-occupied → high energy), so it is written ONLY
+                        ! at its own grid point, overriding whatever the orbit
+                        ! expansion wrote there.
+                        if (allocated(irred_flags)) then
+                            do ii = 1, n_irr
+                                if (irred_flags(ii) /= 1) cycle
+                                if (irred_energies(ii) > huge(1.0_dp) * 0.5_dp) cycle
+                                ei = irred_idx(1, ii)
+                                ej = irred_idx(2, ii)
+                                ek = irred_idx(3, ii)
+                                iexp = ek * (exp_nx+1) * (exp_ny+1) + ej * (exp_nx+1) + ei + 1
+                                if (iexp >= 1 .and. iexp <= n_exp) then
+                                    exp_energies(iexp) = irred_energies(ii)  ! override
+                                    exp_filled(iexp) = .true.
+                                end if
+                            end do
+                        end if
                     else
                         ! Legacy format: floating-point with rounding errors
                         do ii = 1, n_irr
@@ -815,11 +876,11 @@ contains
 
                     if (n_holes > 0) then
                         write(*, '(a)') '  ── Expansion Diagnostics ──'
-                        write(*, '(a,i0,a,i0)') '  ERROR: ', n_holes, &
-                            ' grid points have no symmetry image from the irreducible set, out of ', n_exp
-                        write(*, '(a)') '  This indicates the orbit grid is not commensurate with ' // &
-                            'the space group translations, or CASTEP results are missing.'
-                        write(*, '(a)') '  Energies at these points are left as NaN (not interpolated).'
+                        write(*, '(a,i0,a,i0)') '  INFO: ', n_holes, &
+                            ' grid points left empty (NaN) out of ', n_exp
+                        write(*, '(a)') '  Expected: points rejected by the atom-overlap filter ' // &
+                            '(mobile atom closer than 1.0 Å to a fixed atom) have no energy.'
+                        write(*, '(a)') '  If holes are far from atoms, CASTEP results may be missing.'
                     end if
 
                     ! Periodic boundary self-check (x-face only as representative)
@@ -834,6 +895,70 @@ contains
                         end do
                     end do
                     write(*, '(a,i0)') '  Periodic boundary check (x-face mismatches): ', n_face_bad
+
+                    ! ── Per-grid-point distance filter ──
+                    ! Orbit representatives may be safe while some of their
+                    ! symmetry images overlap fixed atoms (relocated reps
+                    ! expand into overlap points). NaN those grid points.
+                    block
+                        real(dp) :: atom_cart(3, natom), frac_p(3), cart_p(3), dfc(3)
+                        real(dp) :: lvec(3,3), dminp, dtmp
+                        integer :: mobile_idx0, kp, ix, iy, iz, ia, iidx
+                        character(len=256) :: aline
+                        real(dp), parameter :: MIND = 1.0_dp   ! Å
+                        integer :: zz
+                        real(dp) :: chg
+
+                        ! Lattice vectors: dv (N+1 header, = lattice/N) * N
+                        lvec(:,1) = dv(:,1) * real(exp_nx, dp)
+                        lvec(:,2) = dv(:,2) * real(exp_ny, dp)
+                        lvec(:,3) = dv(:,3) * real(exp_nz, dp)
+
+                        ! Atoms (header lines 7..6+natom: Z charge x y z)
+                        do ia = 1, natom
+                            read(header_buf(6 + ia), *) zz, chg, &
+                                atom_cart(1, ia), atom_cart(2, ia), atom_cart(3, ia)
+                        end do
+
+                        ! Mobile atom index from JSON ("mobile_idx":N, 0-based)
+                        mobile_idx0 = 0
+                        kp = index(json_line, '"mobile_idx"')
+                        if (kp > 0) then
+                            kp = index(json_line(kp:), ':') + kp - 1
+                            read(json_line(kp+1:), *, iostat=ios) mobile_idx0
+                            mobile_idx0 = mobile_idx0 + 1
+                        end if
+
+                        n_holes_extra = 0
+                        do iz = 0, exp_nz
+                            do iy = 0, exp_ny
+                                do ix = 0, exp_nx
+                                    iidx = iz * (exp_nx+1) * (exp_ny+1) + iy * (exp_nx+1) + ix + 1
+                                    if (.not. exp_filled(iidx)) cycle
+                                    frac_p(1) = real(ix, dp) / real(exp_nx, dp)
+                                    frac_p(2) = real(iy, dp) / real(exp_ny, dp)
+                                    frac_p(3) = real(iz, dp) / real(exp_nz, dp)
+                                    cart_p = frac_p(1)*lvec(:,1) + frac_p(2)*lvec(:,2) &
+                                           + frac_p(3)*lvec(:,3)
+                                    dminp = huge(1.0_dp)
+                                    do ia = 1, natom
+                                        if (ia == mobile_idx0) cycle
+                                        dfc = cart_p - atom_cart(:, ia)
+                                        dtmp = sqrt(dfc(1)**2 + dfc(2)**2 + dfc(3)**2)
+                                        dminp = min(dminp, dtmp)
+                                    end do
+                                    if (dminp < MIND) then
+                                        exp_filled(iidx) = .false.
+                                        n_holes_extra = n_holes_extra + 1
+                                    end if
+                                end do
+                            end do
+                        end do
+                        if (n_holes_extra > 0) then
+                            write(*, '(a, i0, a)') '  Per-point overlap filter: ', n_holes_extra, &
+                                ' grid points NaN (inside fixed-atom exclusion radius)'
+                        end if
+                    end block
 
                     ! Replace energies/has_energy with expanded arrays
                     deallocate(energies, has_energy)
@@ -881,6 +1006,7 @@ contains
                 deallocate(irred_energies)
                 if (allocated(irred_coords)) deallocate(irred_coords)
                 if (allocated(irred_idx)) deallocate(irred_idx)
+                if (allocated(irred_flags)) deallocate(irred_flags)
             else
                 ! Rectangular grid format
                 do k = 1, nz

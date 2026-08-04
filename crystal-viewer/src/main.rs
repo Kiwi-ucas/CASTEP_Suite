@@ -13,7 +13,7 @@ use ui::{AtomInfo, CrystalMeta, ui_system};
 use pes::PesData;
 use cube_reader::{CubeData, is_cube, parse_cube};
 use marching_cubes::marching_cubes_mesh;
-use volume_render::volume_proxy_mesh;
+use volume_render::{VolumeMaterial, VolumeParams, volume_proxy_mesh, build_volume_texture, update_volume};
 use slice_plane::{generate_slice_texture, slice_plane_mesh};
 use std::f32::consts::PI;
 use std::env;
@@ -25,6 +25,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(bevy_egui::EguiPlugin)
+        .add_plugins(volume_render::VolumePlugin)
         .insert_resource(CrystalPath(json_path.to_string()))
         .init_resource::<PanelRects>()
         .add_systems(Startup, setup)
@@ -41,6 +42,7 @@ fn main() {
         .add_systems(Update, (toggle_surface_combined, update_color_clip, update_pes_surface).chain().after(ui_system))
         .add_systems(Update, toggle_pes3d_mode.after(ui_system))
         .add_systems(Update, (update_isosurface, update_isosurface_mesh).chain().after(ui_system))
+        .add_systems(Update, update_volume.after(ui_system))
         .add_systems(Update, update_slices_inner.after(ui_system))
         .run();
 }
@@ -159,11 +161,15 @@ pub struct Pes3dState {
     pub color_clip: f32, pub iso_value: f32,
     pub iso_step: f32,  // user-configurable isosurface step size (eV)
     pub iso_material: IsoMaterial,  // material preset
+    pub alpha_scale: f32,   // volume render: opacity multiplier
+    pub alpha_falloff: f32, // volume render: gaussian window width (energy layer selector)
+    pub vol_iso_ref: f32,   // volume render: band-pass window center (eV)
+    pub vol_steps: u32,     // volume render: ray-march step count
     pub slice_axis: u8, pub slice_pos: f32,
 }
 #[derive(Resource)] struct CubeResource(CubeData);
 #[derive(Component)] struct IsoSurface;
-#[derive(Component)] struct VolumeProxy;
+#[derive(Component)] pub struct VolumeProxy;
 #[derive(Component)] struct SlicePlaneMesh;
 
 #[derive(Resource)]
@@ -600,10 +606,24 @@ fn uv_sphere(radius: f32, sec: u32, stk: u32) -> Mesh {
 
 // ── Scene ──
 
+/// Percentile of the valid (finite) field values — used for the default
+/// color-mapping range so that outlier points don't wash out the colormap.
+fn energy_percentile(field: &[f32], p: f64) -> f32 {
+    let mut vals: Vec<f32> = field.iter().filter(|v| v.is_finite()).copied().collect();
+    if vals.is_empty() { return 0.0; }
+    vals.sort_by(|a, b| a.total_cmp(b));
+    let i = p * (vals.len() - 1) as f64;
+    let lo = i.floor() as usize;
+    let hi = i.ceil() as usize;
+    let frac = (i - lo as f64) as f32;
+    vals[lo] + (vals[hi] - vals[lo]) * frac
+}
+
 fn setup(
     mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
-    mut materials: ResMut<Assets<StandardMaterial>>, crystal_path: Res<CrystalPath>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut vol_materials: ResMut<Assets<VolumeMaterial>>, crystal_path: Res<CrystalPath>,
 ) {
     // ── Cube file detection ──
     let cube_opt: Option<CubeData> = if is_cube(&crystal_path.0) {
@@ -856,6 +876,12 @@ fn setup(
         let lattice = cube.to_lattice();
         let e_min = cube.field.iter().cloned().fold(f32::MAX, f32::min);
         let e_max = cube.field.iter().cloned().fold(f32::MIN, f32::max);
+        // Default color mapping range: 5th–95th percentile of valid data.
+        // The raw min/max range is dominated by a few outlier points (e.g. 0–3223 eV
+        // with 91% of data in 400–500 eV), which makes the jet colormap render
+        // almost everything blue. Percentiles give visible color variation.
+        let c_min = energy_percentile(&cube.field, 0.05);
+        let c_max = energy_percentile(&cube.field, 0.95);
         // Extract actual fractional range from cube metadata (fallback to [0,1])
         let frac_range = cube.pes_meta.as_ref()
             .and_then(|m| {
@@ -868,14 +894,19 @@ fn setup(
         println!("PES 3D: {}x{}x{} grid, E=[{:.4}, {:.4}], {} atoms",
             cube.nx, cube.ny, cube.nz, e_min, e_max, cube.atoms.len());
 
-        // Spawn volume proxy (mode 5)
+        // Spawn volume proxy (mode 5) — custom ray-march material
         let vol_mesh = meshes.add(volume_proxy_mesh(&lattice));
-        let vol_mat = materials.add(StandardMaterial {
-            base_color: Color::srgba(0.3, 0.3, 0.8, 0.15),
-            alpha_mode: AlphaMode::Blend, unlit: true, ..default()
+        let vol_img = images.add(build_volume_texture(
+            &cube.field, cube.nx, cube.ny, cube.nz, c_min, c_max));
+        let vol_mat = vol_materials.add(VolumeMaterial {
+            volume: vol_img,
+            params: VolumeParams::default(),
         });
         commands.spawn((Mesh3d(vol_mesh), MeshMaterial3d(vol_mat), VolumeProxy, Visibility::Hidden));
 
+        // Volume-mode ISO ref: median energy (window center in the dense band).
+        // Isosurface mode gets the classic 15% point of the full range.
+        let iso_value_vol = energy_percentile(&cube.field, 0.5);
         // Spawn MC isosurface
         let iso_value = e_min + 0.15 * (e_max - e_min);
         if let Some(mc_mesh) = marching_cubes_mesh(
@@ -914,13 +945,17 @@ fn setup(
         commands.insert_resource(Pes3dState {
             nx: cube.nx, ny: cube.ny, nz: cube.nz,
             e_min, e_max,
-            color_min: e_min, color_max: e_max,  // default to full range
+            color_min: c_min, color_max: c_max,  // percentile-based default range
             clip_x: [0.0, 1.0], clip_y: [0.0, 1.0], clip_z: [0.0, 1.0],  // default: no clipping
             has_energies: true, has_expanded: false,
             show_surface: true, vis_mode: VisMode::Isosurface,
             color_clip: 1.0, iso_value,
             iso_step: default_iso_step,
             iso_material: IsoMaterial::SemiTransparent,
+            alpha_scale: 0.8, alpha_falloff: 0.25, vol_steps: 128,
+            // Volume ISO ref starts at the data median so the band-pass window
+            // sits in the dense energy band by default.
+            vol_iso_ref: iso_value_vol,
             slice_axis: 2, slice_pos: 0.5,
         });
         } // end else (3D path)
@@ -1286,6 +1321,7 @@ fn toggle_surface_combined(
         Query<&mut Visibility, With<PesSurface>>,
         Query<&mut Visibility, With<IsoSurface>>,
         Query<&mut Visibility, With<SlicePlaneMesh>>,
+        Query<&mut Visibility, With<VolumeProxy>>,
     )>,
     mut contexts: EguiContexts,
 ) {
@@ -1297,6 +1333,8 @@ fn toggle_surface_combined(
         let vis = if ps.show_surface { Visibility::Inherited } else { Visibility::Hidden };
         if ps.vis_mode == VisMode::Isosurface {
             for mut v in vis_q.p1().iter_mut() { *v = vis; }
+        } else if ps.vis_mode == VisMode::Volume {
+            for mut v in vis_q.p3().iter_mut() { *v = vis; }
         } else if ps.vis_mode == VisMode::Slice {
             for mut v in vis_q.p2().iter_mut() { *v = vis; }
         }
@@ -1434,7 +1472,10 @@ fn update_isosurface(
 ) {
     if contexts.ctx_mut().wants_keyboard_input() { return; }
     let ps = match pes3d_state.as_mut() { Some(ps) => ps, None => return };
-    if ps.vis_mode != VisMode::Isosurface { return; }
+    // +/- adjusts iso_value (Isosurface mode) or vol_iso_ref (Volume mode —
+    // the energy-layer window center). update_isosurface_mesh has its own
+    // Isosurface guard so the MC mesh is not rebuilt in Volume mode.
+    if ps.vis_mode == VisMode::Slice { return; }
 
     let just_plus  = keys.just_pressed(KeyCode::Equal) || keys.just_pressed(KeyCode::NumpadAdd);
     let just_minus = keys.just_pressed(KeyCode::Minus) || keys.just_pressed(KeyCode::NumpadSubtract);
@@ -1445,12 +1486,20 @@ fn update_isosurface(
 
     // Instant single-step on tap
     if just_plus {
-        ps.iso_value = (ps.iso_value + delta).min(ps.e_max);
+        if ps.vis_mode == VisMode::Volume {
+            ps.vol_iso_ref = (ps.vol_iso_ref + delta).min(ps.e_max);
+        } else {
+            ps.iso_value = (ps.iso_value + delta).min(ps.e_max);
+        }
         *hold_time = 0.0;
         return;
     }
     if just_minus {
-        ps.iso_value = (ps.iso_value - delta).max(ps.e_min);
+        if ps.vis_mode == VisMode::Volume {
+            ps.vol_iso_ref = (ps.vol_iso_ref - delta).max(ps.e_min);
+        } else {
+            ps.iso_value = (ps.iso_value - delta).max(ps.e_min);
+        }
         *hold_time = 0.0;
         return;
     }
@@ -1470,13 +1519,36 @@ fn update_isosurface(
 
     let step_delta = delta * steps as f32;
     if held_plus {
-        ps.iso_value = (ps.iso_value + step_delta).min(ps.e_max);
+        if ps.vis_mode == VisMode::Volume {
+            ps.vol_iso_ref = (ps.vol_iso_ref + step_delta).min(ps.e_max);
+        } else {
+            ps.iso_value = (ps.iso_value + step_delta).min(ps.e_max);
+        }
     } else {
-        ps.iso_value = (ps.iso_value - step_delta).max(ps.e_min);
+        if ps.vis_mode == VisMode::Volume {
+            ps.vol_iso_ref = (ps.vol_iso_ref - step_delta).max(ps.e_min);
+        } else {
+            ps.iso_value = (ps.iso_value - step_delta).max(ps.e_min);
+        }
     }
 }
 
-/// Rebuild isosurface mesh when isovalue changes.
+/// Parameters of the last-built isosurface — the mesh is rebuilt ONLY when
+/// these actually change. (is_changed() cannot be used: egui constructs its
+/// DragValue/Slider widgets with &mut references every frame, which marks
+/// Pes3dState as changed every frame via DerefMut → per-frame despawn/respawn
+/// → visible flickering.)
+#[derive(Default, Clone, Copy, PartialEq)]
+struct IsoBuildCache {
+    iso_value: f32,
+    color_min: f32,
+    color_max: f32,
+    clip_x: [f32; 2],
+    clip_y: [f32; 2],
+    clip_z: [f32; 2],
+}
+
+/// Rebuild isosurface mesh when isovalue/color/clip actually change.
 fn update_isosurface_mesh(
     pes3d_state: Option<Res<Pes3dState>>,
     cube: Option<Res<CubeResource>>,
@@ -1485,10 +1557,21 @@ fn update_isosurface_mesh(
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     iso_q: Query<Entity, With<IsoSurface>>,
+    mut cache: Local<IsoBuildCache>,
 ) {
     let ps = match pes3d_state.as_ref() { Some(ps) => ps, None => return };
-    if !ps.is_changed() { return; }
     if ps.vis_mode != VisMode::Isosurface { return; }
+
+    let cur = IsoBuildCache {
+        iso_value: ps.iso_value,
+        color_min: ps.color_min,
+        color_max: ps.color_max,
+        clip_x: ps.clip_x,
+        clip_y: ps.clip_y,
+        clip_z: ps.clip_z,
+    };
+    if *cache == cur { return; }  // nothing actually changed — keep the mesh
+    *cache = cur;
 
     let cube = match cube.as_ref() { Some(c) => c, None => return };
     let lattice = cube.0.to_lattice();
@@ -1526,6 +1609,17 @@ fn update_isosurface_mesh(
     }
 }
 
+/// Parameters of the last-built slice planes — rebuild only when these
+/// actually change (same flicker rationale as IsoBuildCache).
+#[derive(Default, Clone, Copy, PartialEq)]
+struct SliceBuildCache {
+    slice_axis: u8,
+    slice_pos: f32,
+    color_min: f32,
+    color_max: f32,
+    color_clip: f32,
+}
+
 /// Update slice plane textures when axis/position/color_clip changes.
 fn update_slices_inner(
     pes3d_state: Option<Res<Pes3dState>>,
@@ -1535,9 +1629,18 @@ fn update_slices_inner(
     mut materials: ResMut<Assets<StandardMaterial>>,
     slice_q: Query<Entity, With<SlicePlaneMesh>>,
     mut commands: Commands,
+    mut cache: Local<SliceBuildCache>,
 ) {
     let ps = match pes3d_state.as_ref() { Some(ps) => ps, None => return };
-    if !ps.is_changed() { return; }
+    let cur = SliceBuildCache {
+        slice_axis: ps.slice_axis,
+        slice_pos: ps.slice_pos,
+        color_min: ps.color_min,
+        color_max: ps.color_max,
+        color_clip: ps.color_clip,
+    };
+    if *cache == cur { return; }  // nothing actually changed — keep planes
+    *cache = cur;
     let cube = match cube.as_ref() { Some(c) => c, None => return };
 
     // Regenerate all slice textures (despawn old, spawn new)

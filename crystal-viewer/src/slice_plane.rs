@@ -61,6 +61,12 @@ pub fn generate_slice_texture(
 
             let idx = ek * src_stride + ej.min(ny - 1) * nx + ei.min(nx - 1);
             let val = if idx < field.len() { field[idx] } else { e_max };
+            // NaN (rejected atom-overlap holes) → transparent; jet_rgb(NaN)
+            // would produce garbage colors at the hole edges.
+            if !val.is_finite() {
+                pixels.extend_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
             let t = ((val - e_min) / (e_range * color_clip)).clamp(0.0, 1.0);
             let (r, g, b) = jet_rgb(t);
             pixels.extend_from_slice(&[r, g, b, 220]);
