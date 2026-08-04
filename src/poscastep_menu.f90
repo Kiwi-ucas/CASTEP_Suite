@@ -3422,12 +3422,6 @@ contains
         integer, intent(in) :: n_symops
 
         real(dp), parameter :: MIN_DIST = 1.0_dp   ! Å rejection threshold
-        integer, parameter :: A_RADIUS = 6          ! grid steps around mobile
-                                                    ! site: covers the Voronoi
-                                                    ! cell of the mobile site
-                                                    ! (6/50·a ≈ 1.23 Å for
-                                                    ! a = 10.28 Å, Li–Li half
-                                                    ! distance ≈ 1.17 Å)
         real(dp) :: lat(3,3), p(3), df(3), dmin, d, a_frac(3)
         integer :: i, j, ii, n_irr, n_rej, n_special, n_reloc
         integer :: a_ix, a_iy, a_iz, qx, qy, qz
@@ -3441,6 +3435,10 @@ contains
         if (n_irr < 1) return
         if (.not. allocated(grid%irred_flags)) allocate(grid%irred_flags(n_irr))
         grid%irred_flags = 0
+
+        ! Mobile site A (fractional) — used by Pass 3 (relocation) and Pass 2
+        ! (force-include). Must be set before either pass.
+        a_frac = [cfg%atom_x(mobile_idx), cfg%atom_y(mobile_idx), cfg%atom_z(mobile_idx)]
 
         ! Only meaningful for fractional input (CIF). For Cartesian input the
         ! periodic-image distance check below would be wrong — skip filtering.
@@ -3543,7 +3541,6 @@ contains
         ! (flag=0), it is computed and expanded normally — no special
         ! handling needed. Otherwise append it as flag=1 (filled at its own
         ! grid point only; its equilibrium energy must be exact).
-        a_frac = [cfg%atom_x(mobile_idx), cfg%atom_y(mobile_idx), cfg%atom_z(mobile_idx)]
         a_present = .false.
         do i = 1, n_irr
             if (maxval(abs(grid%irred_coords(:, i) - a_frac)) < 1.0e-6_dp) then

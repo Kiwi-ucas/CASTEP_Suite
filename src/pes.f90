@@ -904,7 +904,6 @@ contains
                         real(dp) :: atom_cart(3, natom), frac_p(3), cart_p(3), dfc(3)
                         real(dp) :: lvec(3,3), dminp, dtmp
                         integer :: mobile_idx0, kp, ix, iy, iz, ia, iidx
-                        character(len=256) :: aline
                         real(dp), parameter :: MIND = 1.0_dp   ! Å
                         integer :: zz
                         real(dp) :: chg
