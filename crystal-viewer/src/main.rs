@@ -124,8 +124,9 @@ struct PesSurface;
 #[derive(Clone, PartialEq)]
 pub enum VisMode { Isosurface, Volume, Slice }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum IsoMaterial {
+    #[default]
     Opaque,           // alpha = 1.0, no transparency
     SemiTransparent,  // alpha = 0.7, light transparency
     Transparent,      // alpha = 0.3, heavy transparency
@@ -1546,6 +1547,7 @@ struct IsoBuildCache {
     clip_x: [f32; 2],
     clip_y: [f32; 2],
     clip_z: [f32; 2],
+    iso_material: IsoMaterial,  // material preset (alpha is baked into the mesh material)
 }
 
 /// Rebuild isosurface mesh when isovalue/color/clip actually change.
@@ -1569,6 +1571,7 @@ fn update_isosurface_mesh(
         clip_x: ps.clip_x,
         clip_y: ps.clip_y,
         clip_z: ps.clip_z,
+        iso_material: ps.iso_material,
     };
     if *cache == cur { return; }  // nothing actually changed — keep the mesh
     *cache = cur;

@@ -1478,25 +1478,45 @@ contains
         integer, intent(out) :: ios
         real(dp) :: energy
         character(len=256) :: line
-        integer :: unit, eq_pos
+        integer :: unit, eq_pos, n_found
 
         energy = 0.0_dp; ios = 0
+        n_found = 0
         open(newunit=unit, file=trim(castep_file), status='old', action='read', iostat=ios)
         if (ios /= 0) return
         do
             read(unit, '(a)', iostat=ios) line
             if (ios /= 0) exit
-            if (index(line, 'Final energy') > 0 .or. &
-                index(line, 'final energy') > 0 .or. &
-                index(line, 'Final Energy') > 0) then
+            ! CASTEP appends every run of the same seed to the existing .castep,
+            ! so a file can accumulate several SCF histories (an old run plus
+            ! one or more reruns). Always take the LAST occurrence:
+            !   1. "Total energy corrected for finite basis set" — the final
+            !      converged value (finite-basis extrapolation + dispersion)
+            !   2. fallback: plain "Final energy" (last basis size), skipping
+            !      "Dispersion corrected final energy*" (vdW-inclusive variant)
+            if (index(line, 'corrected for finite basis set') > 0) then
                 eq_pos = index(line, '=')
-                if (eq_pos > 0) read(line(eq_pos+1:), *, iostat=ios) energy
-                ios = 0
-                close(unit); return
+                if (eq_pos > 0) then
+                    read(line(eq_pos+1:), *, iostat=ios) energy
+                    if (ios == 0) n_found = n_found + 1
+                end if
+            else if ((index(line, 'Final energy') > 0 .or. &
+                      index(line, 'final energy') > 0 .or. &
+                      index(line, 'Final Energy') > 0) .and. &
+                     index(line, 'ispersion') == 0) then
+                eq_pos = index(line, '=')
+                if (eq_pos > 0) then
+                    read(line(eq_pos+1:), *, iostat=ios) energy
+                    if (ios == 0) n_found = n_found + 1
+                end if
             end if
         end do
-        ios = 1
         close(unit)
+        if (n_found == 0) then
+            ios = 1   ! no parseable final energy found
+        else
+            ios = 0   ! success — the loop's EOF (-1) must not leak out
+        end if
     end function parse_castep_energy
 
 
