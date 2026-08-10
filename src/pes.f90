@@ -19,10 +19,6 @@ module pes
     public :: collect_pes_energies
     public :: symops_translation_lcm
 
-    ! Legacy wrappers — kept for backward compatibility with poscastep_menu.f90
-    public :: write_pes_metadata_json   ! deprecated: use write_pes_cube
-    public :: write_pes3d_cube          ! deprecated: use write_pes_cube
-
     ! Maximum grid sizes
     integer, parameter :: MAX_GRID_2D = 200
     integer, parameter :: MAX_GRID_3D = 50
@@ -455,70 +451,6 @@ contains
     end subroutine write_pes_cube
 
 
-    ! ── Legacy: write_pes_metadata_json (deprecated, kept for backward compat) ──
-
-    subroutine write_pes_metadata_json(json_path, grid, cfg, iostat, iomsg)
-        !! Deprecated: use write_pes_cube() instead.
-        !! Redirects to cube writing at the same directory with name scan.cube.
-        character(len=*), intent(in) :: json_path
-        type(pes_grid_t), intent(in) :: grid
-        type(castep_config_t), intent(in) :: cfg
-        integer, intent(out) :: iostat
-        character(len=*), optional, intent(out) :: iomsg
-
-        real(dp), allocatable :: energies(:)
-        logical, allocatable :: has_en(:)
-        integer :: n_total
-        character(len=1024) :: cube_path, dir_path
-        integer :: slash_pos
-
-        iostat = 0
-        n_total = grid%n_points(1) * grid%n_points(2)
-        if (grid%ndim == 3) n_total = n_total * grid%n_points(3)
-
-        allocate(energies(n_total), has_en(n_total), stat=iostat)
-        if (iostat /= 0) return
-        energies = 0.0_dp
-        has_en = .false.
-
-        ! Derive cube path from json path
-        slash_pos = index(json_path, '/', back=.true.)
-        if (slash_pos > 0) then
-            dir_path = json_path(1:slash_pos)
-            cube_path = trim(dir_path) // 'scan.cube'
-        else
-            cube_path = 'scan.cube'
-        end if
-
-        call write_pes_cube(cube_path, grid, cfg, energies, has_en, iostat, iomsg)
-        deallocate(energies, has_en)
-    end subroutine write_pes_metadata_json
-
-
-    ! ── Legacy: write_pes3d_cube (deprecated, kept for backward compat) ──
-
-    subroutine write_pes3d_cube(cube_path, grid, cfg, cif, energies, n_energies, iostat, iomsg)
-        !! Deprecated: use write_pes_cube() instead.
-        character(len=*), intent(in) :: cube_path
-        type(pes_grid_t), intent(in) :: grid
-        type(castep_config_t), intent(in), target :: cfg
-        type(cif_data_t), intent(in) :: cif
-        real(dp), intent(in) :: energies(:)
-        integer, intent(in) :: n_energies
-        integer, intent(out) :: iostat
-        character(len=*), optional, intent(out) :: iomsg
-
-        logical, allocatable :: has_en(:)
-
-        allocate(has_en(n_energies), stat=iostat)
-        if (iostat /= 0) return
-        has_en = .true.
-
-        call write_pes_cube(cube_path, grid, cfg, energies, has_en, iostat, iomsg)
-        deallocate(has_en)
-    end subroutine write_pes3d_cube
-
-
     ! ═══════════════════════════════════════════════════════════════════════════
     !  Result collection (unified 2D / 3D)
     ! ═══════════════════════════════════════════════════════════════════════════
@@ -567,11 +499,6 @@ contains
         ! Find cube file
         cube_path = trim(scan_dir) // '/scan.cube'
         inquire(file=trim(cube_path), exist=exists)
-        if (.not. exists) then
-            ! backward compat: try pes_metadata.json path
-            cube_path = trim(scan_dir) // '/pes3d.cube'
-            inquire(file=trim(cube_path), exist=exists)
-        end if
         if (.not. exists) then
             iostat = IO_FILE_NOT_FOUND
             if (present(iomsg)) iomsg = 'scan.cube not found in: ' // trim(scan_dir)

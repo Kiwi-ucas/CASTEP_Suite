@@ -2964,7 +2964,7 @@ contains
         !! PES sub-menu 2: Collect .castep results and launch viewer
         integer, intent(out) :: iostat
 
-        character(len=MAX_LINE_LEN) :: scan_dir, cube_path, input
+        character(len=MAX_LINE_LEN) :: scan_dir, input
         integer :: ios
         logical :: exists
 
@@ -2977,16 +2977,10 @@ contains
         scan_dir = adjustl(scan_dir); call strip_quotes(scan_dir)
         if (scan_dir == 'q' .or. scan_dir == 'Q') return
 
-        ! Check for scan.cube (primary) or pes_metadata.json (legacy)
+        ! Check for scan.cube
         inquire(file=trim(scan_dir)//'/scan.cube', exist=exists)
         if (.not. exists) then
-            inquire(file=trim(scan_dir)//'/pes3d.cube', exist=exists)
-        end if
-        if (.not. exists) then
-            inquire(file=trim(scan_dir)//'/pes_metadata.json', exist=exists)
-        end if
-        if (.not. exists) then
-            write(*, '(a)') '  No scan.cube or pes_metadata.json found in directory.'
+            write(*, '(a)') '  No scan.cube found in directory.'
             return
         end if
 
@@ -3001,13 +2995,7 @@ contains
         write(*, '(a)', advance='no') '  Launch 3D Viewer? (y/n): '
         read(*, '(a)', iostat=ios) input
         if (ios == 0 .and. (input(1:1) == 'y' .or. input(1:1) == 'Y')) then
-            ! Prefer cube file over legacy JSON
-            cube_path = trim(scan_dir) // '/scan.cube'
-            inquire(file=trim(cube_path), exist=exists)
-            if (.not. exists) inquire(file=trim(scan_dir)//'/pes3d.cube', exist=exists)
-            if (.not. exists) cube_path = trim(scan_dir) // '/pes3d.cube'
-            if (.not. exists) cube_path = trim(scan_dir) // '/pes_metadata.json'
-            call launch_viewer(cube_path)
+            call launch_viewer(trim(scan_dir) // '/scan.cube')
         end if
     end subroutine handle_pes_collect
 
@@ -3596,7 +3584,7 @@ contains
         !! symmetry-expand, and launch viewer.
         integer, intent(out) :: iostat
 
-        character(len=MAX_LINE_LEN) :: scan_dir, json_path, input
+        character(len=MAX_LINE_LEN) :: scan_dir, input
         integer :: ios
         logical :: exists
 
@@ -3608,15 +3596,10 @@ contains
         scan_dir = adjustl(scan_dir); call strip_quotes(scan_dir)
         if (scan_dir == 'q' .or. scan_dir == 'Q') return
 
-        ! Check for scan.cube (primary) or pes3d.cube / pes3d_metadata.json (legacy)
+        ! Check for scan.cube
         inquire(file=trim(scan_dir)//'/scan.cube', exist=exists)
-        if (.not. exists) inquire(file=trim(scan_dir)//'/pes3d.cube', exist=exists)
         if (.not. exists) then
-            json_path = trim(scan_dir) // '/pes3d_metadata.json'
-            inquire(file=trim(json_path), exist=exists)
-        end if
-        if (.not. exists) then
-            write(*, '(a)') '  No scan.cube or pes3d_metadata.json found in ' // trim(scan_dir)
+            write(*, '(a)') '  No scan.cube found in ' // trim(scan_dir)
             return
         end if
 

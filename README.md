@@ -274,7 +274,7 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
 - Generates `irred_NNNNN` subdirectories (or `grid_III_JJJ_KKK` for non-symmetry scans)
 - Forward orbit expansion fills the full-cell output grid at 100% coverage
 - **Collection**: auto-detects directory format, reads `irred_coords.dat` sidecar for mapping
-- **3D viewer**: MC isosurface (Mode 4), volume render (5), slice planes (6); `-/+` adjust isovalue; semi-transparent rendering
+- **3D viewer**: MC isosurface (4), volume render (5), slice planes (6), fixed-radius sphere (7), radial-stationary migration surface (8); `-/+` adjust isovalue; semi-transparent rendering
 
 **2D PES**:
 - Select mobile atom, scan plane (XY/XZ/YZ), fractional coordinate range, and grid size

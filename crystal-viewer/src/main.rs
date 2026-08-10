@@ -43,7 +43,7 @@ fn main() {
         .add_systems(Update, (toggle_surface_combined, update_color_clip, update_pes_surface).chain().after(ui_system))
         .add_systems(Update, toggle_pes3d_mode.after(ui_system))
         .add_systems(Update, (update_isosurface, update_isosurface_mesh).chain().after(ui_system))
-        .add_systems(Update, (update_sphere_section, update_migration_surface).after(ui_system))
+        .add_systems(Update, update_surface_mesh.after(ui_system))
         .add_systems(Update, update_volume.after(ui_system))
         .add_systems(Update, update_slices_inner.after(ui_system))
         .run();
@@ -643,29 +643,9 @@ fn setup(
         }
     } else { None };
 
-    // Detect PES JSON (type == "pes_scan") — legacy fallback
-    let json_str = if crystal_path.0.is_empty() {
-        String::new()
-    } else {
-        std::fs::read_to_string(&crystal_path.0).unwrap_or_default()
-    };
-
     // ── 2D PES from cube (nz==1) → convert to PesData ──
     let pes_from_cube: Option<PesData> = cube_opt.as_ref()
         .and_then(|c| if c.is_pes_2d() { PesData::from_cube(c).ok() } else { None });
-
-    // Legacy JSON PES (only if no 2D cube already converted)
-    let pes_opt: Option<PesData> = if pes_from_cube.is_none() && cube_opt.as_ref().map_or(true, |c| !c.is_pes_3d())
-        && PesData::detect(&json_str)
-    {
-        eprintln!("  Note: loading legacy pes_metadata.json (consider migrating to .cube format)");
-        PesData::from_json(&crystal_path.0).ok()
-    } else {
-        None
-    };
-
-    // Use pes_from_cube first, then pes_opt, then regular
-    let final_pes: Option<&PesData> = pes_from_cube.as_ref().or(pes_opt.as_ref());
 
     let data = if let Some(ref cube) = cube_opt {
         if cube.is_pes_2d() {
@@ -675,15 +655,13 @@ fn setup(
         } else {
             crystal_data_from_cube(cube)
         }
+    } else if crystal_path.0.is_empty() {
+        default_cu_fcc()
     } else {
-        match final_pes {
-            Some(pes) => crystal_data_from_pes(pes),
-            None if crystal_path.0.is_empty() => default_cu_fcc(),
-            None => CrystalData::from_json(&crystal_path.0).unwrap_or_else(|e| {
-                eprintln!("Failed to load {}: {}. Using Cu FCC.", crystal_path.0, e);
-                default_cu_fcc()
-            }),
-        }
+        CrystalData::from_json(&crystal_path.0).unwrap_or_else(|e| {
+            eprintln!("Failed to load {}: {}. Using Cu FCC.", crystal_path.0, e);
+            default_cu_fcc()
+        })
     };
 
     let (positions, parent_indices, image_offsets) = data.expand_to_cell();
@@ -844,8 +822,8 @@ fn setup(
         MainCamera,
     ));
 
-    // ── PES 2D surface mesh (from cube or legacy JSON) ──
-    if let Some(pes) = &final_pes {
+    // ── PES 2D surface mesh (from cube) ──
+    if let Some(pes) = pes_from_cube.as_ref() {
         let e_range = pes.energy_range();
         if let Some((mesh, tex_image)) = pes.generate_surface(1.0) {
             let tex_handle = materials.add(StandardMaterial {
@@ -979,7 +957,7 @@ fn setup(
 
     if cube_opt.is_some() {
         println!("PES 3D mode: {} atoms. 4:iso 5:volume 6:slice 7:sphere 8:migration S:toggle -/+:iso [ ]:clip", n);
-    } else if final_pes.is_some() {
+    } else if pes_from_cube.is_some() {
         println!("PES 2D mode: {} atoms. Right-drag: rotate | Scroll: zoom | S: surface toggle.", n);
     } else {
         println!("Loaded {} atoms. Right-drag to rotate, scroll to zoom, click to select.", n);
@@ -1248,27 +1226,6 @@ fn default_cu_fcc() -> CrystalData {
             crystal::AtomData { element: "Cu".into(), x: 0.0, y: 1.8075, z: 1.8075, label: "4".into() },
         ],
         positions_fractional: false,
-        modified: false,
-        phonon_modes: None,
-    }
-}
-
-/// Convert PesData structure_atoms (fx/fy/fz) to CrystalData for shared rendering.
-/// The mobile atom is excluded — it is the one being scanned across the surface.
-fn crystal_data_from_pes(pes: &PesData) -> CrystalData {
-    let mobile_idx = pes.mobile_atom.index.max(0) as usize;
-    crystal::CrystalData {
-        lattice: pes.lattice.clone(),
-        atoms: pes.structure_atoms.iter().enumerate()
-            .filter(|(i, _)| *i != mobile_idx)
-            .map(|(_, pa)| crystal::AtomData {
-                element: pa.element.clone(),
-                x: pa.fx as f32,
-                y: pa.fy as f32,
-                z: pa.fz as f32,
-                label: String::new(),
-            }).collect(),
-        positions_fractional: true,
         modified: false,
         phonon_modes: None,
     }
@@ -1639,118 +1596,97 @@ fn update_isosurface_mesh(
     }
 }
 
-/// Parameters of the last-built fixed-radius sphere (mode 7) — rebuilt only
-/// when these actually change (same flicker rationale as IsoBuildCache).
-#[derive(Default, Clone, Copy, PartialEq)]
-struct SphereBuildCache {
+/// Parameters of the last-built shared 7/8 surface mesh (SphereSurface
+/// entity) — rebuilt only when these actually change (same flicker rationale
+/// as IsoBuildCache). `built_mode` records which mode the current mesh was
+/// built for: without it, switching 8→7 sees identical sphere params and
+/// skips the rebuild, leaving the migration mesh on screen (and vice versa).
+#[derive(Default, Clone, PartialEq)]
+struct SurfaceBuildCache {
+    built_mode: Option<VisMode>,
     center_frac: [f32; 3],
     radius: f32,
-    color_min: f32,
-    color_max: f32,
-    material: IsoMaterial,
-}
-
-/// Rebuild the fixed-radius sphere section mesh (mode 7) when its
-/// center/radius/color-range/material actually change.
-fn update_sphere_section(
-    pes3d_state: Option<Res<Pes3dState>>,
-    cube: Option<Res<CubeResource>>,
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    surf_q: Query<Entity, With<SphereSurface>>,
-    mut cache: Local<SphereBuildCache>,
-) {
-    let ps = match pes3d_state.as_ref() { Some(ps) => ps, None => return };
-    if ps.vis_mode != VisMode::Sphere { return; }
-    let cube = match cube.as_ref() { Some(c) => c, None => return };
-
-    // Resolve the sphere center to fractional coordinates
-    let lattice = cube.0.to_lattice();
-    let center_frac = if ps.sphere_center_idx == usize::MAX {
-        Vec3::from_array(ps.sphere_center_custom)
-    } else {
-        let i = ps.sphere_center_idx.min(cube.0.atoms.len().saturating_sub(1));
-        let a = &cube.0.atoms[i];
-        let inv = lattice.inverse_vectors();
-        Lattice::apply_inverse(&inv, Vec3::new(a.x, a.y, a.z_coord))
-    };
-    let cur = SphereBuildCache {
-        center_frac: center_frac.to_array(),
-        radius: ps.sphere_radius,
-        color_min: ps.color_min,
-        color_max: ps.color_max,
-        material: ps.iso_material,
-    };
-    if *cache == cur { return; }  // nothing actually changed — keep the mesh
-    *cache = cur;
-
-    for e in surf_q.iter() { commands.entity(e).despawn(); }
-    let mesh = sphere_section::sphere_section_mesh(
-        &cube.0.field, cube.0.nx, &lattice,
-        center_frac, ps.sphere_radius,
-        ps.color_min, ps.color_max, ps.iso_material,
-    );
-    let alpha = ps.iso_material.alpha();
-    let mat = materials.add(StandardMaterial {
-        base_color: Color::WHITE,   // per-vertex colors replace base_color
-        alpha_mode: if alpha < 1.0 { AlphaMode::Blend } else { AlphaMode::Opaque },
-        unlit: true,
-        cull_mode: None,
-        ..default()
-    });
-    let vis = if ps.show_surface { Visibility::Inherited } else { Visibility::Hidden };
-    commands.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(mat), SphereSurface, vis));
-}
-
-/// Parameters of the last-built migration surface (mode 8) — rebuilt only
-/// when these actually change.
-#[derive(Default, Clone, PartialEq)]
-struct MigrationBuildCache {
     e_cap: f32,
-    color_min: f32,
-    color_max: f32,
-    material: IsoMaterial,
     show_shell: bool,
     show_cap: bool,
     centers: Vec<[f32; 3]>,
+    color_min: f32,
+    color_max: f32,
+    material: IsoMaterial,
 }
 
-/// Rebuild the radial-stationary migration surface (mode 8) when its
-/// energy cap / color range / material / cage-center set actually change.
-fn update_migration_surface(
+/// Rebuild the shared mode-7 (sphere) / mode-8 (migration) surface mesh when
+/// its parameters — or the active mode — actually change. Modes 4/5/6 use
+/// their own entities and are toggled by visibility only.
+fn update_surface_mesh(
     pes3d_state: Option<Res<Pes3dState>>,
     cube: Option<Res<CubeResource>>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     surf_q: Query<Entity, With<SphereSurface>>,
-    mut cache: Local<MigrationBuildCache>,
+    mut cache: Local<SurfaceBuildCache>,
 ) {
     let ps = match pes3d_state.as_ref() { Some(ps) => ps, None => return };
-    if ps.vis_mode != VisMode::Migration { return; }
     let cube = match cube.as_ref() { Some(c) => c, None => return };
+    let lattice = cube.0.to_lattice();
 
-    let centers: Vec<Vec3> = sphere_section::detect_cage_centers(&cube.0);
-    let cur = MigrationBuildCache {
-        e_cap: ps.mig_e_cap,
-        color_min: ps.color_min,
-        color_max: ps.color_max,
-        material: ps.iso_material,
-        show_shell: ps.mig_show_shell,
-        show_cap: ps.mig_show_cap,
-        centers: centers.iter().map(|c| c.to_array()).collect(),
+    let centers: Vec<Vec3> = if ps.vis_mode == VisMode::Migration {
+        sphere_section::detect_cage_centers(&cube.0)
+    } else { Vec::new() };
+
+    let cur = match ps.vis_mode {
+        VisMode::Sphere => {
+            // Resolve the sphere center to fractional coordinates
+            let center_frac = if ps.sphere_center_idx == usize::MAX {
+                Vec3::from_array(ps.sphere_center_custom)
+            } else {
+                let i = ps.sphere_center_idx.min(cube.0.atoms.len().saturating_sub(1));
+                let a = &cube.0.atoms[i];
+                let inv = lattice.inverse_vectors();
+                Lattice::apply_inverse(&inv, Vec3::new(a.x, a.y, a.z_coord))
+            };
+            SurfaceBuildCache {
+                built_mode: Some(VisMode::Sphere),
+                center_frac: center_frac.to_array(),
+                radius: ps.sphere_radius,
+                e_cap: 0.0, show_shell: false, show_cap: false,
+                centers: Vec::new(),
+                color_min: ps.color_min, color_max: ps.color_max,
+                material: ps.iso_material,
+            }
+        }
+        VisMode::Migration => SurfaceBuildCache {
+            built_mode: Some(VisMode::Migration),
+            center_frac: [0.0; 3],
+            radius: 0.0,
+            e_cap: ps.mig_e_cap,
+            show_shell: ps.mig_show_shell,
+            show_cap: ps.mig_show_cap,
+            centers: centers.iter().map(|c| c.to_array()).collect(),
+            color_min: ps.color_min, color_max: ps.color_max,
+            material: ps.iso_material,
+        },
+        _ => return,   // modes 4/5/6 have their own entities
     };
+
     if *cache == cur { return; }  // nothing actually changed — keep the mesh
-    *cache = cur;
 
     for e in surf_q.iter() { commands.entity(e).despawn(); }
-    let lattice = cube.0.to_lattice();
-    let Some(mesh) = sphere_section::migration_surface_mesh(
-        &cube.0.field, cube.0.nx, &lattice,
-        &centers, ps.mig_e_cap, ps.mig_show_shell, ps.mig_show_cap,
-        ps.color_min, ps.color_max, ps.iso_material,
-    ) else { return };
+
+    let mesh = match ps.vis_mode {
+        VisMode::Sphere => sphere_section::sphere_section_mesh(
+            &cube.0.field, cube.0.nx, &lattice,
+            Vec3::from_array(cur.center_frac), ps.sphere_radius,
+            ps.color_min, ps.color_max, ps.iso_material),
+        VisMode::Migration => match sphere_section::migration_surface_mesh(
+            &cube.0.field, cube.0.nx, &lattice,
+            &centers, ps.mig_e_cap, ps.mig_show_shell, ps.mig_show_cap,
+            ps.color_min, ps.color_max, ps.iso_material) {
+            Some(m) => m, None => return,
+        },
+        _ => return,
+    };
     let alpha = ps.iso_material.alpha();
     let mat = materials.add(StandardMaterial {
         base_color: Color::WHITE,   // per-vertex colors replace base_color
@@ -1761,6 +1697,7 @@ fn update_migration_surface(
     });
     let vis = if ps.show_surface { Visibility::Inherited } else { Visibility::Hidden };
     commands.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(mat), SphereSurface, vis));
+    *cache = cur;   // only after a successful build — a failed build retries
 }
 
 /// Parameters of the last-built slice planes — rebuild only when these

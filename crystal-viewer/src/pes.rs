@@ -1,7 +1,7 @@
 //! PES (Potential Energy Surface) data types and surface mesh generation.
 //!
-//! Parses `pes_metadata.json` produced by Fortran PosCASTEP PES scan module.
-//! Generates a 3D surface mesh with vertex colors from a jet colormap.
+//! Constructs 2D PES data from Gaussian Cube files (nz=1) and generates a
+//! colored surface mesh with a jet colormap.
 
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::crystal::Lattice;
 use crate::cube_reader::CubeData;
 
-// ── PES data types (match Fortran write_pes_metadata_json output) ──
+// ── PES data types (built from 2D cube metadata) ──
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PesData {
@@ -46,12 +46,6 @@ pub struct PesAtom {
 }
 
 impl PesData {
-    /// Load PES metadata from a JSON file.
-    pub fn from_json(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let content = std::fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&content)?)
-    }
-
     /// Construct PesData from a 2D PES cube file (nz=1).
     ///
     /// Extracts scan plane, mobile atom, fractional ranges, lattice,
@@ -109,11 +103,6 @@ impl PesData {
             energies,
             has_energies,
         })
-    }
-
-    /// Quick check whether JSON content is a PES scan file (legacy).
-    pub fn detect(json_str: &str) -> bool {
-        json_str.contains("\"pes_scan\"")
     }
 
     /// Return (plane_axis_0, plane_axis_1) as indices into lattice vectors [a,b,c].
