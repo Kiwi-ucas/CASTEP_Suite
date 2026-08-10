@@ -14,6 +14,7 @@ use crate::PesState;
 use crate::Pes3dState;
 use crate::VisMode;
 use crate::IsoMaterial;
+use crate::CubeResource;
 use crate::resources;
 
 #[derive(Resource)]
@@ -49,6 +50,7 @@ pub fn ui_system(
     mut panel_rects: ResMut<PanelRects>,
     pes_state: Option<Res<PesState>>,
     mut pes3d_state: Option<ResMut<Pes3dState>>,
+    cube: Option<Res<CubeResource>>,
 ) {
     let ctx = contexts.ctx_mut();
 
@@ -227,6 +229,8 @@ pub fn ui_system(
                         VisMode::Isosurface => format!("Isosurface (4) iso={:.2}", ps.iso_value),
                         VisMode::Volume => format!("Volume (5) layer={:.1}", ps.vol_iso_ref),
                         VisMode::Slice => format!("Slice (6) axis={} pos={:.2}", ps.slice_axis, ps.slice_pos),
+                        VisMode::Sphere => format!("Sphere (7) R={:.2} Å", ps.sphere_radius),
+                        VisMode::Migration => format!("Migration (8) cap={:.2} eV", ps.mig_e_cap),
                     };
                     ui.label(format!("Mode: {}", mode_str));
                 } else {
@@ -254,6 +258,96 @@ pub fn ui_system(
                                 ui.selectable_value(&mut ps.iso_material, IsoMaterial::Transparent, "Transparent");
                             });
                     });
+                }
+            }
+
+            // ── Sphere section controls (mode 7) ──
+            if let Some(ref mut ps) = pes3d_state {
+                if ps.has_energies && ps.vis_mode == VisMode::Sphere {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Sphere Section").strong());
+                    if let Some(ref cube) = cube {
+                        let atoms = &cube.0.atoms;
+                        let sel = if ps.sphere_center_idx == usize::MAX {
+                            "Custom…".to_string()
+                        } else {
+                            let i = ps.sphere_center_idx.min(atoms.len().saturating_sub(1));
+                            format!("{}: {}", i, crate::atom_z_to_symbol(atoms[i].z))
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label("Center");
+                            egui::ComboBox::from_id_salt("sphere_center")
+                                .selected_text(sel)
+                                .show_ui(ui, |ui| {
+                                    for (i, a) in atoms.iter().enumerate() {
+                                        ui.selectable_value(
+                                            &mut ps.sphere_center_idx, i,
+                                            format!("{}: {} ({:.2},{:.2},{:.2})",
+                                                i, crate::atom_z_to_symbol(a.z), a.x, a.y, a.z_coord));
+                                    }
+                                    ui.selectable_value(&mut ps.sphere_center_idx, usize::MAX, "Custom…");
+                                });
+                        });
+                        if ps.sphere_center_idx == usize::MAX {
+                            ui.horizontal(|ui| {
+                                ui.label("Frac");
+                                ui.add(egui::DragValue::new(&mut ps.sphere_center_custom[0])
+                                    .speed(0.005).range(0.0..=1.0));
+                                ui.add(egui::DragValue::new(&mut ps.sphere_center_custom[1])
+                                    .speed(0.005).range(0.0..=1.0));
+                                ui.add(egui::DragValue::new(&mut ps.sphere_center_custom[2])
+                                    .speed(0.005).range(0.0..=1.0));
+                            });
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Radius");
+                        ui.add(egui::DragValue::new(&mut ps.sphere_radius)
+                            .speed(0.05)
+                            .range(0.1..=5.0)
+                            .suffix(" Å"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Material");
+                        egui::ComboBox::from_id_salt("sphere_material")
+                            .selected_text(ps.iso_material.name())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut ps.iso_material, IsoMaterial::Opaque, "Opaque");
+                                ui.selectable_value(&mut ps.iso_material, IsoMaterial::SemiTransparent, "Semi-transparent");
+                                ui.selectable_value(&mut ps.iso_material, IsoMaterial::Transparent, "Transparent");
+                            });
+                    });
+                }
+            }
+
+            // ── Migration surface controls (mode 8) ──
+            if let Some(ref mut ps) = pes3d_state {
+                if ps.has_energies && ps.vis_mode == VisMode::Migration {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Migration Surface").strong());
+                    ui.label("Cage shells = 1st radial min; window caps = 1st radial max beyond it");
+                    let e_max = ps.e_max.max(1.0);
+                    ui.horizontal(|ui| {
+                        ui.label("E cap");
+                        ui.add(egui::Slider::new(&mut ps.mig_e_cap, 0.05..=e_max)
+                            .suffix(" eV"));
+                    });
+                    ui.checkbox(&mut ps.mig_show_shell, "Cage shells");
+                    ui.checkbox(&mut ps.mig_show_cap, "Window caps");
+                    ui.horizontal(|ui| {
+                        ui.label("Material");
+                        egui::ComboBox::from_id_salt("mig_material")
+                            .selected_text(ps.iso_material.name())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut ps.iso_material, IsoMaterial::Opaque, "Opaque");
+                                ui.selectable_value(&mut ps.iso_material, IsoMaterial::SemiTransparent, "Semi-transparent");
+                                ui.selectable_value(&mut ps.iso_material, IsoMaterial::Transparent, "Transparent");
+                            });
+                    });
+                    if let Some(ref cube) = cube {
+                        let n = crate::sphere_section::detect_cage_centers(&cube.0).len();
+                        ui.label(format!("Cage centers (auto): {}", n));
+                    }
                 }
             }
 

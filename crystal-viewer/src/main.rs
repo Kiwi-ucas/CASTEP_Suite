@@ -2,6 +2,7 @@
 
 mod crystal; mod resources; mod picking; mod ui; mod pes;
 mod cube_reader; mod marching_cubes; mod volume_render; mod slice_plane;
+mod sphere_section;
 
 use bevy::prelude::*;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
@@ -42,6 +43,7 @@ fn main() {
         .add_systems(Update, (toggle_surface_combined, update_color_clip, update_pes_surface).chain().after(ui_system))
         .add_systems(Update, toggle_pes3d_mode.after(ui_system))
         .add_systems(Update, (update_isosurface, update_isosurface_mesh).chain().after(ui_system))
+        .add_systems(Update, (update_sphere_section, update_migration_surface).after(ui_system))
         .add_systems(Update, update_volume.after(ui_system))
         .add_systems(Update, update_slices_inner.after(ui_system))
         .run();
@@ -122,7 +124,7 @@ fn step_to_clip(step: i32) -> f32 {
 struct PesSurface;
 
 #[derive(Clone, PartialEq)]
-pub enum VisMode { Isosurface, Volume, Slice }
+pub enum VisMode { Isosurface, Volume, Slice, Sphere, Migration }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum IsoMaterial {
@@ -162,16 +164,23 @@ pub struct Pes3dState {
     pub color_clip: f32, pub iso_value: f32,
     pub iso_step: f32,  // user-configurable isosurface step size (eV)
     pub iso_material: IsoMaterial,  // material preset
+    pub sphere_center_idx: usize,     // mode 7: cube atom index (usize::MAX = custom frac)
+    pub sphere_center_custom: [f32; 3],  // mode 7: custom center (fractional)
+    pub sphere_radius: f32,           // mode 7: sphere radius (Å)
+    pub mig_e_cap: f32,               // mode 8: max relative energy on the surface (eV)
+    pub mig_show_shell: bool,         // mode 8: show cage shells
+    pub mig_show_cap: bool,           // mode 8: show window caps
     pub alpha_scale: f32,   // volume render: opacity multiplier
     pub alpha_falloff: f32, // volume render: gaussian window width (energy layer selector)
     pub vol_iso_ref: f32,   // volume render: band-pass window center (eV)
     pub vol_steps: u32,     // volume render: ray-march step count
     pub slice_axis: u8, pub slice_pos: f32,
 }
-#[derive(Resource)] struct CubeResource(CubeData);
+#[derive(Resource)] pub struct CubeResource(pub CubeData);
 #[derive(Component)] struct IsoSurface;
 #[derive(Component)] pub struct VolumeProxy;
 #[derive(Component)] struct SlicePlaneMesh;
+#[derive(Component)] struct SphereSurface;  // mode 7 sphere + mode 8 migration mesh
 
 #[derive(Resource)]
 struct DisplayMode {
@@ -953,6 +962,12 @@ fn setup(
             color_clip: 1.0, iso_value,
             iso_step: default_iso_step,
             iso_material: IsoMaterial::SemiTransparent,
+            // Mode 7: default center = first S atom (cage center if present)
+            sphere_center_idx: cube.atoms.iter().position(|a| a.z == 16).unwrap_or(0),
+            sphere_center_custom: [0.25, 0.25, 0.25],
+            sphere_radius: 1.4,
+            // Mode 8: migration window (relative eV), shells + caps on
+            mig_e_cap: 3.0, mig_show_shell: true, mig_show_cap: true,
             alpha_scale: 0.8, alpha_falloff: 0.25, vol_steps: 128,
             // Volume ISO ref starts at the data median so the band-pass window
             // sits in the dense energy band by default.
@@ -963,7 +978,7 @@ fn setup(
     }
 
     if cube_opt.is_some() {
-        println!("PES 3D mode: {} atoms. 4:isosurface 5:volume 6:slice S:toggle -/+:iso [ ]:clip", n);
+        println!("PES 3D mode: {} atoms. 4:iso 5:volume 6:slice 7:sphere 8:migration S:toggle -/+:iso [ ]:clip", n);
     } else if final_pes.is_some() {
         println!("PES 2D mode: {} atoms. Right-drag: rotate | Scroll: zoom | S: surface toggle.", n);
     } else {
@@ -1301,7 +1316,7 @@ fn crystal_data_from_cube(cube: &CubeData) -> CrystalData {
 }
 
 /// Atomic number → element symbol (supports up to Xe, 54).
-fn atom_z_to_symbol(z: i32) -> String {
+pub(crate) fn atom_z_to_symbol(z: i32) -> String {
     const SYM: &[&str] = &[
         "X", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne",
         "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca",
@@ -1323,6 +1338,7 @@ fn toggle_surface_combined(
         Query<&mut Visibility, With<IsoSurface>>,
         Query<&mut Visibility, With<SlicePlaneMesh>>,
         Query<&mut Visibility, With<VolumeProxy>>,
+        Query<&mut Visibility, With<SphereSurface>>,
     )>,
     mut contexts: EguiContexts,
 ) {
@@ -1338,6 +1354,8 @@ fn toggle_surface_combined(
             for mut v in vis_q.p3().iter_mut() { *v = vis; }
         } else if ps.vis_mode == VisMode::Slice {
             for mut v in vis_q.p2().iter_mut() { *v = vis; }
+        } else if matches!(ps.vis_mode, VisMode::Sphere | VisMode::Migration) {
+            for mut v in vis_q.p4().iter_mut() { *v = vis; }
         }
         return;
     }
@@ -1430,7 +1448,8 @@ fn update_pes_surface(
     }
 }
 
-/// Switch 3D PES visualization mode (4=isosurface, 5=volume, 6=slice).
+/// Switch 3D PES visualization mode (4=isosurface, 5=volume, 6=slice,
+/// 7=fixed-radius sphere, 8=radial-stationary migration surface).
 fn toggle_pes3d_mode(
     keys: Res<ButtonInput<KeyCode>>,
     mut pes3d_state: Option<ResMut<Pes3dState>>,
@@ -1438,6 +1457,7 @@ fn toggle_pes3d_mode(
         Query<&mut Visibility, With<IsoSurface>>,
         Query<&mut Visibility, With<VolumeProxy>>,
         Query<&mut Visibility, With<SlicePlaneMesh>>,
+        Query<&mut Visibility, With<SphereSurface>>,
     )>,
     mut contexts: EguiContexts,
 ) {
@@ -1450,6 +1470,10 @@ fn toggle_pes3d_mode(
         Some(VisMode::Volume)
     } else if keys.just_pressed(KeyCode::Digit6) {
         Some(VisMode::Slice)
+    } else if keys.just_pressed(KeyCode::Digit7) {
+        Some(VisMode::Sphere)
+    } else if keys.just_pressed(KeyCode::Digit8) {
+        Some(VisMode::Migration)
     } else { None };
 
     if let Some(mode) = new_mode {
@@ -1459,6 +1483,9 @@ fn toggle_pes3d_mode(
         for mut v in vis_q.p0().iter_mut() { *v = if ps.vis_mode == VisMode::Isosurface { vis_on } else { Visibility::Hidden }; }
         for mut v in vis_q.p1().iter_mut() { *v = if ps.vis_mode == VisMode::Volume { vis_on } else { Visibility::Hidden }; }
         for mut v in vis_q.p2().iter_mut() { *v = if ps.vis_mode == VisMode::Slice { vis_on } else { Visibility::Hidden }; }
+        for mut v in vis_q.p3().iter_mut() {
+            *v = if matches!(ps.vis_mode, VisMode::Sphere | VisMode::Migration) { vis_on } else { Visibility::Hidden };
+        }
     }
 }
 
@@ -1610,6 +1637,130 @@ fn update_isosurface_mesh(
         let vis = if ps.show_surface { Visibility::Inherited } else { Visibility::Hidden };
         commands.spawn((Mesh3d(meshes.add(mc_mesh)), MeshMaterial3d(tex), IsoSurface, vis));
     }
+}
+
+/// Parameters of the last-built fixed-radius sphere (mode 7) — rebuilt only
+/// when these actually change (same flicker rationale as IsoBuildCache).
+#[derive(Default, Clone, Copy, PartialEq)]
+struct SphereBuildCache {
+    center_frac: [f32; 3],
+    radius: f32,
+    color_min: f32,
+    color_max: f32,
+    material: IsoMaterial,
+}
+
+/// Rebuild the fixed-radius sphere section mesh (mode 7) when its
+/// center/radius/color-range/material actually change.
+fn update_sphere_section(
+    pes3d_state: Option<Res<Pes3dState>>,
+    cube: Option<Res<CubeResource>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    surf_q: Query<Entity, With<SphereSurface>>,
+    mut cache: Local<SphereBuildCache>,
+) {
+    let ps = match pes3d_state.as_ref() { Some(ps) => ps, None => return };
+    if ps.vis_mode != VisMode::Sphere { return; }
+    let cube = match cube.as_ref() { Some(c) => c, None => return };
+
+    // Resolve the sphere center to fractional coordinates
+    let lattice = cube.0.to_lattice();
+    let center_frac = if ps.sphere_center_idx == usize::MAX {
+        Vec3::from_array(ps.sphere_center_custom)
+    } else {
+        let i = ps.sphere_center_idx.min(cube.0.atoms.len().saturating_sub(1));
+        let a = &cube.0.atoms[i];
+        let inv = lattice.inverse_vectors();
+        Lattice::apply_inverse(&inv, Vec3::new(a.x, a.y, a.z_coord))
+    };
+    let cur = SphereBuildCache {
+        center_frac: center_frac.to_array(),
+        radius: ps.sphere_radius,
+        color_min: ps.color_min,
+        color_max: ps.color_max,
+        material: ps.iso_material,
+    };
+    if *cache == cur { return; }  // nothing actually changed — keep the mesh
+    *cache = cur;
+
+    for e in surf_q.iter() { commands.entity(e).despawn(); }
+    let mesh = sphere_section::sphere_section_mesh(
+        &cube.0.field, cube.0.nx, &lattice,
+        center_frac, ps.sphere_radius,
+        ps.color_min, ps.color_max, ps.iso_material,
+    );
+    let alpha = ps.iso_material.alpha();
+    let mat = materials.add(StandardMaterial {
+        base_color: Color::WHITE,   // per-vertex colors replace base_color
+        alpha_mode: if alpha < 1.0 { AlphaMode::Blend } else { AlphaMode::Opaque },
+        unlit: true,
+        cull_mode: None,
+        ..default()
+    });
+    let vis = if ps.show_surface { Visibility::Inherited } else { Visibility::Hidden };
+    commands.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(mat), SphereSurface, vis));
+}
+
+/// Parameters of the last-built migration surface (mode 8) — rebuilt only
+/// when these actually change.
+#[derive(Default, Clone, PartialEq)]
+struct MigrationBuildCache {
+    e_cap: f32,
+    color_min: f32,
+    color_max: f32,
+    material: IsoMaterial,
+    show_shell: bool,
+    show_cap: bool,
+    centers: Vec<[f32; 3]>,
+}
+
+/// Rebuild the radial-stationary migration surface (mode 8) when its
+/// energy cap / color range / material / cage-center set actually change.
+fn update_migration_surface(
+    pes3d_state: Option<Res<Pes3dState>>,
+    cube: Option<Res<CubeResource>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    surf_q: Query<Entity, With<SphereSurface>>,
+    mut cache: Local<MigrationBuildCache>,
+) {
+    let ps = match pes3d_state.as_ref() { Some(ps) => ps, None => return };
+    if ps.vis_mode != VisMode::Migration { return; }
+    let cube = match cube.as_ref() { Some(c) => c, None => return };
+
+    let centers: Vec<Vec3> = sphere_section::detect_cage_centers(&cube.0);
+    let cur = MigrationBuildCache {
+        e_cap: ps.mig_e_cap,
+        color_min: ps.color_min,
+        color_max: ps.color_max,
+        material: ps.iso_material,
+        show_shell: ps.mig_show_shell,
+        show_cap: ps.mig_show_cap,
+        centers: centers.iter().map(|c| c.to_array()).collect(),
+    };
+    if *cache == cur { return; }  // nothing actually changed — keep the mesh
+    *cache = cur;
+
+    for e in surf_q.iter() { commands.entity(e).despawn(); }
+    let lattice = cube.0.to_lattice();
+    let Some(mesh) = sphere_section::migration_surface_mesh(
+        &cube.0.field, cube.0.nx, &lattice,
+        &centers, ps.mig_e_cap, ps.mig_show_shell, ps.mig_show_cap,
+        ps.color_min, ps.color_max, ps.iso_material,
+    ) else { return };
+    let alpha = ps.iso_material.alpha();
+    let mat = materials.add(StandardMaterial {
+        base_color: Color::WHITE,   // per-vertex colors replace base_color
+        alpha_mode: if alpha < 1.0 { AlphaMode::Blend } else { AlphaMode::Opaque },
+        unlit: true,
+        cull_mode: None,
+        ..default()
+    });
+    let vis = if ps.show_surface { Visibility::Inherited } else { Visibility::Hidden };
+    commands.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(mat), SphereSurface, vis));
 }
 
 /// Parameters of the last-built slice planes — rebuild only when these
