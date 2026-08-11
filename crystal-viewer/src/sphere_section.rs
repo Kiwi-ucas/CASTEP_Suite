@@ -183,6 +183,17 @@ pub fn migration_surface_mesh(
     const R_MAX: f32 = 4.00;
     const R_STEP: f32 = 0.05;
     const SHELL_R_MIN: f32 = 0.75;   // ignore minima inside the S-core repulsion
+    // Radial pre-smoothing (step 1): moving average before extremum detection
+    const SMOOTH_WINDOW: usize = 5;   // window (odd); NaN breaks the run
+    // Extremum validation (step 2): a shell minimum must be prominent —
+    // (window max − min) ≥ MIN_DEPTH — or the scan continues.
+    const MIN_DEPTH: f32 = 0.01;      // eV
+    const DEPTH_STEPS: usize = 3;     // depth-check window (3 × 0.05 Å = 0.15 Å)
+    // Shell-radius Laplacian smoothing (step 3): removes directional jumps.
+    const SMOOTH_ITERS: usize = 3;    // iterations (φ wraps, θ clamps at poles)
+
+    let n_r = 1 + ((R_MAX - R_MIN) / R_STEP).round() as usize;
+    let half_w = SMOOTH_WINDOW / 2;
 
     let vecs = lattice.to_vectors();
     let inv = lattice.inverse_vectors();
@@ -227,25 +238,46 @@ pub fn migration_surface_mesh(
         let mut cap_valid = vec![false; (NT + 1) * NP];
         let mut shell_vert: Vec<Option<usize>> = vec![None; (NT + 1) * NP];
         let mut cap_vert: Vec<Option<usize>> = vec![None; (NT + 1) * NP];
+        let mut r_shell: Vec<Option<f32>> = vec![None; (NT + 1) * NP];   // shell radii, for smoothing
 
         for it in 0..=NT {
             for ip in 0..NP {
                 let dir = sphere_dir(it, ip, NT, NP);
-                // Radial energy profile
+                // 1) Sample the full radial profile, then 2) moving-average
+                //    smooth it (NaN breaks the run) before extremum detection.
+                let mut profile = Vec::with_capacity(n_r);
+                for i in 0..n_r {
+                    let r = R_MIN + i as f32 * R_STEP;
+                    let pos = center_cart + dir * r;
+                    let frac = cart_to_frac(&inv, pos);
+                    profile.push(sample_trilinear(field, n, frac));
+                }
+                let mut sm = vec![None; n_r];
+                for i in 0..n_r {
+                    if profile[i].is_none() { continue; }
+                    let lo = i.saturating_sub(half_w);
+                    let hi = (i + half_w).min(n_r - 1);
+                    let (mut sum, mut cnt) = (0.0f32, 0u32);
+                    for j in lo..=hi {
+                        if let Some(v) = profile[j] { sum += v; cnt += 1; }
+                    }
+                    if cnt > 0 { sm[i] = Some(sum / cnt as f32); }
+                }
+                // Extremum scan on the smoothed profile. Slope-sign threshold
+                // is low (1e-5) so flat saddle caps are still detected;
+                // spurious shell minima are gated by prominence (step 2).
                 let mut prev: Option<(f32, f32)> = None;   // (r, E) previous sample
                 let mut prev2: Option<(f32, f32)> = None;  // (r, E) two samples back
                 let mut shell: Option<(f32, f32, Vec3)> = None;
                 let mut cap: Option<(f32, f32, Vec3)> = None;
-                let mut r = R_MIN;
-                while r <= R_MAX {
-                    let pos = center_cart + dir * r;
-                    let frac = cart_to_frac(&inv, pos);
-                    let e = sample_trilinear(field, n, frac);
+                for i in 0..n_r {
+                    let r = R_MIN + i as f32 * R_STEP;
+                    let e = sm[i];
                     if let (Some(pp), Some(p), Some(ev)) = (prev2, prev, e) {
                         let de_prev = p.1 - pp.1;
                         let de_cur = ev - p.1;
-                        let s_prev = if de_prev > 1e-4 { 1 } else if de_prev < -1e-4 { -1 } else { 0 };
-                        let s_cur = if de_cur > 1e-4 { 1 } else if de_cur < -1e-4 { -1 } else { 0 };
+                        let s_prev = if de_prev > 1e-5 { 1 } else if de_prev < -1e-5 { -1 } else { 0 };
+                        let s_cur = if de_cur > 1e-5 { 1 } else if de_cur < -1e-5 { -1 } else { 0 };
                         if s_prev != 0 && s_cur != 0 && s_prev != s_cur {
                             // Extremum between pp and r (parabolic refinement)
                             let denom = pp.1 - 2.0 * p.1 + ev;
@@ -255,8 +287,23 @@ pub fn migration_surface_mesh(
                             let e_star = p.1 + (r_star - p.0) / R_STEP * 0.5 * (ev - pp.1);
                             let is_min = s_prev < 0;   // − → + = minimum
                             if is_min {
-                                if shell.is_none() && r_star >= SHELL_R_MIN && e_star <= e_cap {
-                                    shell = Some((r_star, e_star, center_cart + dir * r_star));
+                                if shell.is_none() {
+                                    if r_star < SHELL_R_MIN || e_star > e_cap { continue; }
+                                    // Prominence: window max − min ≥ MIN_DEPTH,
+                                    // NaN anywhere in the window rejects.
+                                    let lo = i.saturating_sub(DEPTH_STEPS);
+                                    let hi = (i + DEPTH_STEPS).min(n_r - 1);
+                                    let mut w_max = f32::NEG_INFINITY;
+                                    let mut w_ok = true;
+                                    for j in lo..=hi {
+                                        match sm[j] {
+                                            Some(v) => w_max = w_max.max(v),
+                                            None => { w_ok = false; break; }
+                                        }
+                                    }
+                                    if w_ok && w_max - e_star >= MIN_DEPTH {
+                                        shell = Some((r_star, e_star, center_cart + dir * r_star));
+                                    }
                                 }
                             } else if shell.is_some() && cap.is_none() && e_star <= e_cap {
                                 cap = Some((r_star, e_star, center_cart + dir * r_star));
@@ -269,18 +316,10 @@ pub fn migration_surface_mesh(
                         prev2 = prev;
                         prev = Some((r, e.unwrap()));
                     }
-                    r += R_STEP;
                 }
                 let idx = it * NP + ip;
-                if let Some((_, e, pos)) = shell {
-                    if show_shell {
-                        shell_valid[idx] = true;
-                        let rgb = jet_f32(((e - color_min) / range).clamp(0.0, 1.0));
-                        shell_vert[idx] = Some(positions.len());
-                        positions.push([pos.x, pos.y, pos.z]);
-                        normals.push([dir.x, dir.y, dir.z]);
-                        colors.push([rgb[0], rgb[1], rgb[2], alpha]);
-                    }
+                if let Some((r, _, _)) = shell {
+                    if show_shell { r_shell[idx] = Some(r); }   // vertices after smoothing
                 }
                 if let Some((_, e, pos)) = cap {
                     if show_cap && !cap_taken(pos, &cap_hash) {
@@ -291,6 +330,51 @@ pub fn migration_surface_mesh(
                         positions.push([pos.x, pos.y, pos.z]);
                         normals.push([dir.x, dir.y, dir.z]);
                         colors.push([rgb[0], rgb[1], rgb[2], alpha]);
+                    }
+                }
+            }
+        }
+
+        // Step 3: Laplacian smoothing of the shell radius field (NaN-aware,
+        // φ wraps, θ clamps at the poles) — removes directional jumps that
+        // read as spikes on the mesh — then emit shell vertices with energy
+        // re-sampled at the smoothed radius (keep the e_cap cutoff).
+        if show_shell {
+            let mut r_field = r_shell;
+            for _ in 0..SMOOTH_ITERS {
+                let mut next = vec![None; (NT + 1) * NP];
+                for it in 0..=NT {
+                    for ip in 0..NP {
+                        let i0 = it * NP + ip;
+                        let Some(r) = r_field[i0] else { continue };
+                        let (mut sum, mut cnt) = (r, 1);
+                        let ipm = (ip + NP - 1) % NP;
+                        let ipp = (ip + 1) % NP;
+                        if let Some(v) = r_field[it * NP + ipm] { sum += v; cnt += 1; }
+                        if let Some(v) = r_field[it * NP + ipp] { sum += v; cnt += 1; }
+                        if it > 0 { if let Some(v) = r_field[(it - 1) * NP + ip] { sum += v; cnt += 1; } }
+                        if it < NT { if let Some(v) = r_field[(it + 1) * NP + ip] { sum += v; cnt += 1; } }
+                        next[i0] = Some(sum / cnt as f32);
+                    }
+                }
+                r_field = next;
+            }
+            for it in 0..=NT {
+                for ip in 0..NP {
+                    let i0 = it * NP + ip;
+                    let Some(r) = r_field[i0] else { continue };
+                    let dir = sphere_dir(it, ip, NT, NP);
+                    let pos = center_cart + dir * r;
+                    let frac = cart_to_frac(&inv, pos);
+                    if let Some(e) = sample_trilinear(field, n, frac) {
+                        if e <= e_cap {
+                            shell_valid[i0] = true;
+                            let rgb = jet_f32(((e - color_min) / range).clamp(0.0, 1.0));
+                            shell_vert[i0] = Some(positions.len());
+                            positions.push([pos.x, pos.y, pos.z]);
+                            normals.push([dir.x, dir.y, dir.z]);
+                            colors.push([rgb[0], rgb[1], rgb[2], alpha]);
+                        }
                     }
                 }
             }
