@@ -9,12 +9,11 @@
 //!
 //! Mode 8 (migration): for every cage-center atom (auto-detected: an atom
 //! with ≥6 Li within 3.0 Å), walk radial energy profiles along each
-//! direction. The FIRST radial MINIMUM forms the cage shell (in-cage
-//! migration surface); the first radial MAXIMUM beyond it forms the window
-//! cap (inter-cage crossing surface, where the Li's energy peaks while
-//! hopping between cages — its color shows the barrier landscape, darkest
-//! spot = true saddle). Energy-capped: only points with E ≤ e_cap survive
-//! (directions blocked by framework atoms become holes).
+//! direction. The FIRST radial MINIMUM forms the cage shell — the migration
+//! surface. Shells are made hole-free (spike suppression without rejection,
+//! gap interpolation, pole merging) and are WELDED across cages where the
+//! window bulges near-touch (~0.3 Å), so adjacent cages' shells merge into
+//! one connected surface — the inter-cage migration path.
 
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
@@ -132,7 +131,8 @@ pub fn sphere_section_mesh(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Mode 8: radial-stationary migration surface (cage shells + window caps)
+// Mode 8: radial-stationary migration surface (cage shells, welded across
+// the inter-cage window bulges)
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Auto-detect cage centers: atoms with ≥6 Li neighbors within 3.0 Å
@@ -164,17 +164,95 @@ pub fn detect_cage_centers(cube: &CubeData) -> Vec<Vec3> {
     centers
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Global vertex welding — adjacent cages' shells near-touch at the shared
+// window bulges (~0.3 Å apart). Welding MERGES the near-coincident vertices
+// into shared ones, so the two bulges connect into one continuous migration
+// surface between cages.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Merge distance: adjacent shells at a window bulge are within a few tenths
+/// of an Ångstrom of each other. Below this, two vertices become one.
+/// Real-position (same image) welding, so it can be raised generously without
+/// the periodic-image stretch the user saw as lines through the cell.
+const WELD_TOL: f32 = 0.6;
+/// Spatial-hash cell size for the weld lookup (fine enough that only the 27
+/// neighbor cells need checking).
+const WELD_CELL: f32 = 0.15;
+
+/// Push a vertex, or reuse an existing one from a DIFFERENT cage within
+/// WELD_TOL. Returns the global vertex index. Same-cage vertices never weld
+/// (the direction grid spacing ~0.16 Å is < WELD_TOL, so welding intra-cage
+/// would collapse a shell to points). Cross-cage welding connects the
+/// near-touching window bulges of adjacent shells.
+///
+/// The distance is measured in REAL cartesian space (no periodic folding):
+/// welding must only merge vertices that genuinely coincide in the rendered
+/// cell. Folding the coordinates first makes two vertices that are the same
+/// PHYSICAL point but different periodic IMAGES (e.g. one at cart 0.05, the
+/// other at cart 10.33) weld, and then the re-used vertex sits 10 Å from the
+/// welder's neighbours — a triangle stretched across the whole cell (the
+/// "lines through the cell" the user saw). Real-position welding connects
+/// the in-cell windows (both cages reach the saddle in the same image) and
+/// leaves the cell-face wraps separate, exactly like v0.3.3.
+fn weld_or_push(
+    pos: Vec3, normal: Vec3, color: [f32; 4], cage: usize,
+    positions: &mut Vec<[f32; 3]>, normals: &mut Vec<[f32; 3]>, colors: &mut Vec<[f32; 4]>,
+    vertex_cage: &mut Vec<usize>,
+    hash: &mut std::collections::HashMap<(i32, i32, i32), Vec<(usize, Vec3, usize)>>,
+    cross_pairs: &mut std::collections::HashSet<(usize, usize)>,
+    stats: &mut (usize, usize),
+) -> usize {
+    let key = (
+        (pos.x / WELD_CELL).floor() as i32,
+        (pos.y / WELD_CELL).floor() as i32,
+        (pos.z / WELD_CELL).floor() as i32,
+    );
+    for dx in -1i32..=1 {
+        for dy in -1i32..=1 {
+            for dz in -1i32..=1 {
+                if let Some(bucket) = hash.get(&(key.0 + dx, key.1 + dy, key.2 + dz)) {
+                    for (vi, q, c) in bucket {
+                        // Cross-cage weld (real positions only).
+                        if *c != cage && (*q - pos).length() < WELD_TOL {
+                            cross_pairs.insert(((*c).min(cage), (*c).max(cage)));
+                            stats.1 += 1;
+                            return *vi;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    stats.0 += 1;
+    let vi = positions.len();
+    positions.push([pos.x, pos.y, pos.z]);
+    normals.push([normal.x, normal.y, normal.z]);
+    colors.push(color);
+    vertex_cage.push(cage);
+    hash.entry(key).or_default().push((vi, pos, cage));
+    vi
+}
+
 /// Build the merged migration surface: per cage, the first radial minimum
-/// (cage shell) and the first radial maximum beyond it (window cap), both
-/// energy-capped at `e_cap` (cube values are E−E_min, so this is a relative
-/// energy). Cap points are deduplicated across cages (spatial hash, 0.25 Å)
-/// to avoid z-fighting between coincident caps of neighboring cages.
+/// (cage shell) forms the migration surface, energy-capped at `e_cap` (cube
+/// values are E−E_min, so this is a relative energy).
+///
+/// The shell gets the full spike-suppression pipeline (opt 1 pre-smoothing,
+/// opt 2 prominence, opt 3 Laplacian), but none of it is allowed to create a
+/// hole — prominence only picks WHICH minimum (a rejected one falls back to
+/// the first valid minimum), a smoothed radius that crosses above e_cap falls
+/// back to the pre-smoothing radius, remaining gaps are interpolated from the
+/// grid neighbours, and the coincident pole vertices are merged (with
+/// degenerate triangles dropped). Adjacent cages' shells near-touch at the
+/// window bulges (~0.3 Å apart) and are WELDED (real-position) into one
+/// connected surface — the inter-cage migration path.
 ///
 /// Returns None when no cage center yields any valid surface point.
 pub fn migration_surface_mesh(
     field: &[f32], n: usize, lattice: &Lattice,
     centers: &[Vec3],
-    e_cap: f32, show_shell: bool, show_cap: bool,
+    e_cap: f32, show_shell: bool,
     color_min: f32, color_max: f32, material: IsoMaterial,
 ) -> Option<Mesh> {
     const NT: usize = 48;
@@ -183,13 +261,13 @@ pub fn migration_surface_mesh(
     const R_MAX: f32 = 4.00;
     const R_STEP: f32 = 0.05;
     const SHELL_R_MIN: f32 = 0.75;   // ignore minima inside the S-core repulsion
-    // Radial pre-smoothing (step 1): moving average before extremum detection
+    // Radial pre-smoothing (opt 1): moving average before extremum detection.
     const SMOOTH_WINDOW: usize = 5;   // window (odd); NaN breaks the run
-    // Extremum validation (step 2): a shell minimum must be prominent —
-    // (window max − min) ≥ MIN_DEPTH — or the scan continues.
+    // Extremum validation (opt 2): a shell minimum must be prominent —
+    // (window max − min) ≥ MIN_DEPTH — or the scan continues (spike gate).
     const MIN_DEPTH: f32 = 0.01;      // eV
     const DEPTH_STEPS: usize = 3;     // depth-check window (3 × 0.05 Å = 0.15 Å)
-    // Shell-radius Laplacian smoothing (step 3): removes directional jumps.
+    // Shell-radius Laplacian smoothing (opt 3): removes directional jumps.
     const SMOOTH_ITERS: usize = 3;    // iterations (φ wraps, θ clamps at poles)
 
     let n_r = 1 + ((R_MAX - R_MIN) / R_STEP).round() as usize;
@@ -204,45 +282,44 @@ pub fn migration_surface_mesh(
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut colors: Vec<[f32; 4]> = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
+    // Creator cage of each vertex — used to suppress duplicate quads: a shell
+    // quad whose four vertices were ALL created by another cage (welded, so
+    // that cage already renders the merged window region) is not emitted.
+    let mut vertex_cage: Vec<usize> = Vec::new();
 
-    // Accepted cap positions (cartesian) in a spatial hash — cross-cage dedup.
-    let cell = 0.25_f32;
-    let mut cap_hash: std::collections::HashMap<(i32, i32, i32), Vec<Vec3>> =
+    // Global weld hash (cross-cage shared vertices) + weld counters.
+    let mut weld_hash: std::collections::HashMap<(i32, i32, i32), Vec<(usize, Vec3, usize)>> =
         std::collections::HashMap::new();
-    let hash_key = |p: Vec3| {
-        (
-            (p.x / cell).floor() as i32,
-            (p.y / cell).floor() as i32,
-            (p.z / cell).floor() as i32,
-        )
-    };
-    let cap_taken = |p: Vec3, hash: &std::collections::HashMap<(i32, i32, i32), Vec<Vec3>>| -> bool {
-        let k = hash_key(p);
-        for dx in -1i32..=1 {
-            for dy in -1i32..=1 {
-                for dz in -1i32..=1 {
-                    if let Some(bucket) = hash.get(&(k.0 + dx, k.1 + dy, k.2 + dz)) {
-                        for q in bucket {
-                            if (p - *q).length() < cell { return true; }
-                        }
-                    }
-                }
-            }
-        }
-        false
-    };
+    let mut weld_stats: (usize, usize) = (0, 0);   // (new, welded)
+    // Distinct cage pairs sharing at least one welded vertex — direct measure
+    // of inter-cage connectivity via the shared window.
+    let mut cross_pairs: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
+    let mut n_shell_dirs = 0usize;
+    // Quads skipped because all four vertices came from another cage (a
+    // fully-welded duplicate region) — the window merge de-duplication.
+    let mut n_suppressed = 0usize;
+    // Duplicate-face removal (belt-and-suspenders on top of quad suppression).
+    let mut seen_tris: std::collections::HashSet<(u32, u32, u32)> =
+        std::collections::HashSet::new();
 
-    for center_frac in centers {
+    for (cage_idx, &center_frac) in centers.iter().enumerate() {
         let center_cart = center_frac.x * vecs[0] + center_frac.y * vecs[1] + center_frac.z * vecs[2];
         let mut shell_valid = vec![false; (NT + 1) * NP];
-        let mut cap_valid = vec![false; (NT + 1) * NP];
         let mut shell_vert: Vec<Option<usize>> = vec![None; (NT + 1) * NP];
-        let mut cap_vert: Vec<Option<usize>> = vec![None; (NT + 1) * NP];
-        let mut r_shell: Vec<Option<f32>> = vec![None; (NT + 1) * NP];   // shell radii, for smoothing
+        // Prominence-validated shell radius (opt 2), Laplacian-smoothed (opt 3),
+        // then emitted.
+        let mut r_shell: Vec<Option<f32>> = vec![None; (NT + 1) * NP];
+        // First valid minimum radius per direction — the fallback for opt-2
+        // holes, so prominence picks WHICH minimum but never creates a hole.
+        let mut first_min_r: Vec<Option<f32>> = vec![None; (NT + 1) * NP];
 
+        // ── radial scan: shell = first prominent minimum (≤ e_cap), with opt 2
+        // (prominence gate) + opt 3 (Laplacian) spike suppression. ──
         for it in 0..=NT {
             for ip in 0..NP {
                 let dir = sphere_dir(it, ip, NT, NP);
+                let idx = it * NP + ip;
                 // 1) Sample the full radial profile, then 2) moving-average
                 //    smooth it (NaN breaks the run) before extremum detection.
                 let mut profile = Vec::with_capacity(n_r);
@@ -263,13 +340,15 @@ pub fn migration_surface_mesh(
                     }
                     if cnt > 0 { sm[i] = Some(sum / cnt as f32); }
                 }
-                // Extremum scan on the smoothed profile. Slope-sign threshold
-                // is low (1e-5) so flat saddle caps are still detected;
-                // spurious shell minima are gated by prominence (step 2).
+                // Extremum scan on the smoothed profile (slope-sign threshold
+                // 1e-5 so flat extrema are still detected).
                 let mut prev: Option<(f32, f32)> = None;   // (r, E) previous sample
                 let mut prev2: Option<(f32, f32)> = None;  // (r, E) two samples back
                 let mut shell: Option<(f32, f32, Vec3)> = None;
-                let mut cap: Option<(f32, f32, Vec3)> = None;
+                // First valid minimum (r ≥ SHELL_R_MIN, e ≤ e_cap) — the shell
+                // falls back to THIS when prominence (opt 2) rejects the min, so
+                // opt 2 picks WHICH minimum but never creates a hole.
+                let mut first_min_dir: Option<(f32, f32, Vec3)> = None;
                 for i in 0..n_r {
                     let r = R_MIN + i as f32 * R_STEP;
                     let e = sm[i];
@@ -287,26 +366,32 @@ pub fn migration_surface_mesh(
                             let e_star = p.1 + (r_star - p.0) / R_STEP * 0.5 * (ev - pp.1);
                             let is_min = s_prev < 0;   // − → + = minimum
                             if is_min {
+                                if first_min_dir.is_none() && r_star >= SHELL_R_MIN && e_star <= e_cap {
+                                    first_min_dir = Some((r_star, e_star, center_cart + dir * r_star));
+                                }
                                 if shell.is_none() {
-                                    if r_star < SHELL_R_MIN || e_star > e_cap { continue; }
-                                    // Prominence: window max − min ≥ MIN_DEPTH,
-                                    // NaN anywhere in the window rejects.
-                                    let lo = i.saturating_sub(DEPTH_STEPS);
-                                    let hi = (i + DEPTH_STEPS).min(n_r - 1);
-                                    let mut w_max = f32::NEG_INFINITY;
-                                    let mut w_ok = true;
-                                    for j in lo..=hi {
-                                        match sm[j] {
-                                            Some(v) => w_max = w_max.max(v),
-                                            None => { w_ok = false; break; }
+                                    // Prominence (opt 2): window max − min over
+                                    // ±DEPTH_STEPS must be ≥ MIN_DEPTH — rejects
+                                    // spurious shallow minima (shell spikes).
+                                    // (No `continue` here: skipping the prev
+                                    // update would leave stale profile state and
+                                    // shift later extremum positions.)
+                                    if r_star >= SHELL_R_MIN && e_star <= e_cap {
+                                        let lo = i.saturating_sub(DEPTH_STEPS);
+                                        let hi = (i + DEPTH_STEPS).min(n_r - 1);
+                                        let mut w_max = f32::NEG_INFINITY;
+                                        let mut w_ok = true;
+                                        for j in lo..=hi {
+                                            match sm[j] {
+                                                Some(v) => w_max = w_max.max(v),
+                                                None => { w_ok = false; break; }
+                                            }
+                                        }
+                                        if w_ok && w_max - e_star >= MIN_DEPTH {
+                                            shell = Some((r_star, e_star, center_cart + dir * r_star));
                                         }
                                     }
-                                    if w_ok && w_max - e_star >= MIN_DEPTH {
-                                        shell = Some((r_star, e_star, center_cart + dir * r_star));
-                                    }
                                 }
-                            } else if shell.is_some() && cap.is_none() && e_star <= e_cap {
-                                cap = Some((r_star, e_star, center_cart + dir * r_star));
                             }
                         }
                     }
@@ -317,29 +402,47 @@ pub fn migration_surface_mesh(
                         prev = Some((r, e.unwrap()));
                     }
                 }
-                let idx = it * NP + ip;
                 if let Some((r, _, _)) = shell {
-                    if show_shell { r_shell[idx] = Some(r); }   // vertices after smoothing
+                    if show_shell { r_shell[idx] = Some(r); }   // emitted after smoothing
                 }
-                if let Some((_, e, pos)) = cap {
-                    if show_cap && !cap_taken(pos, &cap_hash) {
-                        cap_valid[idx] = true;
-                        cap_hash.entry(hash_key(pos)).or_default().push(pos);
-                        let rgb = jet_f32(((e - color_min) / range).clamp(0.0, 1.0));
-                        cap_vert[idx] = Some(positions.len());
-                        positions.push([pos.x, pos.y, pos.z]);
-                        normals.push([dir.x, dir.y, dir.z]);
-                        colors.push([rgb[0], rgb[1], rgb[2], alpha]);
-                    }
-                }
+                first_min_r[idx] = first_min_dir.map(|(r, _, _)| r);
             }
         }
 
-        // Step 3: Laplacian smoothing of the shell radius field (NaN-aware,
+        // Opt 2 must never create a hole: where prominence rejected the shell,
+        // fall back to the first valid minimum. Then interpolate any remaining
+        // gaps (monotonic / NaN directions) from the 4 grid neighbours so the
+        // shell closes into a sphere (χ=2) instead of a holey surface.
+        for i in 0..(NT + 1) * NP {
+            if r_shell[i].is_none() { r_shell[i] = first_min_r[i]; }
+        }
+        for _ in 0..4 {
+            let mut changed = false;
+            let mut next = r_shell.clone();
+            for it in 0..=NT {
+                for ip in 0..NP {
+                    let i0 = it * NP + ip;
+                    if next[i0].is_some() { continue; }
+                    let ipm = (ip + NP - 1) % NP;
+                    let ipp = (ip + 1) % NP;
+                    let (mut sum, mut cnt) = (0.0f32, 0u32);
+                    if it > 0 { if let Some(r) = r_shell[(it - 1) * NP + ip] { sum += r; cnt += 1; } }
+                    if it < NT { if let Some(r) = r_shell[(it + 1) * NP + ip] { sum += r; cnt += 1; } }
+                    if let Some(r) = r_shell[it * NP + ipm] { sum += r; cnt += 1; }
+                    if let Some(r) = r_shell[it * NP + ipp] { sum += r; cnt += 1; }
+                    if cnt >= 2 { next[i0] = Some(sum / cnt as f32); changed = true; }
+                }
+            }
+            r_shell = next;
+            if !changed { break; }
+        }
+
+        // Opt 3: Laplacian smoothing of the shell radius field (NaN-aware,
         // φ wraps, θ clamps at the poles) — removes directional jumps that
         // read as spikes on the mesh — then emit shell vertices with energy
         // re-sampled at the smoothed radius (keep the e_cap cutoff).
         if show_shell {
+            let r_orig = r_shell.clone();   // pre-smoothing radii, for the clamp
             let mut r_field = r_shell;
             for _ in 0..SMOOTH_ITERS {
                 let mut next = vec![None; (NT + 1) * NP];
@@ -364,24 +467,55 @@ pub fn migration_surface_mesh(
                     let i0 = it * NP + ip;
                     let Some(r) = r_field[i0] else { continue };
                     let dir = sphere_dir(it, ip, NT, NP);
-                    let pos = center_cart + dir * r;
-                    let frac = cart_to_frac(&inv, pos);
-                    if let Some(e) = sample_trilinear(field, n, frac) {
+                    let frac = cart_to_frac(&inv, center_cart + dir * r);
+                    let e = sample_trilinear(field, n, frac);
+                    // Opt 3 must never create a hole: if the smoothed radius's
+                    // energy crosses above e_cap, fall back to the pre-smoothing
+                    // radius (which is ≤ e_cap) instead of dropping the point.
+                    let (r_use, e_use) = match e {
+                        Some(e) if e <= e_cap => (r, Some(e)),
+                        _ => {
+                            let ro = r_orig[i0].unwrap_or(r);
+                            (ro, sample_trilinear(field, n, cart_to_frac(&inv, center_cart + dir * ro)))
+                        }
+                    };
+                    if let Some(e) = e_use {
                         if e <= e_cap {
                             shell_valid[i0] = true;
                             let rgb = jet_f32(((e - color_min) / range).clamp(0.0, 1.0));
-                            shell_vert[i0] = Some(positions.len());
-                            positions.push([pos.x, pos.y, pos.z]);
-                            normals.push([dir.x, dir.y, dir.z]);
-                            colors.push([rgb[0], rgb[1], rgb[2], alpha]);
+                            let pos = center_cart + dir * r_use;
+                            shell_vert[i0] = Some(weld_or_push(
+                                pos, dir, [rgb[0], rgb[1], rgb[2], alpha], cage_idx,
+                                &mut positions, &mut normals, &mut colors,
+                                &mut vertex_cage, &mut weld_hash, &mut cross_pairs, &mut weld_stats));
                         }
                     }
                 }
             }
         }
 
-        // Triangulate quads (skip any quad with missing corners → holes)
-        let push_sheet = |valid: &[bool], vert: &[Option<usize>], indices: &mut Vec<u32>| {
+        // Merge the coincident pole vertices (θ=0 and θ=NT: every φ maps to
+        // the same direction → the same position) into a single index, so the
+        // shell closes into a true sphere (χ=2) instead of a cylinder with a
+        // degenerate fan of zero-area triangles at each pole.
+        let verts = &mut shell_vert;
+        for pole_it in [0usize, NT] {
+            let pole_idx = (0..NP).find_map(|ip| verts[pole_it * NP + ip]);
+            if let Some(vi) = pole_idx {
+                for ip in 0..NP {
+                    if verts[pole_it * NP + ip].is_some() {
+                        verts[pole_it * NP + ip] = Some(vi);
+                    }
+                }
+            }
+        }
+
+        // Triangulate quads. A quad whose four vertices were ALL created by
+        // other cages is SKIPPED — it is a fully-welded duplicate region that
+        // the owning cage already renders, so the merged window keeps one
+        // clean surface instead of two cross-hatched sheets. Missing corners →
+        // holes.
+        let mut push_sheet = |valid: &[bool], vert: &[Option<usize>], indices: &mut Vec<u32>| {
             for it in 0..NT {
                 for ip in 0..NP {
                     let a = it * NP + ip;
@@ -391,14 +525,33 @@ pub fn migration_surface_mesh(
                     if valid[a] && valid[b] && valid[c] && valid[d] {
                         let (va, vb, vc, vd) = (vert[a].unwrap() as u32, vert[b].unwrap() as u32,
                                                 vert[c].unwrap() as u32, vert[d].unwrap() as u32);
-                        indices.extend_from_slice(&[va, vb, vc, va, vc, vd]);
+                        if ![va, vb, vc, vd].iter().any(|&v| vertex_cage[v as usize] == cage_idx) {
+                            n_suppressed += 1;   // fully welded — the owning cage renders it
+                            continue;
+                        }
+                        let sorted = |x: u32, y: u32, z: u32| {
+                            let mut t = [x, y, z]; t.sort(); (t[0], t[1], t[2])
+                        };
+                        // Drop degenerate triangles (two coincident verts, e.g.
+                        // the pole fans after merging) — they're zero-area.
+                        if va != vb && vb != vc && va != vc && seen_tris.insert(sorted(va, vb, vc)) {
+                            indices.extend_from_slice(&[va, vb, vc]);
+                        }
+                        if va != vc && vc != vd && va != vd && seen_tris.insert(sorted(va, vc, vd)) {
+                            indices.extend_from_slice(&[va, vc, vd]);
+                        }
                     }
                 }
             }
         };
+        n_shell_dirs += shell_valid.iter().filter(|&&v| v).count();
         push_sheet(&shell_valid, &shell_vert, &mut indices);
-        push_sheet(&cap_valid, &cap_vert, &mut indices);
     }
+
+    eprintln!(
+        "[mode8] cages={} verts={} tris={} shell_dirs={} weld=new{} merged{} pairs={} suppressed={}",
+        centers.len(), positions.len(), indices.len() / 3,
+        n_shell_dirs, weld_stats.0, weld_stats.1, cross_pairs.len(), n_suppressed);
 
     if positions.is_empty() { return None; }
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
@@ -465,26 +618,25 @@ mod tests {
         assert!(colors.iter().all(|c| c[3] == 1.0));
     }
 
-    /// Mode 8: shell (first radial min ≈ well at 2.4 Å) + cap (barrier
-    /// between the two wells) both present; cap dedup keeps < 4×4704×2 pts.
+    /// Mode 8: the shell (first radial min ≈ well at 2.4 Å) is present and
+    /// energy-capped; the shell wells are low-energy (blue).
     #[test]
-    fn migration_surface_shell_and_cap() {
+    fn migration_surface_shell() {
         let cube = test_cube();
         let lattice = cube.to_lattice();
         let centers = detect_cage_centers(&cube);
         let mesh = migration_surface_mesh(
             &cube.field, cube.nx, &lattice,
-            &centers, 3.0, true, true,
+            &centers, 3.0, true,
             0.0, 0.5, IsoMaterial::SemiTransparent,
         ).expect("migration surface must build");
         let nv = mesh.count_vertices();
-        // 4 cages × 4704 grid points — shells + caps; dedup must cut the caps
+        // 4 cages × 4704 grid points, minus pole merging and welded dupes
         assert!(nv > 5000, "expected shells, got only {} vertices", nv);
         assert!(nv < 4 * 4704 * 2, "suspicious vertex count {}", nv);
         let colors = colors_of(&mesh);
-        // Shell wells ≈ E_min (blue) and the inter-cage barrier (red) both present
+        // Shell wells ≈ E_min (blue) present
         assert!(colors.iter().any(|c| c[2] > c[0] + 0.2), "no blue shell wells");
-        assert!(colors.iter().any(|c| c[0] > c[2] + 0.2), "no barrier (red) cap points");
         assert!(colors.iter().all(|c| c[3] == 0.7), "SemiTransparent alpha");
     }
 }

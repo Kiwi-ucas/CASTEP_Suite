@@ -38,6 +38,7 @@ fn main() {
         .add_systems(Update, move_selected_atom.after(highlight_atoms))
         .add_systems(Update, (add_atom_system, delete_atom_system))
         .add_systems(Update, (display_mode_system, sync_atom_radii).chain())
+        .add_systems(Update, apply_atom_visibility.after(display_mode_system))
         .add_systems(Update, sync_axes_visibility.after(display_mode_system))
         .add_systems(Update, (toggle_projection, sync_arrow_visibility))
         .add_systems(Update, (toggle_surface_combined, update_color_clip, update_pes_surface).chain().after(ui_system))
@@ -169,7 +170,6 @@ pub struct Pes3dState {
     pub sphere_radius: f32,           // mode 7: sphere radius (Å)
     pub mig_e_cap: f32,               // mode 8: max relative energy on the surface (eV)
     pub mig_show_shell: bool,         // mode 8: show cage shells
-    pub mig_show_cap: bool,           // mode 8: show window caps
     pub alpha_scale: f32,   // volume render: opacity multiplier
     pub alpha_falloff: f32, // volume render: gaussian window width (energy layer selector)
     pub vol_iso_ref: f32,   // volume render: band-pass window center (eV)
@@ -183,11 +183,12 @@ pub struct Pes3dState {
 #[derive(Component)] struct SphereSurface;  // mode 7 sphere + mode 8 migration mesh
 
 #[derive(Resource)]
-struct DisplayMode {
+pub struct DisplayMode {
     mode: u8,          // 1=ball-stick, 2=space-filling, 3=wireframe
     show_bonds: bool,
     show_cell: bool,
     show_axes: bool,
+    show_atoms: bool,  // hide/show all atoms (observe the PES surface alone)
 }
 
 /// Saved initial camera state for R-key reset
@@ -747,7 +748,7 @@ fn setup(
         .collect();
     let radii: Vec<f32> = elements.iter().map(|el| resources::covalent_radius(el)).collect();
     commands.insert_resource(AtomInfo::new(elements, labels, radii));
-    commands.insert_resource(DisplayMode { mode: 1, show_bonds: false, show_cell: true, show_axes: false });
+    commands.insert_resource(DisplayMode { mode: 1, show_bonds: false, show_cell: true, show_axes: false, show_atoms: true });
 
     // Crystal metadata for UI (strip .json extension from filename)
     let fname = if crystal_path.0.is_empty() {
@@ -944,8 +945,9 @@ fn setup(
             sphere_center_idx: cube.atoms.iter().position(|a| a.z == 16).unwrap_or(0),
             sphere_center_custom: [0.25, 0.25, 0.25],
             sphere_radius: 1.4,
-            // Mode 8: migration window (relative eV), shells + caps on
-            mig_e_cap: 3.0, mig_show_shell: true, mig_show_cap: true,
+            // Mode 8: migration window (relative eV); the migration surface is
+            // the shell (inter-cage link = shell weld).
+            mig_e_cap: 3.0, mig_show_shell: true,
             alpha_scale: 0.8, alpha_falloff: 0.25, vol_steps: 128,
             // Volume ISO ref starts at the data median so the band-pass window
             // sits in the dense energy band by default.
@@ -1213,6 +1215,25 @@ fn display_mode_system(
     }
     if keys.just_pressed(KeyCode::KeyA) {
         display.show_axes = !display.show_axes;
+    }
+    if keys.just_pressed(KeyCode::KeyH) {
+        display.show_atoms = !display.show_atoms;
+    }
+}
+
+/// Apply the hide/show-atoms flag to every atom entity (change-detected so
+/// the per-frame cost is zero while the flag is static).
+fn apply_atom_visibility(
+    display: Res<DisplayMode>,
+    mut prev: Local<bool>,
+    atoms: Query<Entity, With<AtomMarker>>,
+    mut commands: Commands,
+) {
+    let new = display.show_atoms;
+    if *prev != new {
+        *prev = new;
+        let vis = if new { Visibility::Visible } else { Visibility::Hidden };
+        for e in atoms.iter() { commands.entity(e).insert(vis); }
     }
 }
 
@@ -1608,7 +1629,6 @@ struct SurfaceBuildCache {
     radius: f32,
     e_cap: f32,
     show_shell: bool,
-    show_cap: bool,
     centers: Vec<[f32; 3]>,
     color_min: f32,
     color_max: f32,
@@ -1650,7 +1670,7 @@ fn update_surface_mesh(
                 built_mode: Some(VisMode::Sphere),
                 center_frac: center_frac.to_array(),
                 radius: ps.sphere_radius,
-                e_cap: 0.0, show_shell: false, show_cap: false,
+                e_cap: 0.0, show_shell: false,
                 centers: Vec::new(),
                 color_min: ps.color_min, color_max: ps.color_max,
                 material: ps.iso_material,
@@ -1662,7 +1682,6 @@ fn update_surface_mesh(
             radius: 0.0,
             e_cap: ps.mig_e_cap,
             show_shell: ps.mig_show_shell,
-            show_cap: ps.mig_show_cap,
             centers: centers.iter().map(|c| c.to_array()).collect(),
             color_min: ps.color_min, color_max: ps.color_max,
             material: ps.iso_material,
@@ -1681,7 +1700,7 @@ fn update_surface_mesh(
             ps.color_min, ps.color_max, ps.iso_material),
         VisMode::Migration => match sphere_section::migration_surface_mesh(
             &cube.0.field, cube.0.nx, &lattice,
-            &centers, ps.mig_e_cap, ps.mig_show_shell, ps.mig_show_cap,
+            &centers, ps.mig_e_cap, ps.mig_show_shell,
             ps.color_min, ps.color_max, ps.iso_material) {
             Some(m) => m, None => return,
         },

@@ -12,6 +12,7 @@ use crate::RotateState;
 use crate::PanelRects;
 use crate::PesState;
 use crate::Pes3dState;
+use crate::DisplayMode;
 use crate::VisMode;
 use crate::IsoMaterial;
 use crate::CubeResource;
@@ -51,6 +52,7 @@ pub fn ui_system(
     pes_state: Option<Res<PesState>>,
     mut pes3d_state: Option<ResMut<Pes3dState>>,
     cube: Option<Res<CubeResource>>,
+    mut display: ResMut<DisplayMode>,
 ) {
     let ctx = contexts.ctx_mut();
 
@@ -81,7 +83,7 @@ pub fn ui_system(
                         p, el, img_count)
                 ).strong());
             } else {
-                let mut base = "\u{1f5b0} Right-drag: rotate | Scroll: zoom | Click: select | 1/2/3: mode | P: proj | A: axes | B: bonds | C: cell | R: reset".to_string();
+                let mut base = "\u{1f5b0} Right-drag: rotate | Scroll: zoom | Click: select | 1/2/3: mode | P: proj | A: axes | B: bonds | C: cell | H: atoms | R: reset".to_string();
                 if let Some(ref pes) = pes_state {
                     if pes.has_energies {
                         base.push_str(" | +/-: color range");
@@ -95,13 +97,19 @@ pub fn ui_system(
 
     // ── Left panel: atom list (asymmetric unit only) ──
     let left_resp = egui::SidePanel::left("atom_list")
-        .resizable(false).default_width(180.0)
+        .resizable(false).default_width(205.0)
         .show(ctx, |ui| {
             ui.heading("Atoms");
             ui.separator();
-            if ui.button("\u{2795} Add Atom").clicked() {
-                add_state.show_table = true;
-            }
+            ui.horizontal(|ui| {
+                if ui.button("\u{2795} Add Atom").clicked() {
+                    add_state.show_table = true;
+                }
+                let hide_label = if display.show_atoms { "Hide Atoms" } else { "Show Atoms" };
+                if ui.button(hide_label).clicked() {
+                    display.show_atoms = !display.show_atoms;
+                }
+            });
             ui.separator();
             egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                 for i in 0..count {
@@ -325,7 +333,7 @@ pub fn ui_system(
                 if ps.has_energies && ps.vis_mode == VisMode::Migration {
                     ui.separator();
                     ui.label(egui::RichText::new("Migration Surface").strong());
-                    ui.label("Cage shells = 1st radial min; window caps = 1st radial max beyond it");
+                    ui.label("Cage shells = 1st radial min, welded across window bulges");
                     let e_max = ps.e_max.max(1.0);
                     ui.horizontal(|ui| {
                         ui.label("E cap");
@@ -333,7 +341,6 @@ pub fn ui_system(
                             .suffix(" eV"));
                     });
                     ui.checkbox(&mut ps.mig_show_shell, "Cage shells");
-                    ui.checkbox(&mut ps.mig_show_cap, "Window caps");
                     ui.horizontal(|ui| {
                         ui.label("Material");
                         egui::ComboBox::from_id_salt("mig_material")
