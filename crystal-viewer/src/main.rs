@@ -3,6 +3,7 @@
 mod crystal; mod resources; mod picking; mod ui; mod pes;
 mod cube_reader; mod marching_cubes; mod volume_render; mod slice_plane;
 mod sphere_section;
+mod render_export;
 
 use bevy::prelude::*;
 use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
@@ -22,6 +23,9 @@ use std::env;
 fn main() {
     let args: Vec<String> = env::args().collect();
     let json_path = args.get(1).map(|s| s.as_str()).unwrap_or("");
+    // Build marker — lets the user verify they are running THIS binary
+    // (mode 8: Export PLY / E key, Bevy-native render export).
+    eprintln!("[viewer] build v0.3.5+bevyrender (mode 8: Export PLY / Render with Bevy)");
 
     App::new()
         .add_plugins(DefaultPlugins)
@@ -29,6 +33,7 @@ fn main() {
         .add_plugins(volume_render::VolumePlugin)
         .insert_resource(CrystalPath(json_path.to_string()))
         .init_resource::<PanelRects>()
+        .init_resource::<RenderSettings>()
         .add_systems(Startup, setup)
         .insert_resource(RotateState { angle_deg: 45.0 })
         .add_systems(Update, (ui_system, orbit_camera).chain())
@@ -45,13 +50,125 @@ fn main() {
         .add_systems(Update, toggle_pes3d_mode.after(ui_system))
         .add_systems(Update, (update_isosurface, update_isosurface_mesh).chain().after(ui_system))
         .add_systems(Update, update_surface_mesh.after(ui_system))
+        .add_systems(Update, render_export::start_offscreen_render.after(ui_system))
+        .add_systems(Update, apply_render_params.after(ui_system))
         .add_systems(Update, update_volume.after(ui_system))
         .add_systems(Update, update_slices_inner.after(ui_system))
+        .add_systems(Update, auto_exit_system)
+        .add_systems(Update, auto_render_system.after(ui_system))
         .run();
 }
 
+/// Debug/test hook: `CRYSTAL_VIEWER_AUTOEXIT=<seconds>` sends AppExit after
+/// that many seconds — the exact same teardown path as closing the window,
+/// for reproducing exit crashes headlessly (no-op when unset).
+fn auto_exit_system(
+    time: Res<Time>,
+    mut timer: Local<Option<Timer>>,
+    mut exit: EventWriter<AppExit>,
+) {
+    let Ok(s) = std::env::var("CRYSTAL_VIEWER_AUTOEXIT") else { return };
+    if timer.is_none() {
+        let secs: f32 = s.parse().unwrap_or(5.0);
+        *timer = Some(Timer::from_seconds(secs, TimerMode::Once));
+    }
+    if let Some(t) = timer.as_mut() {
+        t.tick(time.delta());
+        if t.finished() {
+            eprintln!("[viewer] auto-exit (CRYSTAL_VIEWER_AUTOEXIT)");
+            exit.send(AppExit::Success);
+        }
+    }
+}
+
 #[derive(Resource)] struct CrystalPath(String);
+/// Render pipeline state: the UI writes `request` (Render button),
+/// the Bevy-native offscreen render system consumes it.
+#[derive(Resource)]
+pub struct RenderSettings {
+    /// Set by the Render button; consumed (reset to false) by the system.
+    pub request: bool,
+    /// Render button → opens the render settings dialog.
+    pub show_dialog: bool,
+    /// Last pipeline result, shown in the dialog.
+    pub last_status: std::sync::Arc<std::sync::Mutex<String>>,
+    /// True while an offscreen render is in flight (blocks new requests).
+    pub rendering: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // ── output settings ──
+    pub width: u32,
+    pub height: u32,
+    pub format: render_export::ImgFormat,
+    // ── live scene parameters (bound to the viewer in real time, so the
+    //    render dialog edits are literally what you see on screen) ──
+
+    pub key_lux: f32,
+    pub fill_lux: f32,
+    pub ambient_lux: f32,
+    /// Background clear color (sRGB, 0..1 per channel).
+    pub bg_r: f32,
+    pub bg_g: f32,
+    pub bg_b: f32,
+    pub shadows_enabled: bool,
+    /// Anti-aliasing sample count on the camera: 1 (off), 2, 4 or 8.
+    pub msaa_samples: u32,
+    pub atom_roughness: f32,
+    pub atom_metallic: f32,
+    pub tonemap: render_export::TonemapChoice,
+}
+impl Default for RenderSettings {
+    fn default() -> Self {
+        Self {
+            request: false, show_dialog: false,
+            last_status: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            rendering: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            width: 1920, height: 1080,
+            format: render_export::ImgFormat::Png,
+            key_lux: 4000.0, fill_lux: 2000.0, ambient_lux: 80.0,
+            bg_r: 43.0 / 255.0, bg_g: 44.0 / 255.0, bg_b: 47.0 / 255.0,
+            shadows_enabled: false,
+            msaa_samples: 4,
+            atom_roughness: 0.5, atom_metallic: 0.2,
+            tonemap: render_export::TonemapChoice::TonyMcMapface,
+        }
+    }
+}
+impl RenderSettings {
+    /// Restore every editable render parameter to its default value while
+    /// keeping the runtime flags (request/show_dialog/status/rendering).
+    pub fn reset_params(&mut self) {
+        let d = Self::default();
+        self.width = d.width; self.height = d.height; self.format = d.format;
+        self.key_lux = d.key_lux; self.fill_lux = d.fill_lux;
+        self.ambient_lux = d.ambient_lux;
+        self.bg_r = d.bg_r; self.bg_g = d.bg_g; self.bg_b = d.bg_b;
+        self.shadows_enabled = d.shadows_enabled;
+        self.msaa_samples = d.msaa_samples;
+        self.atom_roughness = d.atom_roughness; self.atom_metallic = d.atom_metallic;
+        self.tonemap = d.tonemap;
+    }
+}
 #[derive(Resource, Clone)] struct CrystalStore { data: CrystalData, json_path: String }
+
+/// Save a modified structure. NEVER overwrites a non-JSON input file (a
+/// user's .cube/.cif/.pdb) — the Fortran handoff JSON is always named
+/// `*.json`, so only that is written in place; anything else goes to a
+/// `<stem>_modified.json` sidecar. (Writing the crystal JSON back over a PES
+/// cube used to silently destroy the user's data.)
+fn save_modified_structure(crystal: &CrystalStore) {
+    let path = &crystal.json_path;
+    let target = if path.to_ascii_lowercase().ends_with(".json") {
+        path.clone()
+    } else {
+        let mut p = std::path::PathBuf::from(path);
+        let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "structure".to_string());
+        p.set_file_name(format!("{}_modified.json", stem));
+        p.to_string_lossy().into_owned()
+    };
+    if let Err(e) = crystal.data.write_to_file(&target) {
+        eprintln!("  Failed to save modified positions: {}", e);
+    }
+}
 #[derive(Resource)] struct LatticeData { vecs: [Vec3; 3], inv: [Vec3; 3] }
 #[derive(Resource)] struct ImageOffsets(pub Vec<Vec3>);  // fractional offset for each expanded atom
 
@@ -82,6 +199,9 @@ struct CachedSphere(Handle<Mesh>);
 #[derive(Resource)] pub struct RotateState { pub angle_deg: f32 }
 #[derive(Component)] pub struct MainCamera;
 #[derive(Component)] struct FollowCamera;
+/// Light-rig markers for the render parameter panel.
+#[derive(Component)] struct KeyLight;
+#[derive(Component)] struct FillLight;
 #[derive(Component)] struct AtomMarker;
 #[derive(Component)] struct BondMarker;
 #[derive(Component)] struct CellMarker;
@@ -180,7 +300,7 @@ pub struct Pes3dState {
 #[derive(Component)] struct IsoSurface;
 #[derive(Component)] pub struct VolumeProxy;
 #[derive(Component)] struct SlicePlaneMesh;
-#[derive(Component)] struct SphereSurface;  // mode 7 sphere + mode 8 migration mesh
+#[derive(Component)] pub(crate) struct SphereSurface;  // mode 7 sphere + mode 8 migration mesh
 
 #[derive(Resource)]
 pub struct DisplayMode {
@@ -221,7 +341,7 @@ fn toggle_projection(
     mut camera_q: Query<&mut Projection, With<MainCamera>>,
     mut contexts: EguiContexts,
 ) {
-    if contexts.ctx_mut().wants_keyboard_input() { return; }
+    if contexts.try_ctx_mut().is_some_and(|c| c.wants_keyboard_input()) { return; }
     if keys.just_pressed(KeyCode::KeyP) {
         *proj_mode = match *proj_mode {
             ProjMode::Perspective => {
@@ -266,8 +386,12 @@ fn orbit_camera(
 ) {
     let Ok(mut cam) = camera_q.get_single_mut() else { return };
 
+    // Don't start rotations / zooms while interacting with egui (panels AND
+    // floating dialogs — the render menu etc.).
+    let ui_capture = contexts.try_ctx_mut().is_some_and(|c| c.wants_pointer_input());
+
     // Right mouse → rotate using local axes (no gimbal lock)
-    if mouse_btn.just_pressed(MouseButton::Right) { input.rotating = true; }
+    if !ui_capture && mouse_btn.just_pressed(MouseButton::Right) { input.rotating = true; }
     if mouse_btn.just_released(MouseButton::Right) { input.rotating = false; }
 
     for motion in mouse_motion.read() {
@@ -281,14 +405,14 @@ fn orbit_camera(
         }
     }
 
-    let ctx = contexts.ctx_mut();
+    let Some(ctx) = contexts.try_ctx_mut() else { return; };
     let over_panel = ctx.input(|i| i.pointer.interact_pos()).map_or(false, |pos| {
         panel_rects.left.map_or(false, |r| r.contains(pos))
             || panel_rects.right.map_or(false, |r| r.contains(pos))
             || panel_rects.bottom.map_or(false, |r| r.contains(pos))
     });
     for ev in mouse_wheel.read() {
-        if over_panel { continue; }
+        if over_panel || ui_capture { continue; }
         let dy = match ev.unit {
             MouseScrollUnit::Line => ev.y * 0.1,
             MouseScrollUnit::Pixel => ev.y * 0.001,
@@ -339,7 +463,7 @@ fn rotate_camera_keys(
     rotate_state: Res<RotateState>,
     mut contexts: EguiContexts,
 ) {
-    if contexts.ctx_mut().wants_keyboard_input() { return; }
+    if contexts.try_ctx_mut().is_some_and(|c| c.wants_keyboard_input()) { return; }
 
     let angle_rad = rotate_state.angle_deg.clamp(1.0, 90.0).to_radians();
     let mut delta = Quat::IDENTITY;
@@ -380,7 +504,7 @@ fn move_selected_atom(
     lattice: Res<LatticeData>,
     offsets: Res<ImageOffsets>,
 ) {
-    if contexts.ctx_mut().wants_keyboard_input() { return; }
+    if contexts.try_ctx_mut().is_some_and(|c| c.wants_keyboard_input()) { return; }
     if picking.selected < 0 { return; }
     let i = picking.selected as usize;
     if i >= picking.parent_indices.len() { return; }
@@ -447,10 +571,8 @@ fn move_selected_atom(
 
         picking.modified = true;
 
-        // Auto-save modified positions to JSON
-        if let Err(e) = crystal.data.write_to_file(&crystal.json_path) {
-            eprintln!("  Failed to save modified positions: {}", e);
-        }
+        // Auto-save modified positions (never overwrites the input file)
+        save_modified_structure(&crystal);
     }
 }
 
@@ -463,6 +585,7 @@ fn add_atom_system(
     mut materials: ResMut<Assets<StandardMaterial>>,
     sphere: Res<CachedSphere>,
     mut commands: Commands,
+    render_settings: Res<RenderSettings>,
 ) {
     let Some((el, fx, fy, fz)) = add_state.pending.take() else { return };
 
@@ -483,7 +606,10 @@ fn add_atom_system(
     // Spawn entities for each image
     let color = resources::element_color(&el);
     let mat_handle = materials.add(StandardMaterial {
-        base_color: color, metallic: 0.2, perceptual_roughness: 0.5, ..default()
+        base_color: color,
+        metallic: render_settings.atom_metallic,
+        perceptual_roughness: render_settings.atom_roughness,
+        ..default()
     });
     let mut handles = Vec::new();
     let mut entities = Vec::new();
@@ -511,7 +637,7 @@ fn add_atom_system(
     atom_info.radii.push(resources::covalent_radius(&el));
 
     // Auto-save
-    let _ = crystal.data.write_to_file(&crystal.json_path);
+    save_modified_structure(&crystal);
 }
 
 fn sync_atom_radii(
@@ -544,7 +670,7 @@ fn delete_atom_system(
     mut commands: Commands,
     mut contexts: EguiContexts,
 ) {
-    if contexts.ctx_mut().wants_keyboard_input() { return; }
+    if contexts.try_ctx_mut().is_some_and(|c| c.wants_keyboard_input()) { return; }
     if !keys.just_pressed(KeyCode::KeyD) || picking.selected < 0 { return; }
     let i = picking.selected as usize;
     if i >= picking.parent_indices.len() { return; }
@@ -586,7 +712,7 @@ fn delete_atom_system(
     picking.selected = -1;
     picking.modified = true;
     crystal.data.modified = true;
-    let _ = crystal.data.write_to_file(&crystal.json_path);
+    save_modified_structure(&crystal);
 }
 
 // ── Geometry ──
@@ -635,6 +761,7 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut vol_materials: ResMut<Assets<VolumeMaterial>>, crystal_path: Res<CrystalPath>,
+    render_settings: Res<RenderSettings>,
 ) {
     // ── Cube file detection ──
     let cube_opt: Option<CubeData> = if is_cube(&crystal_path.0) {
@@ -688,7 +815,10 @@ fn setup(
         let el = &data.atoms[parent].element;
         let color = resources::element_color(el);
         let mat_handle = materials.add(StandardMaterial {
-            base_color: color, metallic: 0.2, perceptual_roughness: 0.5, ..default()
+            base_color: color,
+            metallic: render_settings.atom_metallic,
+            perceptual_roughness: render_settings.atom_roughness,
+            ..default()
         });
         let entity = commands.spawn((
             Mesh3d(sphere.clone()), MeshMaterial3d(mat_handle.clone()),
@@ -809,11 +939,12 @@ fn setup(
 
     commands.spawn((
         DirectionalLight { illuminance: 8000.0, shadows_enabled: false, ..default() },
-        Transform::default(), FollowCamera,
+        Transform::default(), FollowCamera, KeyLight,
     ));
     commands.spawn((
         DirectionalLight { illuminance: 2000.0, ..default() },
         Transform::from_xyz(0.0, -5.0, 0.0).looking_at(center, Vec3::Y),
+        FillLight,
     ));
 
     commands.spawn((
@@ -1165,7 +1296,7 @@ fn display_mode_system(
     mut commands: Commands,
     mut contexts: EguiContexts,
 ) {
-    if contexts.ctx_mut().wants_keyboard_input() { return; }
+    if contexts.try_ctx_mut().is_some_and(|c| c.wants_keyboard_input()) { return; }
     let update_scales = |mode: &mut u8| -> bool {
         let changed = matches!(
             (keys.just_pressed(KeyCode::Digit1), keys.just_pressed(KeyCode::Digit2), keys.just_pressed(KeyCode::Digit3)),
@@ -1320,7 +1451,7 @@ fn toggle_surface_combined(
     )>,
     mut contexts: EguiContexts,
 ) {
-    if contexts.ctx_mut().wants_keyboard_input() { return; }
+    if contexts.try_ctx_mut().is_some_and(|c| c.wants_keyboard_input()) { return; }
     if !keys.just_pressed(KeyCode::KeyS) { return; }
     // 3D takes priority
     if let Some(ref mut ps) = pes3d_state {
@@ -1354,7 +1485,7 @@ fn update_color_clip(
     mut contexts: EguiContexts,
     mut repeat_timer: Local<f32>,
 ) {
-    if contexts.ctx_mut().wants_keyboard_input() { return; }
+    if contexts.try_ctx_mut().is_some_and(|c| c.wants_keyboard_input()) { return; }
     let ps = match pes_state.as_mut() { Some(ps) => ps, None => return };
 
     if keys.just_pressed(KeyCode::KeyR) {
@@ -1439,7 +1570,7 @@ fn toggle_pes3d_mode(
     )>,
     mut contexts: EguiContexts,
 ) {
-    if contexts.ctx_mut().wants_keyboard_input() { return; }
+    if contexts.try_ctx_mut().is_some_and(|c| c.wants_keyboard_input()) { return; }
     let ps = match pes3d_state.as_mut() { Some(ps) => ps, None => return };
 
     let new_mode = if keys.just_pressed(KeyCode::Digit4) {
@@ -1476,7 +1607,7 @@ fn update_isosurface(
     mut contexts: EguiContexts,
     mut hold_time: Local<f32>,
 ) {
-    if contexts.ctx_mut().wants_keyboard_input() { return; }
+    if contexts.try_ctx_mut().is_some_and(|c| c.wants_keyboard_input()) { return; }
     let ps = match pes3d_state.as_mut() { Some(ps) => ps, None => return };
     // +/- adjusts iso_value (Isosurface mode) or vol_iso_ref (Volume mode —
     // the energy-layer window center). update_isosurface_mesh has its own
@@ -1719,6 +1850,53 @@ fn update_surface_mesh(
     *cache = cur;   // only after a successful build — a failed build retries
 }
 
+/// Write positions + per-vertex RGBA colors + triangle indices as an ASCII
+/// PLY (Blender imports the vertex colors as a "Col" attribute). Called
+/// directly from the mode-8 "Export PLY" button / E key.
+pub(crate) fn write_mesh_ply(mesh: &Mesh, path: &str) -> Result<(usize, usize), String> {
+    use std::io::Write;
+    let positions = match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
+        Some(bevy::render::mesh::VertexAttributeValues::Float32x3(v)) => v,
+        _ => return Err("no Float32x3 positions".into()),
+    };
+    let colors = match mesh.attribute(Mesh::ATTRIBUTE_COLOR) {
+        Some(bevy::render::mesh::VertexAttributeValues::Float32x4(v)) => v,
+        _ => return Err("no Float32x4 vertex colors".into()),
+    };
+    let indices = match mesh.indices() {
+        Some(bevy::render::mesh::Indices::U32(v)) => v,
+        _ => return Err("no U32 indices".into()),
+    };
+    let f = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut w = std::io::BufWriter::new(f);
+    writeln!(w, "ply").unwrap();
+    writeln!(w, "format ascii 1.0").unwrap();
+    writeln!(w, "element vertex {}", positions.len()).unwrap();
+    writeln!(w, "property float x").unwrap();
+    writeln!(w, "property float y").unwrap();
+    writeln!(w, "property float z").unwrap();
+    writeln!(w, "property uchar red").unwrap();
+    writeln!(w, "property uchar green").unwrap();
+    writeln!(w, "property uchar blue").unwrap();
+    writeln!(w, "element face {}", indices.len() / 3).unwrap();
+    writeln!(w, "property list uchar int vertex_indices").unwrap();
+    writeln!(w, "end_header").unwrap();
+    for (i, p) in positions.iter().enumerate() {
+        let c = colors[i];
+        let (r, g, b) = (
+            (c[0] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (c[1] * 255.0).round().clamp(0.0, 255.0) as u8,
+            (c[2] * 255.0).round().clamp(0.0, 255.0) as u8,
+        );
+        writeln!(w, "{} {} {} {} {} {}", p[0], p[1], p[2], r, g, b).unwrap();
+    }
+    for tri in indices.chunks(3) {
+        writeln!(w, "3 {} {} {}", tri[0], tri[1], tri[2]).unwrap();
+    }
+    w.flush().map_err(|e| e.to_string())?;
+    Ok((positions.len(), indices.len() / 3))
+}
+
 /// Parameters of the last-built slice planes — rebuild only when these
 /// actually change (same flicker rationale as IsoBuildCache).
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -1794,5 +1972,94 @@ fn sync_axes_visibility(
     let vis = if display.show_axes { Visibility::Inherited } else { Visibility::Hidden };
     for mut v in axes_q.iter_mut() {
         *v = vis;
+    }
+}
+
+
+/// Debug/test hook: `CRYSTAL_VIEWER_AUTORENDER=<WxH>` fires one render
+/// request N seconds after startup (before CRYSTAL_VIEWER_AUTOEXIT), so an
+/// end-to-end offscreen render can be exercised headlessly: run with
+/// `CRYSTAL_VIEWER_AUTORENDER=1280x720 CRYSTAL_VIEWER_AUTOEXIT=12` and check
+/// that `render.png` was written. No-op when unset.
+fn auto_render_system(
+    time: Res<Time>,
+    mut timer: Local<Option<Timer>>,
+    mut fired: Local<bool>,
+    mut settings: ResMut<RenderSettings>,
+) {
+    let Ok(spec) = std::env::var("CRYSTAL_VIEWER_AUTORENDER") else { return };
+    if timer.is_none() {
+        *timer = Some(Timer::from_seconds(4.0, TimerMode::Once));
+        if let Some((w, h)) = spec.split_once('x') {
+            if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) {
+                settings.width = w;
+                settings.height = h;
+            }
+        }
+        // test hook: CRYSTAL_VIEWER_AUTOSSAO=0/1 overrides the AO toggle
+        if let Ok(v) = std::env::var("CRYSTAL_VIEWER_AUTOSHADOWS") {
+            settings.shadows_enabled = v.trim() != "0";
+        }
+    }
+    if let Some(t) = timer.as_mut() {
+        t.tick(time.delta());
+        if !*fired && t.finished() && !settings.request
+            && !settings.rendering.load(std::sync::atomic::Ordering::Relaxed) {
+            *fired = true; // one-shot
+            eprintln!("[viewer] auto-render request (CRYSTAL_VIEWER_AUTORENDER)");
+            settings.request = true;
+        }
+    }
+}
+
+/// Applies the live scene parameters (lights, ambient, SSAO, roughness,
+/// tonemapping) to the running viewer whenever the render dialog edits them —
+/// so what you see on screen IS the render (WYSIWYG). Runs on change only.
+#[allow(clippy::too_many_arguments)]
+fn apply_render_params(
+    settings: Res<RenderSettings>,
+    mut lights_q: Query<(&mut DirectionalLight, Option<&KeyLight>, Option<&FillLight>)>,
+    mut ambient: ResMut<AmbientLight>,
+    cam_q: Query<Entity, With<MainCamera>>,
+    mut msaa_q: Query<&mut bevy::render::view::Msaa, With<MainCamera>>,
+    mut tonemap_q: Query<&mut bevy::core_pipeline::tonemapping::Tonemapping, With<MainCamera>>,
+    mut cam_full_q: Query<&mut Camera, With<MainCamera>>,
+    picking: Option<Res<PickingState>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if !settings.is_changed() { return; }
+    for (mut l, is_key, is_fill) in lights_q.iter_mut() {
+        if is_key.is_some() {
+            l.illuminance = settings.key_lux;
+            l.shadows_enabled = settings.shadows_enabled;
+        }
+        if is_fill.is_some() { l.illuminance = settings.fill_lux; }
+    }
+    ambient.brightness = settings.ambient_lux;
+    let Ok(cam) = cam_q.get_single() else { return };
+    let want_msaa = match settings.msaa_samples {
+        2 => bevy::render::view::Msaa::Sample2,
+        // 8x is unsupported on this target format (Metal/WebGPU guarantee
+        // only 1-4 samples for Rgba8UnormSrgb); clamp anything higher to 4x.
+        4 | 8 => bevy::render::view::Msaa::Sample4,
+        _ => bevy::render::view::Msaa::Off,
+    };
+    if let Ok(mut m) = msaa_q.get_mut(cam) {
+        if *m != want_msaa { *m = want_msaa; }
+    }
+    if let Ok(mut c) = cam_full_q.get_mut(cam) {
+        c.clear_color = bevy::render::camera::ClearColorConfig::Custom(
+            Color::srgb(settings.bg_r, settings.bg_g, settings.bg_b));
+    }
+    if let Ok(mut t) = tonemap_q.get_mut(cam) {
+        *t = settings.tonemap.to_bevy();
+    }
+    if let Some(p) = picking.as_ref() {
+        for h in &p.atom_material_handles {
+            if let Some(m) = materials.get_mut(h) {
+                m.perceptual_roughness = settings.atom_roughness;
+                m.metallic = settings.atom_metallic;
+            }
+        }
     }
 }

@@ -1292,10 +1292,15 @@ contains
         call replace_json_array(json_out, '"fy_range"', 0.0_dp, 1.0_dp)
         call replace_json_array(json_out, '"fz_range"', 0.0_dp, 1.0_dp)
 
-        ! Change use_symmetry:true → use_symmetry:false
+        ! Change use_symmetry:true → use_symmetry:false. 'false' is one
+        ! character longer than 'true', so this must SPLICE the string — the
+        ! old in-place overwrite clobbered the following '"' and produced
+        ! `"use_symmetry":false"n_symops":…`, invalid JSON that made
+        ! cube_reader drop the PES metadata (2D/3D detection broken).
         kp = index(json_out, '"use_symmetry":true')
-        if (kp > 0) json_out(kp+15:kp+18) = 'fals'  ! 'true'→'fals' (need one more)
-        if (kp > 0) json_out(kp+19:kp+19) = 'e'      ! 'true'→'false'
+        if (kp > 0) then
+            json_out = json_out(:kp-1) // '"use_symmetry":false' // json_out(kp+19:)
+        end if
     end subroutine patch_json_full_cell
 
     subroutine replace_json_array(json, key, v1, v2)

@@ -16,6 +16,7 @@ use crate::DisplayMode;
 use crate::VisMode;
 use crate::IsoMaterial;
 use crate::CubeResource;
+use crate::RenderSettings;
 use crate::resources;
 
 #[derive(Resource)]
@@ -53,8 +54,10 @@ pub fn ui_system(
     mut pes3d_state: Option<ResMut<Pes3dState>>,
     cube: Option<Res<CubeResource>>,
     mut display: ResMut<DisplayMode>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut render_settings: ResMut<RenderSettings>,
 ) {
-    let ctx = contexts.ctx_mut();
+    let Some(ctx) = contexts.try_ctx_mut() else { return; };
 
     // Pre-compute: parent indices for selected/hovered images
     let sel_parent = if picking.selected >= 0 && (picking.selected as usize) < picking.parent_indices.len() {
@@ -484,10 +487,160 @@ pub fn ui_system(
                     ui.add(egui::DragValue::new(&mut rotate_state.angle_deg)
                         .suffix("\u{b0}"));
                 });
+                ui.horizontal(|ui| {
+                    if ui.button("Render").clicked() {
+                        render_settings.show_dialog = true;
+                    }
+                    // Export PLY lives next to Render (mode 8 with a cube only)
+                    let mig_ok = pes3d_state.as_ref()
+                        .map(|p| p.has_energies && p.vis_mode == VisMode::Migration)
+                        .unwrap_or(false);
+                    if mig_ok && cube.is_some() {
+                        let e_pressed = !ctx.wants_keyboard_input() && keys.just_pressed(KeyCode::KeyE);
+                        if ui.button("Export PLY").clicked() || e_pressed {
+                            if let Some(ps) = pes3d_state.as_ref() {
+                                export_migration_ply(&cube, ps);
+                            }
+                        }
+                    }
+                    if render_settings.rendering.load(std::sync::atomic::Ordering::Relaxed) {
+                        ui.label(egui::RichText::new("Rendering…")
+                            .color(egui::Color32::LIGHT_BLUE));
+                    }
+                });
                 ui.separator();
             });
         });
     panel_rects.right = Some(right_resp.response.rect);
+
+    // ── Render dialog (Bevy-native offscreen export — WYSIWYG) ──
+    // Built on egui::Area instead of egui::Window: the Area is movable from
+    // ANYWHERE on its surface (not just a title bar) and remembers its
+    // position across frames.
+    if render_settings.show_dialog {
+        let sr = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("render_dialog"))
+            .default_pos(egui::pos2(sr.center().x - 180.0, sr.center().y - 240.0))
+            .movable(true)
+            .show(ctx, |ui| {
+                egui::Frame::window(ui.style()).show(ui, |ui| {
+                ui.set_min_width(340.0);
+                ui.label(egui::RichText::new("Render").strong());
+                ui.separator();
+                if render_settings.rendering.load(std::sync::atomic::Ordering::Relaxed) {
+                    ui.colored_label(egui::Color32::LIGHT_BLUE, "Rendering…");
+                }
+                let rs = &mut *render_settings;
+                ui.horizontal(|ui| {
+                    ui.label("Resolution");
+                    ui.add(egui::DragValue::new(&mut rs.width).range(320..=8192).suffix(" x"));
+                    ui.add(egui::DragValue::new(&mut rs.height).range(240..=8192));
+                });
+                // NOTE: 8x is deliberately NOT offered — WebGPU only
+                // guarantees [1,4] samples for Rgba8UnormSrgb, and Apple
+                // silicon (Metal) supports at most 4x. Requesting 8x aborts
+                // the whole viewer (wgpu validation error).
+                ui.horizontal(|ui| {
+                    ui.label("MSAA");
+                    egui::ComboBox::from_id_salt("render_msaa")
+                        .selected_text(format!("{}x", rs.msaa_samples))
+                        .show_ui(ui, |ui| {
+                            for s in [1u32, 2, 4] {
+                                ui.selectable_value(&mut rs.msaa_samples, s, if s == 1 { "Off (1x)".to_string() } else { format!("{s}x") });
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Format");
+                    egui::ComboBox::from_id_salt("render_format")
+                        .selected_text(rs.format.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut rs.format, crate::render_export::ImgFormat::Png, "PNG");
+                            ui.selectable_value(&mut rs.format, crate::render_export::ImgFormat::Tiff, "TIFF");
+                        });
+                });
+                ui.separator();
+                ui.label(egui::RichText::new("Scene parameters (live — edits apply to the viewer immediately)").strong());
+                ui.horizontal(|ui| {
+                    ui.label("Key light");
+                    ui.add(egui::Slider::new(&mut rs.key_lux, 0.0..=20000.0).suffix(" lx"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Fill light");
+                    ui.add(egui::Slider::new(&mut rs.fill_lux, 0.0..=20000.0).suffix(" lx"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Ambient");
+                    ui.add(egui::Slider::new(&mut rs.ambient_lux, 0.0..=2000.0).suffix(" lx"));
+                });
+                ui.checkbox(&mut rs.shadows_enabled, "Shadows (key light)");
+                ui.horizontal(|ui| {
+                    ui.label("Atom roughness");
+                    ui.add(egui::Slider::new(&mut rs.atom_roughness, 0.0..=1.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Atom metallic");
+                    ui.add(egui::Slider::new(&mut rs.atom_metallic, 0.0..=1.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Tonemapping");
+                    egui::ComboBox::from_id_salt("render_tonemap")
+                        .selected_text(rs.tonemap.label())
+                        .show_ui(ui, |ui| {
+                            for m in [crate::render_export::TonemapChoice::TonyMcMapface,
+                                      crate::render_export::TonemapChoice::Aces,
+                                      crate::render_export::TonemapChoice::AgX,
+                                      crate::render_export::TonemapChoice::Reinhard] {
+                                ui.selectable_value(&mut rs.tonemap, m, m.label());
+                            }
+                        });
+                });
+                ui.separator();
+                ui.label(egui::RichText::new("Background color").strong());
+                let mut br = (rs.bg_r * 255.0).round() as u8;
+                let mut bg = (rs.bg_g * 255.0).round() as u8;
+                let mut bb = (rs.bg_b * 255.0).round() as u8;
+                ui.horizontal(|ui| { ui.label("R"); ui.add(egui::Slider::new(&mut br, 0..=255)); });
+                ui.horizontal(|ui| { ui.label("G"); ui.add(egui::Slider::new(&mut bg, 0..=255)); });
+                ui.horizontal(|ui| { ui.label("B"); ui.add(egui::Slider::new(&mut bb, 0..=255)); });
+                rs.bg_r = br as f32 / 255.0;
+                rs.bg_g = bg as f32 / 255.0;
+                rs.bg_b = bb as f32 / 255.0;
+                ui.horizontal(|ui| {
+                    let presets: [(&str, [f32; 3]); 5] = [
+                        ("Black", [0.0, 0.0, 0.0]),
+                        ("White", [1.0, 1.0, 1.0]),
+                        ("Light gray", [170.0 / 255.0, 170.0 / 255.0, 170.0 / 255.0]),
+                        ("Dark gray", [0.25, 0.25, 0.25]),
+                        ("Viewer default", [43.0 / 255.0, 44.0 / 255.0, 47.0 / 255.0]),
+                    ];
+                    for (label, rgb) in presets {
+                        if ui.button(label).clicked() {
+                            rs.bg_r = rgb[0]; rs.bg_g = rgb[1]; rs.bg_b = rgb[2];
+                        }
+                    }
+                });
+                let status = rs.last_status.lock().map(|s| s.clone()).unwrap_or_default();
+                if !status.is_empty() {
+                    ui.label(egui::RichText::new(&status).color(egui::Color32::from_gray(200)));
+                }
+                ui.separator();
+                let busy = rs.rendering.load(std::sync::atomic::Ordering::Relaxed);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!busy, egui::Button::new(
+                            format!("Render -> render.{}", rs.format.ext()))).clicked() {
+                        rs.request = true;
+                    }
+                    if ui.button("Reset all").clicked() {
+                        rs.reset_params();
+                    }
+                    if ui.button("Close").clicked() {
+                        rs.show_dialog = false;
+                    }
+                });
+                });
+            });
+    }
 
     // ── Add Atom popup: periodic table ──
     if add_state.show_table {
@@ -620,5 +773,34 @@ pub fn ui_system(
                     }
                 });
         }
+    }
+}
+
+/// Export the mode-8 migration surface as `migration_surface.ply` (same
+/// rebuild the viewer renders, so the export matches the screen).
+fn export_migration_ply(cube: &Option<Res<crate::CubeResource>>, ps: &crate::Pes3dState) {
+    let result = match cube.as_ref() {
+        Some(cube) => {
+            let lattice = cube.0.to_lattice();
+            let centers = crate::sphere_section::detect_cage_centers(&cube.0);
+            match crate::sphere_section::migration_surface_mesh(
+                &cube.0.field, cube.0.nx, &lattice, &centers,
+                ps.mig_e_cap, ps.mig_show_shell,
+                ps.color_min, ps.color_max, ps.iso_material)
+            {
+                Some(mesh) => crate::write_mesh_ply(&mesh, "migration_surface.ply"),
+                None => Err("migration surface build returned None".to_string()),
+            }
+        }
+        None => Err("no cube loaded".to_string()),
+    };
+    match result {
+        Ok((nv, nt)) => {
+            let abs = std::env::current_dir()
+                .map(|d| d.join("migration_surface.ply"))
+                .unwrap_or_else(|_| std::path::PathBuf::from("migration_surface.ply"));
+            eprintln!("[mode8] exported {} ({} verts, {} tris)", abs.display(), nv, nt);
+        }
+        Err(e) => eprintln!("[mode8] export failed: {}", e),
     }
 }

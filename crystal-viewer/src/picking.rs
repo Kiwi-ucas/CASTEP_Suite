@@ -132,9 +132,12 @@ pub fn click_pick(
     mut contexts: EguiContexts,
     panel_rects: Res<PanelRects>,
 ) {
-    // Ignore 3D picks when cursor is over an egui panel
-    let ctx = contexts.ctx_mut();
-    if over_egui_panel(ctx, &panel_rects) {
+    // Ignore 3D picks when the cursor is over an egui panel OR any egui
+    // window/control (floating dialogs like the Render menu are not covered
+    // by PanelRects — without this check, clicking e.g. "Close" would
+    // click-pick atoms behind the dialog).
+    let Some(ctx) = contexts.try_ctx_mut() else { return; };
+    if over_egui_panel(ctx, &panel_rects) || ctx.wants_pointer_input() {
         if mouse_btn.just_pressed(MouseButton::Left) || mouse_btn.just_released(MouseButton::Left) {
             picking.click_start = None;
         }
@@ -172,9 +175,10 @@ pub fn hover_pick(
     mut contexts: EguiContexts,
     panel_rects: Res<PanelRects>,
 ) {
-    // Don't update 3D hover when cursor is over an egui panel
-    let ctx = contexts.ctx_mut();
-    if over_egui_panel(ctx, &panel_rects) {
+    // Don't update 3D hover when the cursor is over an egui panel or any
+    // egui window/control (floating dialogs included).
+    let Some(ctx) = contexts.try_ctx_mut() else { return; };
+    if over_egui_panel(ctx, &panel_rects) || ctx.wants_pointer_input() {
         return;
     }
     if picking.click_start.is_some() { return; }

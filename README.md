@@ -275,6 +275,8 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
 - Forward orbit expansion fills the full-cell output grid at 100% coverage
 - **Collection**: auto-detects directory format, reads `irred_coords.dat` sidecar for mapping
 - **3D viewer**: MC isosurface (4), volume render (5), slice planes (6), fixed-radius sphere (7), radial-stationary migration surface (8); `-/+` adjust isovalue; semi-transparent rendering
+- **Export**: "Export PLY" button (next to Render, mode 8 with a loaded cube, or E key) writes the migration shell as `migration_surface.ply` (jet-colored mesh for Blender/external rendering)
+- **Render (WYSIWYG)**: bottom-right "Render" button → draggable dialog with resolution (up to 8192²), MSAA (Off/2x/4x), format (PNG/TIFF), and live scene parameters: key/fill/ambient light intensity, key-light shadows, atom roughness + metallic, tonemapping (TonyMcMapface/ACES/AgX/Reinhard), background color (RGB sliders + Black/White/Light-gray/Dark-gray/Viewer-default presets). Every edit applies to the viewer in real time — the export is rendered by the SAME Bevy PBR pipeline you see on screen (any display mode), saved as `render.png`/`render.tiff`; "Reset all" restores the defaults
 
 **2D PES**:
 - Select mobile atom, scan plane (XY/XZ/YZ), fractional coordinate range, and grid size
