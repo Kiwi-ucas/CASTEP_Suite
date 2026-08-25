@@ -62,18 +62,22 @@ module cli_menu
 
 contains
 
-    subroutine run_main_menu(cfg, iostat)
+    subroutine run_main_menu(cfg, iostat, lock_task)
         !! Main menu loop with cached state
         type(castep_config_t), intent(inout) :: cfg
         integer, intent(out) :: iostat
+        logical, intent(in), optional :: lock_task
         integer :: choice, ios
         character(len=MAX_LINE_LEN) :: input
         logical :: cif_ready, needs_geo_params, needs_phonon_params, show_spectral_menu, needs_cineb_params
+        logical :: task_locked
         character(len=32) :: spectral_display
         character(len=512) :: base_name
 
         iostat = 0
         cif_ready = .false.
+        task_locked = .false.
+        if (present(lock_task)) task_locked = lock_task
 
         ! Ask CIF path first (skip if atoms already populated e.g. from viewer)
         if (cfg%num_atoms == 0) then
@@ -112,7 +116,11 @@ contains
             write(*, '(a)') ' -1. Spin_polarized : ' //   &
                    trim(sp_label(cfg%spin_polarized))
             write(*, '(a)') '  0. Generate InputFile'
-            write(*, '(a)') '  1. Task                    (' // trim(task_label(cfg%task_type))  // ')'
+            if (task_locked) then
+                write(*, '(a)') '  1. Task                    (' // trim(task_label(cfg%task_type))  // ') [locked]'
+            else
+                write(*, '(a)') '  1. Task                    (' // trim(task_label(cfg%task_type))  // ')'
+            end if
             write(*, '(a)') '  2. XC functional           (' // trim(cfg%xc_functional)           // ')'
             write(*, '(a)') '  3. Cutoff energy (eV)      (' // trim(cutoff_label(cfg%cutoff_energy)) // ')'
             write(*, '(a)') '  4. vdW correction          (' // trim(cfg%vdw_method)              // ')'
@@ -189,27 +197,32 @@ contains
                 base_name = auto_output_name(cfg%cif_file_path, cfg%task_type)
                 cfg%cell_output_path  = trim(base_name) // '.cell'
                 cfg%param_output_path = trim(base_name) // '.param'
-                write(*, '(a, a)') '  Output: ', trim(base_name)
+                if (.not. task_locked) write(*, '(a, a)') '  Output: ', trim(base_name)
                 return
             case (MENU_TASK)
-                call ask_task_type('Select calculation type: ', cfg%task_type, iostat)
-                if (iostat /= 0) return
-                if (trim(cfg%task_type) == TASK_THERMODYNAMICS) then
-                    cfg%phonon_fine_method = PHONON_FINE_SUPERCELL
-                    cfg%phonon_method = PHONON_METHOD_FD
-                else if (trim(cfg%task_type) == TASK_PHONON &
-                    .and. trim(cfg%phonon_fine_method) == PHONON_FINE_SUPERCELL) then
-                    cfg%phonon_fine_method = PHONON_FINE_INTERPOLATE
-                end if
-                if (trim(cfg%task_type) == TASK_EFIELD) then
-                    cfg%pseudopotential = PSEUDO_NCP19
-                else if ((trim(cfg%task_type) == TASK_PHONON &
-                    .or. trim(cfg%task_type) == TASK_PHONON_EFIELD) &
-                    .and. trim(cfg%phonon_method) == PHONON_METHOD_DFPT) then
-                    cfg%pseudopotential = PSEUDO_NCP19
-                end if
-                if (trim(cfg%task_type) == TASK_PHONON_EFIELD) then
-                    cfg%phonon_calc_lo_to_splitting = .true.
+                if (task_locked) then
+                    write(*, '(a)') '  Task is locked to ' // trim(task_label(cfg%task_type)) // &
+                        ' for the frozen-phonon scan.'
+                else
+                    call ask_task_type('Select calculation type: ', cfg%task_type, iostat)
+                    if (iostat /= 0) return
+                    if (trim(cfg%task_type) == TASK_THERMODYNAMICS) then
+                        cfg%phonon_fine_method = PHONON_FINE_SUPERCELL
+                        cfg%phonon_method = PHONON_METHOD_FD
+                    else if (trim(cfg%task_type) == TASK_PHONON &
+                        .and. trim(cfg%phonon_fine_method) == PHONON_FINE_SUPERCELL) then
+                        cfg%phonon_fine_method = PHONON_FINE_INTERPOLATE
+                    end if
+                    if (trim(cfg%task_type) == TASK_EFIELD) then
+                        cfg%pseudopotential = PSEUDO_NCP19
+                    else if ((trim(cfg%task_type) == TASK_PHONON &
+                        .or. trim(cfg%task_type) == TASK_PHONON_EFIELD) &
+                        .and. trim(cfg%phonon_method) == PHONON_METHOD_DFPT) then
+                        cfg%pseudopotential = PSEUDO_NCP19
+                    end if
+                    if (trim(cfg%task_type) == TASK_PHONON_EFIELD) then
+                        cfg%phonon_calc_lo_to_splitting = .true.
+                    end if
                 end if
             case (MENU_XC)
                 call ask_xc_functional('Select XC functional: ', cfg%xc_functional, iostat)

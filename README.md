@@ -170,6 +170,7 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
   7. Static Polarizability
   8. Thermodynamics
   9. PES Scan
+ 10. Frozen Phonon Scan
   Q. Back
 ```
 
@@ -240,7 +241,7 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
 
 **Format Converter** converts between CIF, PDB, and CASTEP .cell formats.
 
-### 8. Static Polarizability
+### 7. Static Polarizability
 
 - Computes static dielectric constant and polarizability via AIMD polarization fluctuation method
 - Combines CASTEP DFPT optical dielectric tensor (ε_∞) with CP2K Berry phase dipole trajectory
@@ -250,7 +251,7 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
 - Outputs: ε_ion, ε_static, α_static (tensors + isotropic scalars)
 - Input: CASTEP `.castep` file, CP2K dipole directory, temperature, MD time step
 
-### 8. Phonon Mode Visualization
+### -2. Phonon Mode Visualization
 
 - Parses phonon eigenvectors from `.phonon` files and Born effective charges from `.castep` files
 - Decomposes each phonon mode to per-atom contributions using the Born charge formalism: p_m = Σ Z*(κ)·u(κ,m)
@@ -283,6 +284,28 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
 - Generates `grid_001_001/` … `grid_Nx_Ny/` subdirectories with CASTEP input + constraints
 - Result collection parses `.castep` files, writes `scan.cube` with energy grid
 - 3D viewer: colored surface mesh (jet colormap), S toggles visibility, -/+ adjusts color clip
+
+### 10. Frozen Phonon Scan
+
+Generates CASTEP single-point inputs for frozen-phonon total-energy scans directly from a `.phonon` file:
+
+- **Input**: `.phonon` file with `Phonon Eigenvectors` block (run the phonon job with `PHONON_WRITE_EIGENVECTORS : true`)
+- **Gamma only**: validates and displays the first q-point; only `q = (0,0,0)` is accepted
+- **Mode selector**: lists mode index + frequency; user chooses a mode
+- **Displacement convention**: raw mass-weighted eigenvectors `e/√m` are normalized so that `max_i |u_i| = 1`, then scaled to `±0.1`, `±0.2`, `±0.5 Å` (6 structures, no 0-point)
+- **Preview**: prints every atom's actual `|u|` and new fractional coordinates for all six displacements
+- **PreCASTEP handoff**: structure/lattice/species are taken from the `.phonon` header; task is locked to `SINGLEPOINT` (`ENERGY`), all other parameters are user-selectable
+- **Output**:
+  ```text
+  frozen_phonon/<stem>_mode<M>/
+  ├── d-0.50/<stem>_mode<M>_d-0.50.cell + .param
+  ├── d-0.20/...
+  ├── d-0.10/...
+  ├── d0.10/...
+  ├── d0.20/...
+  └── d0.50/...
+  ```
+
 
 ## Project structure
 

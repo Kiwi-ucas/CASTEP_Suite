@@ -6,7 +6,7 @@ module poscastep_menu
         cif_data_t, atom_t, castep_config_t, sym_op_t, MAX_LINE_LEN, &
         IO_INVALID_INPUT, IO_SUCCESS, IO_USER_QUIT, &
         IO_FILE_NOT_FOUND, IO_PARSE_ERROR, IO_WRITE_ERROR, IO_PRECASTEP_LAUNCH, &
-        TASK_ENERGY, TASK_GEOMETRY_OPT, PSEUDO_C19MK2, KPOINT_GAMMA, &
+        TASK_ENERGY, TASK_GEOMETRY_OPT, PSEUDO_C19MK2, KPOINT_GAMMA, SYM_NONE, &
         default_config, strip_quotes, compute_cartesian_lattice
     use parser, only: parse_cif_inline, parse_pdb_inline, parse_cell_inline, &
         clean_element_symbol
@@ -52,6 +52,7 @@ module poscastep_menu
     integer, parameter :: POS_PHONON_MODES  = -2
     integer, parameter :: POS_THERMO        = 8
     integer, parameter :: POS_PES_SCAN      = 9
+    integer, parameter :: POS_FROZEN_PHONON = 10
     integer, parameter :: POS_VIEW_STRUCTURE = -1
 
     ! Module-level storage for PreCASTEP handoff (option 2: no file on disk)
@@ -89,6 +90,7 @@ contains
             write(*, '(a)') '  7. Static Polarizability'
             write(*, '(a)') '  8. Thermodynamics'
             write(*, '(a)') '  9. PES Scan'
+            write(*, '(a)') ' 10. Frozen Phonon Scan'
             write(*, '(a)') '  Q. Back'
             write(*, '(a)', advance='no') '  Select option: '
 
@@ -145,6 +147,9 @@ contains
                 if (iostat == IO_USER_QUIT) return
             case (POS_PES_SCAN)
                 call handle_pes_scan_menu(iostat)
+                if (iostat == IO_USER_QUIT) return
+            case (POS_FROZEN_PHONON)
+                call handle_frozen_phonon_menu(iostat)
                 if (iostat == IO_USER_QUIT) return
             case (POS_VIEW_STRUCTURE)
                 call handle_view_structure(iostat)
@@ -2310,7 +2315,7 @@ contains
             write(*, '(a,a)') '  Error parsing .phonon: ', trim(msg)
             call free_phonon_modes_data(modes_data); return
         end if
-        write(*, '(a,i0,a,i0)') '  Parsed ', modes_data%n_ions, ' ions, ', &
+        write(*, '(a,i0,a,i0,a)') '  Parsed ', modes_data%n_ions, ' ions, ', &
             modes_data%n_branches, ' branches.'
 
         ! ── Parse Born charges from .castep ──
@@ -2411,6 +2416,327 @@ contains
             if (tmp_ios == 0) close(tmp_unit, status='delete')
         end block
     end subroutine handle_phonon_modes_menu
+
+
+    ! ====================================================================
+    ! Option 10: Frozen Phonon Scan
+    ! ====================================================================
+    subroutine handle_frozen_phonon_menu(iostat)
+        integer, intent(out) :: iostat
+        type(phonon_modes_data_t) :: modes_data
+        type(castep_config_t) :: cfg
+        character(len=MAX_LINE_LEN) :: fname, input, msg, stem
+        character(len=16) :: mode_str
+        integer :: ios, mode_idx, i, j
+        real(dp) :: qnorm, max_u, mag
+        real(dp) :: inv_lattice(3,3)
+        real(dp), allocatable :: cart_dir(:,:)
+
+        iostat = 0
+
+        ! ── Prompt for .phonon file ──
+        write(*, '(a)', advance='no') '  Enter .phonon file path: '
+        read(*, '(a)', iostat=ios) fname
+        if (ios /= 0) return
+        fname = adjustl(fname); call strip_quotes(fname)
+        if (fname == 'q' .or. fname == 'Q') return
+        if (len_trim(fname) == 0) then
+            write(*, '(a)') '  No file specified.'; return
+        end if
+
+        ! ── Parse phonon eigenvectors ──
+        call parse_phonon_eigenvectors(trim(fname), modes_data, ios, msg)
+        if (ios /= 0) then
+            write(*, '(a,a)') '  Error parsing .phonon: ', trim(msg)
+            write(*, '(a)') '  Frozen-phonon scan requires the Phonon Eigenvectors block.'
+            return
+        end if
+        write(*, '(a,i0,a,i0,a)') '  Parsed ', modes_data%n_ions, ' ions, ', &
+            modes_data%n_branches, ' branches.'
+
+        ! ── Gamma-only validation ──
+        if (.not. modes_data%qpoint_parsed) then
+            write(*, '(a)') '  Error: could not read the q-point header from .phonon.'
+            call free_phonon_modes_data(modes_data); return
+        end if
+        qnorm = sqrt(sum(modes_data%qpoint**2))
+        write(*, '(a,3f10.6,a,f10.6)') '  First q-point: ', modes_data%qpoint, &
+            '  |q| = ', qnorm
+        if (qnorm > 1.0e-6_dp) then
+            write(*, '(a)') '  Error: frozen-phonon scan currently supports Gamma (q=0) modes only.'
+            call free_phonon_modes_data(modes_data); return
+        end if
+
+        ! .phonon unit-cell vectors are stored as ROWS (frac * L = cart).
+        ! invert_lattice_3x3 expects a matrix whose COLUMNS are lattice
+        ! vectors (cart = L * frac), so transpose before inverting.
+        inv_lattice = invert_lattice_3x3(transpose(modes_data%lattice_vectors))
+        if (all(abs(inv_lattice) < 1.0e-30_dp)) then
+            write(*, '(a)') '  Error: singular lattice in .phonon header.'
+            call free_phonon_modes_data(modes_data); return
+        end if
+
+        ! ── Print mode list (mode / frequency only) ──
+        write(*, '(a)') ''
+        write(*, '(a)') '  Mode     Freq/cm-1'
+        write(*, '(a)') '  ─────    ─────────'
+        do i = 1, modes_data%n_branches
+            write(*, '(a,i5,a,f13.4)') '  ', i, '    ', modes_data%modes(i)%frequency
+        end do
+        write(*, '(a)') ''
+
+        ! ── Mode selection / preview / PreCASTEP handoff loop ──
+        do
+            write(*, '(a,i0,a)') '  Enter mode number (1-', modes_data%n_branches, ', Q=return): '
+            write(*, '(a)', advance='no') '  > '
+            read(*, '(a)', iostat=ios) input
+            if (ios /= 0) exit
+            input = adjustl(input)
+            if (input(1:1) == 'q' .or. input(1:1) == 'Q') exit
+
+            read(input, *, iostat=ios) mode_idx
+            if (ios /= 0 .or. mode_idx < 1 .or. mode_idx > modes_data%n_branches) then
+                write(*, '(a,i0,a)') '  Invalid. Enter 1-', modes_data%n_branches, ', or Q.'
+                cycle
+            end if
+
+            write(*, '(a,i0,a,f12.4,a)') '  Mode ', mode_idx, ': freq = ', &
+                modes_data%modes(mode_idx)%frequency, ' cm-1'
+
+            ! ── Raw mass-weighted Cartesian direction, normalized so that
+            !    max_i |u_i| = 1. This is NOT the viewer global normalization.
+            if (allocated(cart_dir)) deallocate(cart_dir)
+            allocate(cart_dir(3, modes_data%n_ions))
+            do j = 1, modes_data%n_ions
+                if (modes_data%ion_masses(j) > 0.0_dp) then
+                    cart_dir(1,j) = modes_data%modes(mode_idx)%eigenvectors(j,1) &
+                                  / sqrt(modes_data%ion_masses(j))
+                    cart_dir(2,j) = modes_data%modes(mode_idx)%eigenvectors(j,3) &
+                                  / sqrt(modes_data%ion_masses(j))
+                    cart_dir(3,j) = modes_data%modes(mode_idx)%eigenvectors(j,5) &
+                                  / sqrt(modes_data%ion_masses(j))
+                else
+                    cart_dir(:,j) = 0.0_dp
+                end if
+            end do
+
+            max_u = 0.0_dp
+            do j = 1, modes_data%n_ions
+                mag = sqrt(sum(cart_dir(:,j)**2))
+                max_u = max(max_u, mag)
+            end do
+            if (max_u < 1.0e-12_dp) then
+                write(*, '(a)') '  Error: zero-length phonon eigenvector for this mode.'
+                deallocate(cart_dir)
+                cycle
+            end if
+            cart_dir = cart_dir / max_u
+
+            ! ── Displacement preview for +/- 0.1/0.2/0.5 A ──
+            call frozen_phonon_preview(modes_data, mode_idx, cart_dir, inv_lattice)
+
+            ! ── Populate PreCASTEP configuration from .phonon header ──
+            call default_config(cfg)
+            call frozen_phonon_populate_cfg(modes_data, cfg)
+            cfg%cif_file_path = trim(fname)
+            cfg%task_type = TASK_ENERGY
+            cfg%sym_source = SYM_NONE
+
+            write(*, '(a)') ''
+            write(*, '(a)') '  ── PreCASTEP parameters for frozen-phonon scan ──'
+            call run_main_menu(cfg, ios, lock_task=.true.)
+
+            if (ios == IO_USER_QUIT) then
+                write(*, '(a)') '  Frozen-phonon configuration cancelled.'
+                deallocate(cfg%atom_type, cfg%atom_x, cfg%atom_y, cfg%atom_z)
+                deallocate(cart_dir)
+                call free_phonon_modes_data(modes_data)
+                iostat = 0
+                return
+            end if
+            if (ios /= 0) then
+                write(*, '(a)') '  PreCASTEP configuration aborted.'
+                deallocate(cfg%atom_type, cfg%atom_x, cfg%atom_y, cfg%atom_z)
+                deallocate(cart_dir)
+                call free_phonon_modes_data(modes_data)
+                iostat = ios
+                return
+            end if
+
+            ! ── Write +/- 0.1/0.2/0.5 A input sets ──
+            stem = get_file_stem(fname)
+            mode_str = frozen_phonon_int_str(mode_idx)
+            call frozen_phonon_write_inputs(cfg, modes_data, mode_idx, cart_dir, &
+                inv_lattice, stem, mode_str)
+
+            deallocate(cfg%atom_type, cfg%atom_x, cfg%atom_y, cfg%atom_z)
+            deallocate(cart_dir)
+            call free_phonon_modes_data(modes_data)
+            iostat = 0
+            return
+        end do
+
+        ! User quit the mode-selection loop
+        if (allocated(cart_dir)) deallocate(cart_dir)
+        call free_phonon_modes_data(modes_data)
+        iostat = 0
+    end subroutine handle_frozen_phonon_menu
+
+
+    subroutine frozen_phonon_preview(modes_data, mode_idx, cart_dir, inv_lattice)
+        type(phonon_modes_data_t), intent(in) :: modes_data
+        integer, intent(in) :: mode_idx
+        real(dp), intent(in) :: cart_dir(:,:)
+        real(dp), intent(in) :: inv_lattice(3,3)
+        integer :: i, j, isign, iamp
+        real(dp) :: signed_amp, amp, mag, dcart(3), frac_new(3)
+        integer, parameter :: N_AMP = 3
+        real(dp), parameter :: FP_AMPS(N_AMP) = [0.1_dp, 0.2_dp, 0.5_dp]
+
+        do isign = 1, 2
+            do iamp = 1, N_AMP
+                amp = FP_AMPS(iamp)
+                signed_amp = merge(amp, -amp, isign == 1)
+                write(*, '(a)') ''
+                write(*, '(a,i0,a,f6.2,a)') '  ── Mode ', mode_idx, ' displacement ', &
+                    signed_amp, ' A ──'
+                write(*, '(a)') '    #   El      |u| (A)    new fractional coords'
+                do i = 1, modes_data%n_ions
+                    dcart = signed_amp * cart_dir(:,i)
+                    frac_new = modes_data%ion_positions_frac(:,i) + &
+                        cartesian_to_fractional(dcart(1), dcart(2), dcart(3), inv_lattice)
+                    do j = 1, 3
+                        frac_new(j) = frac_new(j) - floor(frac_new(j))
+                    end do
+                    mag = sqrt(sum(dcart**2))
+                    write(*, '(i5,2x,a,2x,f8.4,2x,3f11.6)') i, &
+                        trim(modes_data%ion_species(i)), mag, frac_new
+                end do
+            end do
+        end do
+    end subroutine frozen_phonon_preview
+
+
+    subroutine frozen_phonon_populate_cfg(modes_data, cfg)
+        type(phonon_modes_data_t), intent(in) :: modes_data
+        type(castep_config_t), intent(inout) :: cfg
+        integer :: i
+
+        cfg%num_atoms = modes_data%n_ions
+        cfg%cell_length = [modes_data%cell_a, modes_data%cell_b, modes_data%cell_c]
+        cfg%cell_angle = [modes_data%cell_alpha, modes_data%cell_beta, modes_data%cell_gamma]
+        cfg%cell_basis = modes_data%lattice_vectors
+        cfg%cartesian_coords = .false.
+        cfg%formula_sum = 'FrozenPhonon'
+
+        allocate(cfg%atom_type(cfg%num_atoms))
+        allocate(cfg%atom_x(cfg%num_atoms))
+        allocate(cfg%atom_y(cfg%num_atoms))
+        allocate(cfg%atom_z(cfg%num_atoms))
+        do i = 1, cfg%num_atoms
+            cfg%atom_type(i) = trim(clean_element_symbol(modes_data%ion_species(i)))
+            cfg%atom_x(i) = modes_data%ion_positions_frac(1,i)
+            cfg%atom_y(i) = modes_data%ion_positions_frac(2,i)
+            cfg%atom_z(i) = modes_data%ion_positions_frac(3,i)
+        end do
+    end subroutine frozen_phonon_populate_cfg
+
+
+    subroutine frozen_phonon_write_inputs(cfg, modes_data, mode_idx, cart_dir, &
+                                          inv_lattice, stem, mode_str)
+        type(castep_config_t), intent(inout) :: cfg
+        type(phonon_modes_data_t), intent(in) :: modes_data
+        integer, intent(in) :: mode_idx
+        real(dp), intent(in) :: cart_dir(:,:)
+        real(dp), intent(in) :: inv_lattice(3,3)
+        character(len=*), intent(in) :: stem
+        character(len=*), intent(in) :: mode_str
+
+        integer :: i, j, isign, iamp, ios, cmdstat
+        real(dp) :: signed_amp, amp, dcart(3), frac_new(3)
+        character(len=MAX_LINE_LEN) :: base_dir, sub_dir, cell_path, param_path
+        character(len=16) :: amp_label
+        character(len=MAX_LINE_LEN) :: msg
+        integer, parameter :: N_AMP = 3
+        real(dp), parameter :: FP_AMPS(N_AMP) = [0.1_dp, 0.2_dp, 0.5_dp]
+
+        base_dir = 'frozen_phonon/' // trim(stem) // '_mode' // trim(mode_str)
+        call execute_command_line('mkdir -p "' // trim(base_dir) // '"', exitstat=cmdstat)
+        if (cmdstat /= 0) then
+            write(*, '(a)') '  Warning: could not create output directory ' // trim(base_dir)
+        end if
+
+        do isign = 1, 2
+            do iamp = 1, N_AMP
+                amp = FP_AMPS(iamp)
+                signed_amp = merge(amp, -amp, isign == 1)
+                amp_label = frozen_phonon_amp_label(signed_amp)
+                sub_dir = trim(base_dir) // '/' // trim(amp_label)
+                call execute_command_line('mkdir -p "' // trim(sub_dir) // '"', exitstat=cmdstat)
+                if (cmdstat /= 0) then
+                    write(*, '(a)') '  Warning: could not create output directory ' // trim(sub_dir)
+                end if
+
+                cell_path = trim(sub_dir) // '/' // trim(stem) // '_mode' // &
+                    trim(mode_str) // '_' // trim(amp_label) // '.cell'
+                param_path = trim(sub_dir) // '/' // trim(stem) // '_mode' // &
+                    trim(mode_str) // '_' // trim(amp_label) // '.param'
+
+                ! Replace cfg coordinates with the displaced structure
+                do i = 1, cfg%num_atoms
+                    dcart = signed_amp * cart_dir(:,i)
+                    frac_new = modes_data%ion_positions_frac(:,i) + &
+                        cartesian_to_fractional(dcart(1), dcart(2), dcart(3), inv_lattice)
+                    do j = 1, 3
+                        frac_new(j) = frac_new(j) - floor(frac_new(j))
+                    end do
+                    cfg%atom_x(i) = frac_new(1)
+                    cfg%atom_y(i) = frac_new(2)
+                    cfg%atom_z(i) = frac_new(3)
+                end do
+
+                call write_cell_file(trim(cell_path), cfg, ios, iomsg=msg)
+                if (ios /= 0) then
+                    write(*, '(a,a)') '  Error writing .cell: ', trim(msg)
+                else
+                    call write_param_file(trim(param_path), cfg, ios, iomsg=msg)
+                    if (ios /= 0) write(*, '(a,a)') '  Error writing .param: ', trim(msg)
+                end if
+            end do
+        end do
+
+        ! Restore the equilibrium coordinates in cfg
+        do i = 1, cfg%num_atoms
+            cfg%atom_x(i) = modes_data%ion_positions_frac(1,i)
+            cfg%atom_y(i) = modes_data%ion_positions_frac(2,i)
+            cfg%atom_z(i) = modes_data%ion_positions_frac(3,i)
+        end do
+
+        write(*, '(a)') ''
+        write(*, '(a)') '  Generated 6 input sets (d±0.10/0.20/0.50):'
+        write(*, '(a)') '    ' // trim(base_dir)
+    end subroutine frozen_phonon_write_inputs
+
+
+    pure function frozen_phonon_amp_label(signed_amp) result(label)
+        real(dp), intent(in) :: signed_amp
+        character(len=16) :: label
+        if (signed_amp >= 0.0_dp) then
+            write(label, '(a,f4.2)') 'd', signed_amp
+        else
+            write(label, '(a,f5.2)') 'd', signed_amp
+        end if
+        label = adjustl(label)
+    end function frozen_phonon_amp_label
+
+
+    pure function frozen_phonon_int_str(i) result(s)
+        integer, intent(in) :: i
+        character(len=16) :: s
+        write(s, '(i0)') i
+        s = adjustl(s)
+    end function frozen_phonon_int_str
+
 
 
     subroutine handle_thermo_menu(iostat)

@@ -35,6 +35,10 @@ module phonon_modes
         integer :: n_ions = 0
         integer :: n_branches = 0
         integer :: n_qpoints = 0
+        ! First q-point parsed by parse_phonon_eigenvectors
+        real(dp) :: qpoint(3) = 0.0_dp
+        real(dp) :: qpoint_weight = 0.0_dp
+        logical  :: qpoint_parsed = .false.
         ! Lattice (from .phonon header)
         real(dp) :: lattice_vectors(3,3) = 0.0_dp
         real(dp) :: cell_a = 0.0_dp, cell_b = 0.0_dp, cell_c = 0.0_dp
@@ -63,9 +67,10 @@ contains
 
         integer :: unit, ios, i, j, mode_idx, ion_idx, nb, ni
         real(dp) :: frac(3), amass, freq, ir, raman
-        real(dp) :: eig(6)
+        real(dp) :: eig(6), qx, qy, qz, qweight
         character(len=MAX_LINE_LEN) :: line, species
         character(len=6) :: tmp_species
+        character(len=20) :: key
 
         iostat_out = 0; iomsg = ''
 
@@ -153,6 +158,16 @@ contains
         if (ios /= 0) then
             iostat_out = 3; iomsg = 'No frequency data found in .phonon'; close(unit); return
         end if
+
+        ! ── Parse the first q-point header ──
+        ! CASTEP format: "q-pt=  N  qx  qy  qz  weight"
+        read(line, *, iostat=ios) key, key, qx, qy, qz, qweight
+        if (ios /= 0) then
+            iostat_out = 3; iomsg = 'Error reading q-point header in .phonon'; close(unit); return
+        end if
+        data%qpoint = [qx, qy, qz]
+        data%qpoint_weight = qweight
+        data%qpoint_parsed = .true.
 
         ! ── Read frequencies, IR, Raman for each branch ──
         ! Format: mode_idx  freq  ir_intensity  [raman_activity]
@@ -469,6 +484,9 @@ contains
         data%n_ions = 0
         data%n_branches = 0
         data%n_qpoints = 0
+        data%qpoint = 0.0_dp
+        data%qpoint_weight = 0.0_dp
+        data%qpoint_parsed = .false.
         data%has_born_charges = .false.
     end subroutine free_phonon_modes_data
 
