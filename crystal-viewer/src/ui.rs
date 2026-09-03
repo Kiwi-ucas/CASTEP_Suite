@@ -18,6 +18,7 @@ use crate::IsoMaterial;
 use crate::CubeResource;
 use crate::RenderSettings;
 use crate::resources;
+use crate::SlabState;
 
 #[derive(Resource)]
 pub struct AtomInfo {
@@ -54,8 +55,8 @@ pub fn ui_system(
     mut pes3d_state: Option<ResMut<Pes3dState>>,
     cube: Option<Res<CubeResource>>,
     mut display: ResMut<DisplayMode>,
-    keys: Res<ButtonInput<KeyCode>>,
     mut render_settings: ResMut<RenderSettings>,
+    mut slab_state: ResMut<SlabState>,
 ) {
     let Some(ctx) = contexts.try_ctx_mut() else { return; };
 
@@ -180,6 +181,174 @@ pub fn ui_system(
                 }
                 ui.label(format!("Asym. atoms: {}", atom_info.elements.len()));
                 ui.label(format!("Displayed: {}", picking.atom_positions.len()));
+                ui.separator();
+
+                // ── Slab / vacuum / supercell: settings live in popup windows ──
+                ui.horizontal(|ui| {
+                    if ui.button("Slab cut").clicked() {
+                        slab_state.slab_open = true;
+                    }
+                    if ui.button("Vacuum").clicked() {
+                        slab_state.vacuum_open = true;
+                    }
+                    if ui.button("Supercell").clicked() {
+                        slab_state.supercell_open = true;
+                    }
+                });
+                let hkl_ok: Option<(i32, i32, i32)> = match (
+                    slab_state.h_str.trim().parse::<i32>(),
+                    slab_state.k_str.trim().parse::<i32>(),
+                    slab_state.l_str.trim().parse::<i32>(),
+                ) {
+                    (Ok(h), Ok(k), Ok(l)) if !(h == 0 && k == 0 && l == 0) => Some((h, k, l)),
+                    _ => None,
+                };
+
+                // ── Dual-input synchronisation (last-edited field wins) ──
+                if let Some(c) = crystal.as_ref() {
+                    let hkl = hkl_ok;
+                    if let Some((h, k, l)) = hkl {
+                        if slab_state.last_hkl != (h, k, l) {
+                            slab_state.last_hkl = (h, k, l);
+                            // Miller indices changed: re-derive the fractional
+                            // displays from the current absolute values.
+                            if let Some(per) = crate::slab::slab_period(&c.data, h, k, l) {
+                                let s0 = slab_state.start_str.trim().parse::<f32>().unwrap_or(0.0);
+                                slab_state.s_frac_str = if s0.abs() < 1e-6 {
+                                    String::new()
+                                } else {
+                                    format!("{:.4}", s0 / per)
+                                };
+                                slab_state.t_frac_str = if slab_state.thickness <= 0.0 {
+                                    String::new()
+                                } else {
+                                    format!("{:.4}", slab_state.thickness / per)
+                                };
+                                slab_state.s_frac_dirty = false;
+                                slab_state.start_dirty = false;
+                                slab_state.t_frac_dirty = false;
+                                slab_state.thick_dirty = false;
+                            }
+                        }
+                        if let Some(period) = crate::slab::slab_period(&c.data, h, k, l) {
+                            if slab_state.s_frac_dirty {
+                                if let Ok(f) = slab_state.s_frac_str.trim().parse::<f32>() {
+                                    slab_state.start_str = format!("{:.4}", f * period);
+                                }
+                                slab_state.s_frac_dirty = false;
+                            } else if slab_state.start_dirty {
+                                let a = slab_state.start_str.trim().parse::<f32>().unwrap_or(0.0);
+                                slab_state.s_frac_str = if a.abs() < 1e-6 {
+                                    String::new()
+                                } else {
+                                    format!("{:.4}", a / period)
+                                };
+                                slab_state.start_dirty = false;
+                            }
+                            if slab_state.t_frac_dirty {
+                                let t = slab_state.t_frac_str.trim();
+                                slab_state.thickness = if t.is_empty() {
+                                    0.0
+                                } else {
+                                    t.parse::<f32>().unwrap_or(0.0) * period
+                                };
+                                slab_state.t_frac_dirty = false;
+                            } else if slab_state.thick_dirty {
+                                slab_state.t_frac_str = if slab_state.thickness <= 0.0 {
+                                    String::new()
+                                } else {
+                                    format!("{:.4}", slab_state.thickness / period)
+                                };
+                                slab_state.thick_dirty = false;
+                            }
+                        }
+                        // V ↔ c coupling: c = T_eff + V (last edited wins)
+                        let [va, vb, vc] = c.data.lattice.to_vectors();
+                        let axis_len = [va.length(), vb.length(), vc.length()]
+                            .get((slab_state.vac_axis - 1) as usize)
+                            .copied()
+                            .unwrap_or(0.0);
+                        let old_vac = if c.data.vacuum.as_ref().is_some_and(|vm| vm.axis == slab_state.vac_axis) {
+                            c.data.vacuum.as_ref().unwrap().thickness_ang
+                        } else {
+                            0.0
+                        };
+                        let base = axis_len - old_vac;
+                        // V ↔ c coupling: c = base + V (last edited wins).
+                        // Auto mode (vac_cell <= 0): c follows V implicitly,
+                        // the c field keeps showing "Auto"; only a manually
+                        // typed c value pins it (and V then follows c).
+                        if slab_state.vac_v_dirty {
+                            if slab_state.vac_cell > 0.0 {
+                                slab_state.vac_cell = base + slab_state.vac_thickness;
+                                slab_state.vac_c_str = format!("{:.1}", slab_state.vac_cell);
+                            } else {
+                                slab_state.vac_c_str.clear(); // stay on "Auto"
+                            }
+                            slab_state.vac_v_dirty = false;
+                        } else if slab_state.vac_c_dirty {
+                            if slab_state.vac_cell > 0.0 {
+                                if slab_state.vac_cell < base {
+                                    slab_state.vac_cell = base; // V ≥ 0
+                                    slab_state.vac_c_str = format!("{:.1}", base);
+                                }
+                                slab_state.vac_thickness = (slab_state.vac_cell - base).max(0.0);
+                            } else {
+                                slab_state.vac_c_str.clear(); // back to auto
+                            }
+                            slab_state.vac_c_dirty = false;
+                        }
+                    }
+                }
+
+                if !slab_state.error.is_empty() {
+                    ui.label(egui::RichText::new(&slab_state.error)
+                        .color(egui::Color32::from_rgb(255, 90, 90)));
+                }
+                // Applied slab / vacuum provenance
+                if let Some(c) = crystal.as_ref() {
+                    if let Some(ref sm) = c.data.slab {
+                        let b = match sm.basis {
+                            crate::InPlaneBasis::Primitive => "prim",
+                            crate::InPlaneBasis::Orthogonal => "90\u{b0}",
+                            crate::InPlaneBasis::Conventional => "conv",
+                        };
+                        let uv_extra = match (&sm.u_vec, &sm.v_vec) {
+                            (Some(uv), Some(vv)) => Some(format!(
+                                " U=({} {} {}) V=({} {} {})",
+                                uv[0], uv[1], uv[2], vv[0], vv[1], vv[2]
+                            )),
+                            _ => None,
+                        };
+                        ui.label(format!(
+                            "Slab: ({},{},{}) s={:.2} T={:.2} \u{c5} {} \u{00d7} {} [{}]{}",
+                            sm.h, sm.k, sm.l, sm.start_ang, sm.thickness_ang, sm.u, sm.v, b,
+                            uv_extra.as_deref().unwrap_or("")
+                        ));
+                    }
+                    if let Some(ref vm) = c.data.vacuum {
+                        let ax = ["?", "a", "b", "c"].get((vm.axis as usize).clamp(0, 3)).copied().unwrap_or("?");
+                        let pos = if vm.position > 0.0 {
+                            format!("{:.2}", vm.position)
+                        } else if vm.both_sides {
+                            "center".into()
+                        } else {
+                            "top".into()
+                        };
+                        ui.label(format!(
+                            "Vacuum: {} +{:.1} \u{c5} (pos {})",
+                            ax,
+                            vm.thickness_ang,
+                            pos
+                        ));
+                    }
+                    if let Some(ref sc) = c.data.supercell {
+                        ui.label(format!(
+                            "Supercell: {}\u{00d7}{}\u{00d7}{}",
+                            sc[0], sc[1], sc[2]
+                        ));
+                    }
+                }
                 ui.separator();
             } else {
                 ui.heading("Crystal Viewer");
@@ -496,11 +665,11 @@ pub fn ui_system(
                         .map(|p| p.has_energies && p.vis_mode == VisMode::Migration)
                         .unwrap_or(false);
                     if mig_ok && cube.is_some() {
-                        let e_pressed = !ctx.wants_keyboard_input() && keys.just_pressed(KeyCode::KeyE);
-                        if ui.button("Export PLY").clicked() || e_pressed {
+                        if ui.button("Export PLY").clicked() || render_settings.request_ply {
                             if let Some(ps) = pes3d_state.as_ref() {
                                 export_migration_ply(&cube, ps);
                             }
+                            render_settings.request_ply = false;
                         }
                     }
                     if render_settings.rendering.load(std::sync::atomic::Ordering::Relaxed) {
@@ -512,6 +681,98 @@ pub fn ui_system(
             });
         });
     panel_rects.right = Some(right_resp.response.rect);
+
+    // ── Slab / vacuum settings popups (opened from the right panel buttons) ──
+    // Same pattern as the Render dialog: egui::Area + window Frame — the popup
+    // is draggable from anywhere on its surface and remembers its position.
+    if slab_state.slab_open || slab_state.vacuum_open || slab_state.supercell_open {
+        if std::env::var("CRYSTAL_VIEWER_DEBUG_UI").is_ok() {
+            eprintln!(
+                "[debug-ui] popup branch: slab_open={} vacuum_open={} supercell_open={} screen={:?}",
+                slab_state.slab_open,
+                slab_state.vacuum_open,
+                slab_state.supercell_open,
+                ctx.screen_rect()
+            );
+        }
+        let sr = ctx.screen_rect();
+        let pop_x = (sr.max.x - 240.0 - 330.0).max(sr.min.x + 10.0);
+        if slab_state.slab_open {
+            let slab_resp = egui::Area::new(egui::Id::new("slab_settings"))
+                .default_pos(egui::pos2(pop_x, 60.0))
+                .movable(true)
+                .show(ctx, |ui| {
+                    egui::Frame::window(ui.style()).show(ui, |ui| {
+                        // The window hugs its content (no forced min width,
+                        // no inner scroll area) — everything shows at once.
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Slab cut (hkl)").strong());
+                            // Plain left-aligned close button: a right_to_left
+                            // sub-layout claims the whole available width on
+                            // the sizing pass, which would stretch the
+                            // content-hugging frame to the screen edge.
+                            if ui.small_button("\u{00d7}").clicked() {
+                                slab_state.slab_open = false;
+                            }
+                        });
+                        // Bounded separator: an unbounded one would stretch
+                        // the frame to the whole available (screen) width,
+                        // defeating the content-hugging window size.
+                        ui.separator();
+                        slab_section_ui(ui, &mut slab_state, crystal.as_deref());
+                    });
+                });
+            let slab_rect = slab_resp.response.rect;
+            if std::env::var("CRYSTAL_VIEWER_DEBUG_UI").is_ok() {
+                eprintln!("[debug-ui] slab popup rect={:?}", slab_rect);
+            }
+        }
+        if slab_state.vacuum_open {
+            let vac_resp = egui::Area::new(egui::Id::new("vacuum_settings"))
+                .default_pos(egui::pos2(pop_x, 420.0))
+                .movable(true)
+                .show(ctx, |ui| {
+                    egui::Frame::window(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Vacuum layer").strong());
+                            if ui.small_button("\u{00d7}").clicked() {
+                                slab_state.vacuum_open = false;
+                            }
+                        });
+                        ui.separator();
+                        vacuum_section_ui(ui, &mut slab_state);
+                    });
+                });
+            let vac_rect = vac_resp.response.rect;
+            if std::env::var("CRYSTAL_VIEWER_DEBUG_UI").is_ok() {
+                eprintln!("[debug-ui] vacuum popup rect={:?}", vac_rect);
+            }
+        }
+        if slab_state.supercell_open {
+            let sc_resp = egui::Area::new(egui::Id::new("supercell_settings"))
+                .default_pos(egui::pos2(pop_x, 240.0))
+                .movable(true)
+                .show(ctx, |ui| {
+                    egui::Frame::window(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Supercell (nx ny nz)").strong());
+                            // Plain left-aligned close button (a right_to_left
+                            // sub-layout would stretch the frame to the
+                            // screen edge — see the slab popup comment).
+                            if ui.small_button("\u{00d7}").clicked() {
+                                slab_state.supercell_open = false;
+                            }
+                        });
+                        ui.separator();
+                        supercell_section_ui(ui, &mut slab_state, crystal.as_deref());
+                    });
+                });
+            let sc_rect = sc_resp.response.rect;
+            if std::env::var("CRYSTAL_VIEWER_DEBUG_UI").is_ok() {
+                eprintln!("[debug-ui] supercell popup rect={:?}", sc_rect);
+            }
+        }
+    }
 
     // ── Render dialog (Bevy-native offscreen export — WYSIWYG) ──
     // Built on egui::Area instead of egui::Window: the Area is movable from
@@ -802,5 +1063,387 @@ fn export_migration_ply(cube: &Option<Res<crate::CubeResource>>, ps: &crate::Pes
             eprintln!("[mode8] exported {} ({} verts, {} tris)", abs.display(), nv, nt);
         }
         Err(e) => eprintln!("[mode8] export failed: {}", e),
+    }
+}
+
+/// Slab settings content — shown in the "Slab cut" popup window
+/// (moved out of the right panel, which now only shows the button).
+fn slab_section_ui(ui: &mut egui::Ui, s: &mut SlabState, c: Option<&crate::CrystalStore>) {
+    let hkl_ok: Option<(i32, i32, i32)> = match (
+        s.h_str.trim().parse::<i32>(),
+        s.k_str.trim().parse::<i32>(),
+        s.l_str.trim().parse::<i32>(),
+    ) {
+        (Ok(h), Ok(k), Ok(l)) if !(h == 0 && k == 0 && l == 0) => Some((h, k, l)),
+        _ => None,
+    };
+
+    ui.horizontal(|ui| {
+        ui.label("h");
+        ui.add(egui::TextEdit::singleline(&mut s.h_str).desired_width(40.0));
+        ui.label("k");
+        ui.add(egui::TextEdit::singleline(&mut s.k_str).desired_width(40.0));
+        ui.label("l");
+        ui.add(egui::TextEdit::singleline(&mut s.l_str).desired_width(40.0));
+    });
+    // s: fraction of the layer period + absolute Å, last-edited field wins
+    ui.horizontal(|ui| {
+        ui.label("s frac");
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut s.s_frac_str)
+                .hint_text("0-1")
+                .desired_width(56.0),
+        );
+        if r.changed() {
+            s.s_frac_dirty = true;
+        }
+        ui.label("s \u{c5}");
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut s.start_str)
+                .hint_text("0")
+                .desired_width(64.0),
+        );
+        if r.changed() {
+            s.start_dirty = true;
+        }
+        if let (Some(c), Some((h, k, l))) = (c, hkl_ok) {
+            let s_cur = s.start_str.trim().parse::<f32>().unwrap_or(0.0);
+            if ui.add_enabled(
+                crate::slab::slab_layer_snap(&c.data, h, k, l, s_cur, true).is_some(),
+                egui::Button::new("up"),
+            ).on_hover_text("Snap s to the nearest atomic plane above").clicked() {
+                if let Some(snap) = crate::slab::slab_layer_snap(&c.data, h, k, l, s_cur, true) {
+                    s.start_str = format!("{:.6}", snap);
+                    if let Some(per) = crate::slab::slab_period(&c.data, h, k, l) {
+                        s.s_frac_str = format!("{:.4}", snap / per);
+                    }
+                    s.start_dirty = false;
+                    s.s_frac_dirty = false;
+                }
+            }
+            if ui.add_enabled(
+                crate::slab::slab_layer_snap(&c.data, h, k, l, s_cur, false).is_some(),
+                egui::Button::new("down"),
+            ).on_hover_text("Snap s to the nearest atomic plane below").clicked() {
+                if let Some(snap) = crate::slab::slab_layer_snap(&c.data, h, k, l, s_cur, false) {
+                    s.start_str = format!("{:.6}", snap);
+                    if let Some(per) = crate::slab::slab_period(&c.data, h, k, l) {
+                        s.s_frac_str = format!("{:.4}", snap / per);
+                    }
+                    s.start_dirty = false;
+                    s.s_frac_dirty = false;
+                }
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("T frac");
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut s.t_frac_str)
+                .hint_text("3")
+                .desired_width(56.0),
+        );
+        if r.changed() {
+            s.t_frac_dirty = true;
+        }
+        ui.label("T \u{c5}");
+        let r = ui.add(
+            egui::DragValue::new(&mut s.thickness)
+                .speed(0.5)
+                .range(0.0..=100.0),
+        );
+        if r.changed() {
+            s.thick_dirty = true;
+        }
+        if s.thickness == 0.0 {
+            ui.label("(0 = 3\u{00b7}period)");
+        }
+    });
+    // Live d_hkl / layer period
+    if let (Some(c), Some((h, k, l))) = (c, hkl_ok) {
+        if let (Some(d), Some(per)) = (
+            crate::slab::slab_d_hkl(&c.data, h, k, l),
+            crate::slab::slab_period(&c.data, h, k, l),
+        ) {
+            ui.label(format!(
+                "d = {:.3} \u{c5}   period = {:.3} \u{c5}",
+                d, per
+            ));
+        }
+    }
+    // U/V definition mode: 0 = integer (in-plane basis × U/V expansion),
+    // 1 = explicit (i j k) vectors. Only the selected form's fields show.
+    ui.horizontal(|ui| {
+        ui.label("U/V def");
+        egui::ComboBox::from_id_salt("slab_uv_mode")
+            .selected_text(match s.uv_mode {
+                0 => "integer \u{00d7} basis",
+                _ => "vector (i j k)",
+            })
+            .show_ui(ui, |cui| {
+                let mut cur = s.uv_mode;
+                if cui.radio_value(&mut cur, 0, "integer \u{00d7} basis").clicked() {
+                    s.uv_mode = 0;
+                }
+                if cui.radio_value(&mut cur, 1, "vector (i j k)").clicked() {
+                    s.uv_mode = 1;
+                }
+            });
+    });
+    if s.uv_mode == 0 {
+        // ── Integer form: in-plane 2D basis + U/V expansion factors ──
+        ui.horizontal(|ui| {
+            ui.label("In-plane");
+            egui::ComboBox::from_id_salt("slab_basis")
+                .selected_text(match s.basis {
+                    crate::InPlaneBasis::Primitive => "primitive L2",
+                    crate::InPlaneBasis::Orthogonal => "90\u{b0} orthogonal",
+                    crate::InPlaneBasis::Conventional => "conventional",
+                })
+                .show_ui(ui, |cui| {
+                    let mut cur = s.basis.as_u8();
+                    for i in 0..3u8 {
+                        let name = ["primitive", "90\u{b0} orthogonal", "conventional"][i as usize];
+                        if cui.radio_value(&mut cur, i, name).clicked() {
+                            s.basis = crate::InPlaneBasis::from_u8(i);
+                        }
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label("U");
+            ui.add(egui::DragValue::new(&mut s.u).range(1..=8).speed(1));
+            ui.label("V");
+            ui.add(egui::DragValue::new(&mut s.v).range(1..=8).speed(1));
+            if s.basis == crate::InPlaneBasis::Orthogonal {
+                ui.label("90\u{b0} #");
+                ui.add(egui::DragValue::new(&mut s.orth_idx).range(0..=16).speed(1));
+            }
+        });
+    } else {
+        // ── Vector form: MS-style explicit (i j k) in-plane vectors ──
+        ui.horizontal(|ui| {
+            ui.label("U vec (i j k)");
+            ui.add(
+                egui::TextEdit::singleline(&mut s.u_vec_str)
+                    .hint_text("0 1 0")
+                    .desired_width(60.0),
+            );
+            ui.label("V vec (i j k)");
+            ui.add(
+                egui::TextEdit::singleline(&mut s.v_vec_str)
+                    .hint_text("0 0 1")
+                    .desired_width(60.0),
+            );
+        });
+        if s.u_vec_str.trim().is_empty() && s.v_vec_str.trim().is_empty() {
+            ui.label(egui::RichText::new("(empty = fall back to integer \u{00d7} basis)")
+                .weak()
+                .size(11.0));
+        }
+    }
+    let vec_active = s.uv_mode == 1
+        && (!s.u_vec_str.trim().is_empty() || !s.v_vec_str.trim().is_empty());
+    // Live in-plane cell info
+    if let (Some(c), Some((h, k, l))) = (c, hkl_ok) {
+        let _ = (h, k, l);
+        if let Some(params) = crate::slab_params_from_state(s) {
+            if let Some(info) = crate::slab::slab_layer_info(&c.data, &params) {
+                let explicit = vec_active;
+                let bname = if explicit {
+                    "U/V vec"
+                } else {
+                    match s.basis {
+                        crate::InPlaneBasis::Primitive => "prim",
+                        crate::InPlaneBasis::Orthogonal => "90\u{b0}",
+                        crate::InPlaneBasis::Conventional => "conv",
+                    }
+                };
+                let (a_show, b_show) = if explicit {
+                    // slab_layer_info already reports the explicit cell
+                    (info.a_prim, info.b_prim)
+                } else {
+                    (info.a_prim * s.u as f32, info.b_prim * s.v as f32)
+                };
+                ui.label(format!(
+                    "in-plane [{}]: {:.3} \u{00d7} {:.3} \u{c5}, \u{b3} = {:.1}\u{b0}",
+                    bname, a_show, b_show, info.gamma_prim
+                ));
+                let cell_note = if explicit {
+                    String::from("explicit cell")
+                } else {
+                    format!("prim cell \u{00d7} {}x{} basis", s.u, s.v)
+                };
+                ui.label(format!(
+                    "{} atom(s)/layer ({})",
+                    info.atoms_per_layer, cell_note
+                ));
+                if s.uv_mode == 0 && s.basis == crate::InPlaneBasis::Orthogonal {
+                    let n = info.ortho.len();
+                    ui.label(format!("90\u{b0} candidates: {}", n));
+                    if n > 0 {
+                        let (oa, ob, _) = info.ortho[(s.orth_idx as usize).min(n - 1)];
+                        ui.label(format!("  [cur {:.2}\u{00d7}{:.2}]", oa, ob));
+                    }
+                }
+            }
+        }
+    }
+    ui.horizontal(|ui| {
+        if ui.button("Preview").clicked() {
+            s.preview_slab = !s.preview_slab;
+            s.preview_vacuum = false;
+        }
+        if ui.button("Apply slab").clicked() {
+            s.req_slab = true;
+        }
+    });
+    if !s.error.is_empty() {
+        ui.label(egui::RichText::new(&s.error)
+            .color(egui::Color32::from_rgb(255, 90, 90)));
+    }
+}
+
+/// Vacuum settings content — shown in the "Vacuum" popup window.
+fn vacuum_section_ui(ui: &mut egui::Ui, s: &mut SlabState) {
+    ui.horizontal(|ui| {
+        ui.label("Thick V (\u{c5})");
+        let r = ui.add(
+            egui::DragValue::new(&mut s.vac_thickness)
+                .speed(0.5)
+                .range(0.0..=300.0),
+        );
+        if r.changed() {
+            s.vac_v_dirty = true;
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Cell c (\u{c5})");
+        // Text input: empty = auto (c = base + V, shown via the "Auto" hint);
+        // type a number to pin c (V then follows); type "Auto" or clear to
+        // go back to auto mode.
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut s.vac_c_str)
+                .hint_text("Auto")
+                .desired_width(72.0),
+        );
+        if r.changed() {
+            let t = s.vac_c_str.trim().to_lowercase();
+            if t.is_empty() || t == "auto" || t == "0" {
+                s.vac_cell = 0.0; // auto: c follows V
+            } else if let Ok(v) = t.parse::<f32>() {
+                s.vac_cell = v.max(0.0);
+            }
+            s.vac_c_dirty = true;
+        }
+        if s.vac_cell <= 0.0 {
+            ui.label("(Auto = base + V)");
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Dir");
+        let mut ax = (s.vac_axis - 1).clamp(0, 2) as usize;
+        for i in 0..3 {
+            let name = ["a", "b", "c"][i];
+            if ui.radio_value(&mut ax, i, name).clicked() {
+                s.vac_axis = (i + 1) as u8;
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Pos 0\u{2013}1");
+        ui.add(egui::Slider::new(&mut s.vac_pos, 0.0..=1.0));
+    });
+    ui.horizontal(|ui| {
+        if ui.button("bottom").clicked() {
+            s.vac_pos = 0.0;
+            s.vac_both = false;
+        }
+        if ui.button("center").clicked() {
+            s.vac_pos = 0.5;
+            s.vac_both = true;
+        }
+        if ui.button("top").clicked() {
+            s.vac_pos = 1.0;
+            s.vac_both = false;
+        }
+        if s.vac_pos > 0.001 {
+            ui.label(format!("pos = {:.2}", s.vac_pos));
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.button("Preview").clicked() {
+            s.preview_vacuum = !s.preview_vacuum;
+            s.preview_slab = false;
+        }
+        if ui.button("Apply vacuum").clicked() {
+            s.req_vacuum = true;
+        }
+        if ui.add_enabled(
+            s.snapshot.is_some(),
+            egui::Button::new("Reset"),
+        )
+        .clicked()
+        {
+            s.req_reset = true;
+        }
+    });
+    if !s.error.is_empty() {
+        ui.label(egui::RichText::new(&s.error)
+            .color(egui::Color32::from_rgb(255, 90, 90)));
+    }
+}
+
+/// Supercell settings content — shown in the "Supercell" popup window.
+/// x/y/z are integer multipliers along a/b/c (1,1,1 = the current cell,
+/// 2,1,1 = one extra cell along a). Preview keeps every ORIGINAL cell's
+/// own edges (boxes side by side) plus all atom copies so the tiling is
+/// visible; only "Apply" merges the boxes into one cube.
+fn supercell_section_ui(ui: &mut egui::Ui, s: &mut SlabState, c: Option<&crate::CrystalStore>) {
+    ui.horizontal(|ui| {
+        ui.label("x");
+        ui.add(egui::DragValue::new(&mut s.sc_x).range(1..=8));
+        ui.label("y");
+        ui.add(egui::DragValue::new(&mut s.sc_y).range(1..=8));
+        ui.label("z");
+        ui.add(egui::DragValue::new(&mut s.sc_z).range(1..=8));
+    });
+    let n = s.sc_x.max(1) * s.sc_y.max(1) * s.sc_z.max(1);
+    if let Some(c) = c {
+        let atoms = c.data.atoms.len();
+        ui.label(format!(
+            "{}\u{00d7}{}\u{00d7}{} = {} cells \u{00d7} {} atoms = {} atoms",
+            s.sc_x.max(1), s.sc_y.max(1), s.sc_z.max(1), n, atoms, n as usize * atoms
+        ));
+        if let Some(sc) = c.data.supercell {
+            ui.label(format!("Applied: {}\u{00d7}{}\u{00d7}{}", sc[0], sc[1], sc[2]));
+        }
+        if n > 512 {
+            ui.label("preview is capped at 512 cells (Apply still works up to the atom limit)");
+        }
+    }
+    ui.horizontal(|ui| {
+        if s.preview_supercell {
+            if ui.button("Stop preview").clicked() {
+                s.preview_supercell = false;
+            }
+        } else {
+            if ui.button("Preview").clicked() {
+                s.preview_supercell = true;
+                s.preview_slab = false;
+                s.preview_vacuum = false;
+            }
+        }
+        if ui.button("Apply supercell").clicked() {
+            s.req_supercell = true;
+            s.preview_supercell = false;
+        }
+    });
+    if s.preview_supercell {
+        ui.label("Preview: each original cell keeps its own edges until you apply.");
+    }
+    if !s.error.is_empty() {
+        ui.label(egui::RichText::new(&s.error)
+            .color(egui::Color32::from_rgb(255, 90, 90)));
     }
 }

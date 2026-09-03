@@ -293,9 +293,15 @@ contains
             ! Check for variable at current position
             if (s(i:i) == 'x' .or. s(i:i) == 'y' .or. s(i:i) == 'z') then
                 if (.not. found_var) then
-                    ! Determine coefficient
-                    if (i > 1 .and. is_digit(s(i-1:i-1))) then
-                        read(s(i-1:i-1), '(i1)') coeff
+                    ! Determine coefficient (Fortran does not short-circuit
+                    ! .and., so the i>1 guard must nest to keep s(i-1:i-1)
+                    ! in bounds when the symmetry string starts with a variable)
+                    if (i > 1) then
+                        if (is_digit(s(i-1:i-1))) then
+                            read(s(i-1:i-1), '(i1)') coeff
+                        else
+                            coeff = 1
+                        end if
                     else
                         coeff = 1
                     end if

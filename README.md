@@ -233,10 +233,14 @@ All interactive plots use the alternate screen buffer — no scrollback pollutio
 - **Full unit cell display**: automatic expansion from asymmetric unit (applies ±1 fractional translations)
 - **Interactive 3D**: right-drag or arrow keys (←↓↑→) to rotate, scroll to zoom, click/hover to select atoms
 - **Atom editing**: select an atom → use HKUMIN keys (±X/±Y/±Z) to move; all symmetry-equivalent copies move in sync
+- **Slab cross-section (hkl) + vacuum layer** (right panel, Cell Parameters section — for catalysis workflows):
+  - *Cross-section (hkl)*: Miller indices h/k/l + slab position s (Å) + thickness T (Å; 0 = auto 3·d_hkl, live d_hkl display). Cuts along the general (hkl) surface normal, rebuilds the in-plane primitive cell, re-expresses all atoms in the new frame (c' = T along the surface normal). Preview shows a ghost cut plane + slab region; Apply rebuilds the structure and auto-saves.
+  - *Vacuum layer*: thickness (default 15 Å) + direction (a/b/c, default c) + placement (top-only / split both sides). Extends the chosen axis by the vacuum thickness without touching the atomic geometry.
+  - Both are independent and order-free; the modified structure auto-saves to JSON and flows into the existing modified-structure sub-menu — zero Fortran-side changes.
 - **Display modes**: 1=ball-stick, 2=space-filling, 3=wireframe; A=toggle cell axes, B=toggle bonds, C=toggle cell frame, P=toggle ortho/perspective, R=reset camera
 - **Right panel controls**: Rotation Angle DragValue (1°–90°, default 45°), Move Step DragValue (0.01–10 Å, default 0.5 Å)
 - **Cell axes**: A toggles red X/green Y/blue Z arrows from cell origin along lattice vectors (1.5× length)
-- **Modified structure**: on close, if atoms were moved, prompts to (1) save as CIF/PDB/cell or (2) pass directly to PreCASTEP for input generation
+- **Modified structure**: on close, if the structure was modified in the viewer (atoms moved, slab cross-section, or vacuum layer applied), prompts to (1) save as CIF/PDB/cell or (2) pass directly to PreCASTEP for input generation
 - JSON auto-cleaned after viewing; output files follow original input name
 
 **Format Converter** converts between CIF, PDB, and CASTEP .cell formats.
